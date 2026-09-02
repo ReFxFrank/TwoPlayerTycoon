@@ -28,6 +28,10 @@ done < <(find src tests -name '*.luau' | sort)
 [ "$fail" -eq 0 ] && echo "  all files parse"
 
 echo
+echo "== house rules =="
+./tests/lint.sh || fail=1
+
+echo
 echo "== specs =="
 if [ "$#" -gt 0 ]; then
     LUAU_BIN="$LUAU_BIN" node tests/tools/bundle.mjs --only "$1" || fail=1

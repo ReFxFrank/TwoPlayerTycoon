@@ -30,21 +30,18 @@ local BACKOFF: { number } = GameConfig.Save.RetryBackoff -- { 1, 2, 4, 8, 16 }
 local JITTER: number = GameConfig.Save.RetryJitter -- +/-20%
 local DEFAULT_MAX_ATTEMPTS = 5
 
--- WHY poll rather than sleep the whole budget: Roblox refills request budget continuously, so a
--- short poll returns to work the instant one credit lands. The cap is the important half -- a
--- permanently starved budget (an outage, or a place with DataStore access switched off) must not
--- park a shutdown save forever, so past the cap we spend the attempt anyway and let the call fail
--- honestly. 4s of polling still leaves headroom inside BindToClose's 30s hard kill.
+-- Poll rather than sleep the whole budget: Roblox refills continuously. The CAP is the important
+-- half -- a permanently starved budget must not park a shutdown save forever, so past it the
+-- attempt is spent anyway and the call fails honestly, still inside BindToClose's 30s kill.
 local BUDGET_POLL_SECONDS = 0.5
 local MAX_BUDGET_WAIT_SECONDS = 4
 
 -- Roblox rejects keys over 50 UTF-8 bytes with a fatal error; catching it here costs no request.
 local MAX_KEY_LENGTH = 50
 
--- Substrings (matched case-insensitively, plain -- not Lua patterns) that mark a failure as worth
--- retrying. Everything else -- "cannot store Instance in data store", key/value size limits, a bug
--- thrown by a caller's UpdateAsync transform -- is deterministic: five attempts would fail five
--- times and burn the shutdown budget that the *other* players' saves need.
+-- Substrings (case-insensitive, plain -- not Lua patterns) marking a failure worth retrying.
+-- Everything else -- an unserialisable value, a size limit, a bug in a caller's transform -- is
+-- deterministic: five attempts fail five times and burn budget the OTHER players' saves need.
 local TRANSIENT_PATTERNS = {
 	"throttl", -- "Number of requests exceeded limit" family
 	"timeout",
@@ -252,10 +249,9 @@ function Service:Remove(store: Store, key: string): (boolean, any)
 	end)
 end
 
--- Lower this on the shutdown path. BindToClose has a HARD 30s budget in Roblox (the server is
--- killed after it regardless of what the handler is doing), and GameConfig.Save.ShutdownBudgetSeconds
--- keeps us under it -- but the full 5-attempt schedule sleeps 1+2+4+8 = 15s for a single key, so a
--- server full of failing saves needs a shorter schedule, not a longer wait.
+-- Lower this on the shutdown path. BindToClose has a HARD 30s budget (the server is killed
+-- regardless of what the handler is doing) and the full 5-attempt schedule sleeps 15s for ONE key,
+-- so a server full of failing saves needs a shorter schedule, not a longer wait.
 function Service:SetMaxAttempts(n: number): ()
 	if type(n) ~= "number" or n ~= n then -- n ~= n catches NaN, which would make math.clamp lie
 		return
