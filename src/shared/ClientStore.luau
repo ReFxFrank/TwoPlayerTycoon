@@ -75,9 +75,13 @@ function ClientStore.new(): Store
 	}, ClientStore)
 end
 
--- Split "Plot.Stage" into { "Plot", "Stage" }. An empty path means "the whole snapshot".
-local function splitPath(path: string): { string }
+-- Split "Plot.Stage" into { "Plot", "Stage" }. An empty path means "the whole snapshot"; a
+-- non-string path yields no segments rather than erroring, so GetPath stays total.
+local function splitPath(path: any): { string }
 	local parts: { string } = {}
+	if type(path) ~= "string" then
+		return parts
+	end
 	for segment in string.gmatch(path, "[^%.]+") do
 		table.insert(parts, segment)
 	end
@@ -91,7 +95,14 @@ local function resolve(root: any, parts: { string }): any
 			-- A missing branch is normal (Gates only exists on Full snapshots), never an error.
 			return nil
 		end
-		node = node[segment]
+		local child = node[segment]
+		if child == nil then
+			-- Occupants is an array, so "Occupants.1.Name" arrives with a string "1". Fall back to
+			-- the numeric key so array paths are observable like any other.
+			local index = tonumber(segment)
+			child = if index ~= nil then node[index] else nil
+		end
+		node = child
 	end
 	return node
 end
@@ -125,7 +136,12 @@ end
     Changed listeners and for cached observer values.
 ]]
 function ClientStore.Set(self: Store, snapshot: Snapshot): ()
-	assert(type(snapshot) == "table", "ClientStore:Set expects a table snapshot")
+	if type(snapshot) ~= "table" then
+		-- Loud but not fatal. This only happens if the server sends a malformed StateSync, and a
+		-- frozen HUD would be a worse outcome than a stale one plus a log line.
+		warn("[ClientStore] ignoring a non-table snapshot of type " .. typeof(snapshot))
+		return
+	end
 
 	local old = self._state
 	local new: Snapshot
@@ -163,7 +179,6 @@ end
     task.spawns each handler, so a slow or erroring observer cannot stall replication.
 ]]
 function ClientStore.Observe(self: Store, path: string, fn: (value: any) -> ()): Signal.Connection
-	assert(type(path) == "string", "ClientStore:Observe expects a string path")
 	assert(type(fn) == "function", "ClientStore:Observe expects a function")
 
 	local parts = splitPath(path)

@@ -1,12 +1,30 @@
-# Build output
-/.bundle/
+# --- Roblox builds -----------------------------------------------------------
+# Place and model files are build OUTPUT (rojo build) -- the source of truth is src/ + the project
+# file, so a committed .rbxl would only ever go stale and cause merge pain.
 *.rbxl
 *.rbxlx
-*.rbxl.lock
-*.rbxlx.lock
-sourcemap.json
+*.rbxm
+*.rbxmx
 
-# Tooling
-node_modules/
+# Studio's lock files, written next to an open place.
+*.lock
+
+# --- Tooling output ----------------------------------------------------------
+sourcemap.json
+/out
+/build
+/tests/out
+
+# --- Node (tests/tools/bundle.mjs) -------------------------------------------
+node_modules
+npm-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+
+# --- Editors / OS ------------------------------------------------------------
 .DS_Store
-*.log
+Thumbs.db
+.idea
+*.swp
+
+# NOTE: rokit.toml is the pinned toolchain manifest and MUST stay committed.

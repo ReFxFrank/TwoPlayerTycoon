@@ -1,0 +1,33 @@
+# Sanctum of Embers -- static analysis.
+# `roblox` std covers game/workspace/task/Instance and the datatype constructors listed in spec
+# section 3.1. Regenerate with `selene generate-roblox-std` after a Roblox API bump.
+std = "roblox"
+
+[lints]
+# Deliberate, and enforced by spec section 3: no globals, no wait/spawn/delay, no unknown API.
+deprecated = "deny"
+global_usage = "deny"
+unscoped_variables = "deny"
+incorrect_standard_library_use = "deny"
+
+# TableUtil hand-rolls deepCopy/shallowCopy with a `seen` map for cycle safety, so the "just use
+# table.clone" suggestion is wrong here.
+manual_table_clone = "allow"
+
+# Narrowing a name inside a branch (`local section = SectionData.get(id)`) is a pattern we use a lot
+# and reads better than inventing a second name.
+shadowing = "allow"
+
+# Ids inside one catalogue are intentionally similar (ember_vent / ember_forge), and so are the
+# paired locals around them.
+similar_names = "allow"
+
+# UI code mixes scale AND offset in a single UDim2.new on purpose (spec section 8 anchors with
+# Scale); fromScale/fromOffset cannot express that.
+roblox_manual_fromscale_or_fromoffset = "allow"
+
+# Data catalogues are written one entry per line with several assignments per line for density.
+multiple_statements = "allow"
+
+# Config tables legitimately mix an array part with named keys in a few places.
+mixed_table = "warn"

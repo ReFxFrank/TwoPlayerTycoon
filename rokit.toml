@@ -1,0 +1,9 @@
+# Sanctum of Embers -- pinned toolchain (rokit: https://github.com/rojo-rbx/rokit)
+# Exact versions, never ranges: a silent tool upgrade must never change a build or a lint result
+# out from under a contributor or CI.
+
+[tools]
+rojo = "rojo-rbx/rojo@7.5.1"
+stylua = "JohnnyMorganz/StyLua@2.0.2"
+selene = "Kampfkarren/selene@0.28.0"
+lune = "lune-org/lune@0.8.9"

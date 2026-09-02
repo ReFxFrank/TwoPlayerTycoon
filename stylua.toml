@@ -1,0 +1,10 @@
+# Sanctum of Embers -- formatting.
+# 110 columns fits the spec's "no file over 300 lines" budget without wrapping type annotations onto
+# their own lines, which is what makes --!strict signatures readable.
+column_width = 110
+line_endings = "Unix"
+indent_type = "Spaces"
+indent_width = 4
+quote_style = "AutoPreferDouble"
+call_parentheses = "Always"
+collapse_simple_statement = "Never"
