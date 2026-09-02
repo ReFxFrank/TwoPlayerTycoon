@@ -2177,6 +2177,331 @@ return Testing
 end)()
 local MODULE_DEFS = {}
 local MODULE_ORDER = {}
+MODULE_ORDER[#MODULE_ORDER + 1] = { Path = "StarterPlayer/StarterPlayerScripts/Client/Controllers/UiBuilder", Class = "ModuleScript", File = "src/client/Controllers/UiBuilder.luau" }
+MODULE_DEFS["StarterPlayer/StarterPlayerScripts/Client/Controllers/UiBuilder"] = function(script, require, ...)
+--#region src/client/Controllers/UiBuilder.luau
+--!strict
+--[[
+    UiBuilder
+    Builds the whole SanctumHud ScreenGui in code and hands back a flat table of named references.
+    Deliberately inert: no store, no remotes, no connections, no behaviour of any kind. Controllers
+    bind to a layout they did not build, which is what keeps "where a widget lives" and "what a
+    widget means" in two separate files -- and keeps the layout reviewable as a plain diff.
+    Owner: client  |  Consumers: ClientBootstrap, HudController, and every other controller
+]]
+--[[ WHY EVERYTHING IS Scale-BASED. This HUD is read on a 1920px monitor and on a 380px phone.
+     Offset sizing would make the phone HUD swallow the screen, so every position and size is a
+     fraction of the viewport, text is TextScaled, and any panel whose readability depends on its
+     shape carries a UIAspectRatioConstraint. Pixel offsets appear ONLY for corner radii and stroke
+     thickness, which are surface detail rather than layout. ]]
+
+local Modules = game:GetService("ReplicatedStorage"):WaitForChild("Modules")
+local Theme = require(Modules:WaitForChild("Theme"))
+local Format = require(Modules:WaitForChild("Format"))
+
+-- Modal construction lives next door purely for the 300-line rule; it is the same builder, and it
+-- is handed this file's primitives so there is exactly one definition of "what a panel looks like".
+local UiModals = require(script.Parent.UiModals)
+
+type Props = { [string]: any }
+type Region = { [string]: any }
+
+type Ui = {
+	ScreenGui: Instance,
+	Hud: Region,
+	Partners: Region,
+	ActionBar: Region,
+	Modals: Region,
+	Toasts: Region,
+}
+
+local UiBuilder = {}
+
+local TITLE_FONT = Enum.Font.GothamBold
+local BODY_FONT = Enum.Font.Gotham
+
+-- Overwrite `base` in place with `overrides`. Every widget helper starts from a defaults table it
+-- owns exclusively, so mutating it here can never leak into another widget.
+local function with(base: Props, overrides: Props?): Props
+	if overrides ~= nil then
+		for key, value in pairs(overrides) do
+			base[key] = value
+		end
+	end
+	return base
+end
+
+local function new(className: string, props: Props, parent: Instance?): any
+	local inst = Instance.new(className)
+	for key, value in pairs(props) do
+		(inst :: any)[key] = value
+	end
+	-- Parent last: each property write on an already-parented instance is a separate replication
+	-- step, and this builder writes a dozen per widget.
+	inst.Parent = parent
+	return inst
+end
+
+local function corner(inst: Instance, radius: number): ()
+	new("UICorner", { CornerRadius = UDim.new(0, radius) }, inst)
+end
+
+local function stroke(inst: Instance, color: Color3, thickness: number): ()
+	new("UIStroke", { Color = color, Thickness = thickness, Transparency = 0.25 }, inst)
+end
+
+-- Scale padding, not offset: the inset has to shrink with the panel or a phone-sized panel is all
+-- margin and no content.
+local function padding(inst: Instance, scale: number): ()
+	local amount = UDim.new(scale, 0)
+	new("UIPadding", {
+		PaddingTop = amount, PaddingBottom = amount, PaddingLeft = amount, PaddingRight = amount,
+	}, inst)
+end
+
+local function listLayout(inst: Instance, gap: number, overrides: Props?): any
+	return new("UIListLayout", with({
+		FillDirection = Enum.FillDirection.Vertical,
+		SortOrder = Enum.SortOrder.LayoutOrder,
+		Padding = UDim.new(gap, 0),
+		HorizontalAlignment = Enum.HorizontalAlignment.Left,
+		VerticalAlignment = Enum.VerticalAlignment.Top,
+	}, overrides), inst)
+end
+
+local function aspect(inst: Instance, ratio: number): ()
+	new("UIAspectRatioConstraint", { AspectRatio = ratio, DominantAxis = Enum.DominantAxis.Width }, inst)
+end
+
+local function label(props: Props, parent: Instance?): any
+	return new("TextLabel", with({
+		BackgroundTransparency = 1,
+		Font = BODY_FONT,
+		Text = "",
+		TextColor3 = Theme.Ui.Text,
+		TextScaled = true,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		TextYAlignment = Enum.TextYAlignment.Center,
+	}, props), parent)
+end
+
+local function panel(props: Props, parent: Instance?): any
+	local frame = new("Frame", with({
+		BackgroundColor3 = Theme.Ui.Panel,
+		BackgroundTransparency = 0.08,
+		BorderSizePixel = 0,
+	}, props), parent)
+	corner(frame, 10)
+	stroke(frame, Theme.Ui.Stroke, 1.5)
+	return frame
+end
+
+local function button(props: Props, parent: Instance?): any
+	local btn = new("TextButton", with({
+		AutoButtonColor = true,
+		BackgroundColor3 = Theme.Ui.Panel,
+		BorderSizePixel = 0,
+		Font = TITLE_FONT,
+		Text = "",
+		TextColor3 = Theme.Ui.Text,
+		TextScaled = true,
+	}, props), parent)
+	corner(btn, 8)
+	stroke(btn, Theme.Ui.Stroke, 1.5)
+	return btn
+end
+
+-- The primitives handed to UiModals. Passed as an argument rather than required back out of this
+-- module, because UiBuilder already requires UiModals and a cycle would break both.
+local Kit: Props = {
+	with = with, new = new, corner = corner, stroke = stroke, padding = padding,
+	listLayout = listLayout, aspect = aspect, label = label, panel = panel, button = button,
+	TitleFont = TITLE_FONT, BodyFont = BODY_FONT,
+}
+
+--[[ HUD -- top-left. The one region that updates on every tick, so it is a flat stack of labels
+     with no nested layouts to re-solve. ]]
+local function buildHud(parent: Instance): Region
+	local root = panel({
+		Name = "Hud",
+		Position = UDim2.fromScale(0.014, 0.02),
+		Size = UDim2.fromScale(0.26, 0.19),
+	}, parent)
+	aspect(root, 2.1)
+	padding(root, 0.055)
+	listLayout(root, 0.03)
+
+	local essence = label({
+		Name = "EssenceLabel", LayoutOrder = 1, Size = UDim2.fromScale(1, 0.34),
+		Font = TITLE_FONT, TextColor3 = Theme.Ui.Accent, Text = Format.essence(0),
+	}, root)
+	local income = label({
+		Name = "IncomeLabel", LayoutOrder = 2, Size = UDim2.fromScale(1, 0.15),
+		TextColor3 = Theme.Ui.Muted, Text = Format.essence(0) .. "/s",
+	}, root)
+	local stage = label({
+		Name = "StageLabel", LayoutOrder = 3, Size = UDim2.fromScale(1, 0.17),
+		Font = TITLE_FONT, Text = "Stage 1 / " .. tostring(#Theme.Stage),
+	}, root)
+
+	-- The bar is a track plus a Fill whose Size.X.Scale IS the progress: one assignment per update,
+	-- no tween, no maths in the widget.
+	local bar = new("Frame", {
+		Name = "StageBar", LayoutOrder = 4, Size = UDim2.fromScale(1, 0.09),
+		BackgroundColor3 = Theme.Ui.Background, BorderSizePixel = 0,
+	}, root)
+	corner(bar, 6)
+	local fill = new("Frame", {
+		Name = "Fill", Size = UDim2.fromScale(0, 1),
+		BackgroundColor3 = Theme.Ui.Accent, BorderSizePixel = 0,
+	}, bar)
+	corner(fill, 6)
+
+	local chip = label({
+		Name = "MultiplierChip", LayoutOrder = 5, Size = UDim2.fromScale(0.46, 0.14),
+		BackgroundTransparency = 0.15, BackgroundColor3 = Theme.Ui.Background,
+		Font = TITLE_FONT, TextColor3 = Theme.Ui.Warning, TextXAlignment = Enum.TextXAlignment.Center,
+		Text = "x1",
+	}, root)
+	corner(chip, 6)
+
+	return {
+		Root = root, EssenceLabel = essence, IncomeLabel = income,
+		StageLabel = stage, StageBar = bar, StageFill = fill, MultiplierChip = chip,
+	}
+end
+
+--[[ Partner panel -- top-right. Two fixed rows, one per Sanctum slot, each carrying BOTH a filled
+     state and an empty state. Building both up front means the occupant observer only ever toggles
+     Visible, so a partner joining or leaving never allocates an Instance. ]]
+local function buildPartnerRow(parent: Instance, slot: number): Region
+	local row = new("Frame", {
+		Name = "Slot" .. tostring(slot), LayoutOrder = slot, Size = UDim2.fromScale(1, 0.42),
+		BackgroundColor3 = Theme.Ui.Background, BackgroundTransparency = 0.35, BorderSizePixel = 0,
+	}, parent)
+	corner(row, 8)
+	local highlight = new("UIStroke", { Color = Theme.Ui.Accent, Thickness = 2, Transparency = 1 }, row)
+	highlight.Name = "Highlight"
+
+	local name = label({
+		Name = "NameLabel", Position = UDim2.fromScale(0.05, 0.08), Size = UDim2.fromScale(0.62, 0.44),
+		Font = TITLE_FONT, Visible = false,
+	}, row)
+	local contribution = label({
+		Name = "ContributionLabel", Position = UDim2.fromScale(0.05, 0.54), Size = UDim2.fromScale(0.62, 0.36),
+		TextColor3 = Theme.Ui.Muted, Visible = false,
+	}, row)
+	local rebirth = label({
+		Name = "RebirthChip", AnchorPoint = Vector2.new(1, 0.5),
+		Position = UDim2.fromScale(0.95, 0.5), Size = UDim2.fromScale(0.26, 0.5),
+		BackgroundTransparency = 0.2, BackgroundColor3 = Theme.Ui.Panel,
+		TextColor3 = Theme.Ui.Warning, TextXAlignment = Enum.TextXAlignment.Center, Visible = false,
+	}, row)
+	corner(rebirth, 6)
+
+	-- Visible by default: before the first snapshot the honest answer is "nobody is here yet", and
+	-- an open slot is the game's invitation to bring a friend.
+	local empty = label({
+		Name = "EmptyLabel", Position = UDim2.fromScale(0.05, 0.2), Size = UDim2.fromScale(0.9, 0.6),
+		TextColor3 = Theme.Ui.Muted, Text = "Slot open -- bring a friend to the Sanctum",
+	}, row)
+
+	return {
+		Row = row, Highlight = highlight, NameLabel = name,
+		ContributionLabel = contribution, RebirthChip = rebirth, EmptyLabel = empty,
+	}
+end
+
+local function buildPartners(parent: Instance): Region
+	local root = panel({
+		Name = "Partners", AnchorPoint = Vector2.new(1, 0),
+		Position = UDim2.fromScale(0.986, 0.02), Size = UDim2.fromScale(0.26, 0.16),
+	}, parent)
+	aspect(root, 2.4)
+	padding(root, 0.05)
+	listLayout(root, 0.04)
+
+	label({
+		Name = "Title", LayoutOrder = 0, Size = UDim2.fromScale(1, 0.16),
+		Font = TITLE_FONT, TextColor3 = Theme.Ui.Muted, Text = "SANCTUM",
+	}, root)
+
+	return {
+		Root = root,
+		Slots = { buildPartnerRow(root, 1), buildPartnerRow(root, 2) },
+	}
+end
+
+--[[ Action bar -- bottom-centre, where a thumb reaches on a phone. Transparent: the buttons are the
+     panel, so the bar itself never covers the world. ]]
+local function buildActionBar(parent: Instance): Region
+	local root = new("Frame", {
+		Name = "ActionBar", AnchorPoint = Vector2.new(0.5, 1), BackgroundTransparency = 1,
+		Position = UDim2.fromScale(0.5, 0.975), Size = UDim2.fromScale(0.46, 0.085),
+	}, parent)
+	listLayout(root, 0.015, {
+		FillDirection = Enum.FillDirection.Horizontal,
+		HorizontalAlignment = Enum.HorizontalAlignment.Center,
+		VerticalAlignment = Enum.VerticalAlignment.Center,
+	})
+
+	local attune = button({
+		Name = "AttuneButton", LayoutOrder = 1, Size = UDim2.fromScale(0.44, 1),
+		BackgroundColor3 = Theme.Ui.Accent, Text = "Attune",
+	}, root)
+	-- Hidden, not disabled: an ineligible Transcendence is not a button the pair should be looking
+	-- at, and it only ever becomes reachable once Gates.Transcend.Ok says so.
+	local transcend = button({
+		Name = "TranscendButton", LayoutOrder = 2, Size = UDim2.fromScale(0.34, 1),
+		BackgroundColor3 = Theme.Ui.Warning, TextColor3 = Theme.Ui.Background,
+		Text = "Transcend", Visible = false,
+	}, root)
+	local settings = button({
+		Name = "SettingsButton", LayoutOrder = 3, Size = UDim2.fromScale(0.14, 1), Text = "Settings",
+	}, root)
+
+	return { Root = root, AttuneButton = attune, TranscendButton = transcend, SettingsButton = settings }
+end
+
+--[[ Toast stack -- bottom-left, growing upward so a new toast never shifts the ones already being
+     read. NotifyController owns what goes in it. ]]
+local function buildToasts(parent: Instance): Region
+	local root = new("Frame", {
+		Name = "Toasts", AnchorPoint = Vector2.new(0, 1), BackgroundTransparency = 1,
+		Position = UDim2.fromScale(0.014, 0.87), Size = UDim2.fromScale(0.24, 0.42),
+	}, parent)
+	local layout = listLayout(root, 0.02, {
+		VerticalAlignment = Enum.VerticalAlignment.Bottom,
+		SortOrder = Enum.SortOrder.LayoutOrder,
+	})
+	return { Root = root, Layout = layout }
+end
+
+--[[ Builds the tree and returns it UNPARENTED. ClientBootstrap owns the moment it becomes visible,
+     so a half-built HUD is never on screen. ]]
+function UiBuilder.build(): Ui
+	local screen = new("ScreenGui", {
+		Name = "SanctumHud",
+		ResetOnSpawn = false, -- the HUD must survive a respawn; state lives in the store, not here
+		IgnoreGuiInset = true,
+		DisplayOrder = 10,
+		ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
+	}, nil)
+
+	return {
+		ScreenGui = screen,
+		Hud = buildHud(screen),
+		Partners = buildPartners(screen),
+		ActionBar = buildActionBar(screen),
+		Modals = UiModals.build(Kit, screen),
+		Toasts = buildToasts(screen),
+	}
+end
+
+return UiBuilder
+
+--#endregion
+end
 MODULE_ORDER[#MODULE_ORDER + 1] = { Path = "ServerScriptService/Core/ServiceRegistry", Class = "ModuleScript", File = "src/server/ServiceRegistry.luau" }
 MODULE_DEFS["ServerScriptService/Core/ServiceRegistry"] = function(script, require, ...)
 --#region src/server/ServiceRegistry.luau
@@ -3791,6 +4116,102 @@ return Service
 
 --#endregion
 end
+MODULE_ORDER[#MODULE_ORDER + 1] = { Path = "ServerScriptService/Core/Systems/BuildKit", Class = "ModuleScript", File = "src/server/Systems/BuildKit.luau" }
+MODULE_DEFS["ServerScriptService/Core/Systems/BuildKit"] = function(script, require, ...)
+--#region src/server/Systems/BuildKit.luau
+--!strict
+--[[
+    BuildKit
+    The construction primitives PlotBuilder assembles a Sanctum from: one Part factory that cannot
+    forget to anchor, one billboard-sign factory, one folder helper, and the shared geometry and
+    material constants they use.
+
+    Split out of PlotBuilder purely to keep both files inside the project's 300-line budget. It has
+    no game knowledge -- nothing here reads a data table or a PlotState.
+    Owner: server  |  Consumers: PlotBuilder
+]]
+
+local Modules = game:GetService("ReplicatedStorage"):WaitForChild("Modules")
+local Theme = require(Modules:WaitForChild("Theme"))
+
+local BuildKit = {}
+
+type PartProps = { Name: string, Size: Vector3, CFrame: CFrame, Color: Color3, Parent: Instance,
+	Material: Enum.Material, Transparency: number?, CanCollide: boolean? }
+
+-- PlotLayout owns every POSITION; these are the extents that fill the space it reserves. Its pad
+-- line spacing is 12 studs so a 6-stud pad leaves a walkway, and a 2-tall pad centred on its
+-- PAD_HEIGHT of 1.5 rests on the 0.5 slab top rather than hovering.
+local PAD_SIZE = Vector3.new(6, 2, 6)
+local FONT_SIZE, MARKER_SIZE = Vector3.new(12, 6, 12), Vector3.new(8, 0.2, 8)
+local MARKER_DROP = -3.4 -- spawn CFrames float at head clearance; the decal belongs on the floor
+local MAX_CONFLUX_SIZE = 60 -- keeps a corrupt stage entry from producing a Sanctum-filling cube
+local MAX_LIGHT_RANGE = 60 -- PointLight.Range is hard-capped at 60 by the engine
+local RAIL_WIDTH, RAIL_THICKNESS, MIN_RAIL_LENGTH = 2.2, 0.4, 0.5 -- below MIN a segment is degenerate
+
+-- Theme has materials for the Conflux and the Affinities but none for static architecture, so a
+-- Sanctum's structural materials are named once here. NEON covers rails and the Font: both glow, so
+-- they read as live ley-work rather than as more masonry.
+local FLOOR_MATERIAL, PAD_MATERIAL = Enum.Material.Slate, Enum.Material.Metal
+local NEON, MARKER_MATERIAL = Enum.Material.Neon, Enum.Material.ForceField
+
+local function newFolder(name: string, parent: Instance): Folder
+	local folder = Instance.new("Folder")
+	folder.Name = name
+	folder.Parent = parent
+	return folder
+end
+
+local function makePart(props: PartProps): Part
+	local part = Instance.new("Part")
+	part.Name = props.Name
+	part.Size = props.Size
+	part.CFrame = props.CFrame
+	part.Color = props.Color
+	part.Material = props.Material
+	part.Anchored = true -- correctness, not optimisation: an unanchored slab falls out of the world
+	part.CanCollide = if props.CanCollide == nil then true else props.CanCollide
+	part.Transparency = props.Transparency or 0
+	part.Parent = props.Parent
+	return part
+end
+
+-- A blank billboard label. PurchaseService writes pad wording; the Font supplies its own up front.
+local function makeSign(adornee: Instance, text: string, height: number): TextLabel
+	local gui = Instance.new("BillboardGui")
+	gui.Name = "Sign"
+	gui.Size = UDim2.new(0, 220, 0, 70)
+	gui.StudsOffset = Vector3.new(0, height, 0)
+	gui.MaxDistance = 90 -- 6 Sanctums x ~25 signs = 150 billboards; cull the already-illegible ones
+	gui.Parent = adornee
+	local label = Instance.new("TextLabel")
+	label.Size = UDim2.new(1, 0, 1, 0)
+	label.BackgroundTransparency = 1
+	label.TextColor3 = Theme.Ui.Text
+	label.TextStrokeTransparency = 0.4 -- pads glow; a stroke keeps the text off its own background
+	label.TextScaled = true
+	label.Text = text
+	label.Parent = gui
+	return label
+end
+
+BuildKit.PAD_SIZE = PAD_SIZE
+BuildKit.FONT_SIZE = FONT_SIZE
+BuildKit.MARKER_SIZE = MARKER_SIZE
+BuildKit.MARKER_DROP = MARKER_DROP
+BuildKit.MAX_CONFLUX_SIZE = MAX_CONFLUX_SIZE
+BuildKit.MAX_LIGHT_RANGE = MAX_LIGHT_RANGE
+BuildKit.RAIL_WIDTH = RAIL_WIDTH
+BuildKit.RAIL_THICKNESS = RAIL_THICKNESS
+BuildKit.MIN_RAIL_LENGTH = MIN_RAIL_LENGTH
+BuildKit.newFolder = newFolder
+BuildKit.makePart = makePart
+BuildKit.makeSign = makeSign
+
+return BuildKit
+
+--#endregion
+end
 MODULE_ORDER[#MODULE_ORDER + 1] = { Path = "ServerScriptService/Core/Systems/DropperSystem", Class = "ModuleScript", File = "src/server/Systems/DropperSystem.luau" }
 MODULE_DEFS["ServerScriptService/Core/Systems/DropperSystem"] = function(script, require, ...)
 --#region src/server/Systems/DropperSystem.luau
@@ -4309,67 +4730,18 @@ type Runtime = {
 	Origin: CFrame, Sections: { [string]: Instance }, Pads: { [string]: Instance },
 	RailFolders: { [string]: Instance }, Signs: { [string]: TextLabel } }
 
-type PartProps = { Name: string, Size: Vector3, CFrame: CFrame, Color: Color3, Parent: Instance,
-	Material: Enum.Material, Transparency: number?, CanCollide: boolean? }
-
--- PlotLayout owns every POSITION; these are the extents that fill the space it reserves. Its pad
--- line spacing is 12 studs so a 6-stud pad leaves a walkway, and a 2-tall pad centred on its
--- PAD_HEIGHT of 1.5 rests on the 0.5 slab top rather than hovering.
-local PAD_SIZE = Vector3.new(6, 2, 6)
-local FONT_SIZE, MARKER_SIZE = Vector3.new(12, 6, 12), Vector3.new(8, 0.2, 8)
-local MARKER_DROP = -3.4 -- spawn CFrames float at head clearance; the decal belongs on the floor
-local MAX_CONFLUX_SIZE = 60 -- keeps a corrupt stage entry from producing a Sanctum-filling cube
-local MAX_LIGHT_RANGE = 60 -- PointLight.Range is hard-capped at 60 by the engine
-local RAIL_WIDTH, RAIL_THICKNESS, MIN_RAIL_LENGTH = 2.2, 0.4, 0.5 -- below MIN a segment is degenerate
-
--- Theme has materials for the Conflux and the Affinities but none for static architecture, so a
--- Sanctum's structural materials are named once here. NEON covers rails and the Font: both glow, so
--- they read as live ley-work rather than as more masonry.
-local FLOOR_MATERIAL, PAD_MATERIAL = Enum.Material.Slate, Enum.Material.Metal
-local NEON, MARKER_MATERIAL = Enum.Material.Neon, Enum.Material.ForceField
+-- Construction primitives and shared extents live in BuildKit; aliased locally so every call
+-- site below reads the same as before the split.
+local BuildKit = require(script.Parent.BuildKit)
+local newFolder, makePart, makeSign = BuildKit.newFolder, BuildKit.makePart, BuildKit.makeSign
+local PAD_SIZE, FONT_SIZE, MARKER_SIZE = BuildKit.PAD_SIZE, BuildKit.FONT_SIZE, BuildKit.MARKER_SIZE
+local MARKER_DROP, MAX_CONFLUX_SIZE = BuildKit.MARKER_DROP, BuildKit.MAX_CONFLUX_SIZE
+local MAX_LIGHT_RANGE = BuildKit.MAX_LIGHT_RANGE
+local RAIL_WIDTH, RAIL_THICKNESS = BuildKit.RAIL_WIDTH, BuildKit.RAIL_THICKNESS
+local MIN_RAIL_LENGTH = BuildKit.MIN_RAIL_LENGTH
 local HIDDEN_ROOT_NAME = "SanctumHiddenWings" -- where locked Wings wait; see setSectionVisible
 
 local PlotBuilder = {}
-
-local function newFolder(name: string, parent: Instance): Folder
-	local folder = Instance.new("Folder")
-	folder.Name = name
-	folder.Parent = parent
-	return folder
-end
-
-local function makePart(props: PartProps): Part
-	local part = Instance.new("Part")
-	part.Name = props.Name
-	part.Size = props.Size
-	part.CFrame = props.CFrame
-	part.Color = props.Color
-	part.Material = props.Material
-	part.Anchored = true -- correctness, not optimisation: an unanchored slab falls out of the world
-	part.CanCollide = if props.CanCollide == nil then true else props.CanCollide
-	part.Transparency = props.Transparency or 0
-	part.Parent = props.Parent
-	return part
-end
-
--- A blank billboard label. PurchaseService writes pad wording; the Font supplies its own up front.
-local function makeSign(adornee: Instance, text: string, height: number): TextLabel
-	local gui = Instance.new("BillboardGui")
-	gui.Name = "Sign"
-	gui.Size = UDim2.new(0, 220, 0, 70)
-	gui.StudsOffset = Vector3.new(0, height, 0)
-	gui.MaxDistance = 90 -- 6 Sanctums x ~25 signs = 150 billboards; cull the already-illegible ones
-	gui.Parent = adornee
-	local label = Instance.new("TextLabel")
-	label.Size = UDim2.new(1, 0, 1, 0)
-	label.BackgroundTransparency = 1
-	label.TextColor3 = Theme.Ui.Text
-	label.TextStrokeTransparency = 0.4 -- pads glow; a stroke keeps the text off its own background
-	label.TextScaled = true
-	label.Text = text
-	label.Parent = gui
-	return label
-end
 
 --[[ The per-Wing pad numbering, assigned in exactly one place. PlotLayout.padCFrame and .railPath
      take a PER-WING running index, not a catalogue Order -- DropperData and UpgradeData both number
@@ -6892,11 +7264,6 @@ type Prestige = { Rebirths: number, Multiplier: number, Badges: { [string]: bool
 type Settings = { Music: boolean, Sfx: boolean }
 type Stats = { TotalEssenceEarned: number, Playtime: number, JoinCount: number, FirstJoin: number, LastSave: number }
 type Profile = { SchemaVersion: number, Plot: PlotState, Prestige: Prestige, Settings: Settings, Stats: Stats }
--- Options for snapshotForClient. Prestige/Settings/Stats live in per-player Profiles a pure module
--- cannot fetch, so the caller passes them keyed by UserId, with display Names and EconomyService's
--- cached Multipliers. Full = false selects the essence-only fast tick.
-type SnapshotOpts = { Full: boolean?, Tick: number?, MoteCount: number?,
-	Profiles: { [number]: any }?, Names: { [number]: string }?, Multipliers: any? }
 
 local StateSchema = {}
 StateSchema.VERSION = 1
@@ -7063,91 +7430,9 @@ function StateSchema.mergePlotStates(a: PlotState, b: PlotState): PlotState
 	-- re-clamped: a union can exceed a def's MaxOwned if the catalogue shrank between the two saves
 	return sanitizePlotState(out)
 end
--- UserId from a number, a plain table (tests) or a Player-like object. pcall'd because the value can
--- be userdata with a protective metatable; a failed read simply means "not you".
-local function userIdOf(v: any): number
-	if type(v) == "number" then return int(v, 0, 1e18, 0) end
-	local ok, id = pcall(function(): any return (v :: any).UserId end)
-	return if ok and type(id) == "number" then int(id, 0, 1e18, 0) else 0
-end
-local function nameOf(opts: { [string]: any }, uid: number, occupant: { [string]: any }): string
-	local given = tbl(opts.Names)[uid :: any]
-	if type(given) == "string" and #given > 0 then return given end
-	if type(occupant.Name) == "string" then return occupant.Name :: string end
-	-- read-only fallback off a Player-like field; the pcall keeps this total for plain-table tests
-	local ok, name = pcall(function(): any return (occupant.Player :: any).Name end)
-	return if ok and type(name) == "string" then name else "Occupant " .. tostring(uid)
-end
-local function prestigeOf(opts: { [string]: any }, uid: number): Prestige
-	return sanitizePrestige(tbl(tbl(opts.Profiles)[uid :: any]).Prestige)
-end
-local function buildSnapshot(sanctum: any, forPlayer: any, opts: any): { [string]: any }
-	local o, root = tbl(opts), tbl(sanctum)
-	-- accepts a Sanctum or a bare PlotState, so unit tests can drive it with a plain table
-	local plot = sanitizePlotState(if type(root.State) == "table" then root.State else root)
-	-- Essence rides every tick, everything else only when Full: §7's bandwidth split
-	local snapshotTick = clamp(o.Tick, 0, MAX_TIME, 0)
-	if o.Full == false then return { Full = false, Tick = snapshotTick, Essence = plot.Essence } end
-	local youId = userIdOf(forPlayer)
-	local occupants: { any }, rebirthsList: { number }, yourSlot = {}, {}, 0
-	for _, entry in pairs(tbl(root.Occupants)) do
-		local occ = tbl(entry)
-		local uid = userIdOf(if occ.UserId ~= nil then occ.UserId else occ.Player)
-		local prestige = prestigeOf(o, uid)
-		local isYou = uid ~= 0 and uid == youId
-		local slot = int(occ.Slot, 0, GameConfig.Plot.SlotsPerSanctum, 0)
-		if isYou then yourSlot = slot end
-		table.insert(rebirthsList, prestige.Rebirths)
-		table.insert(occupants, {
-			UserId = uid, Name = nameOf(o, uid, occ), Slot = slot,
-			Contribution = clamp(occ.Contribution, 0, MAX_CURRENCY, 0),
-			Rebirths = prestige.Rebirths, Multiplier = prestige.Multiplier, IsYou = isYou,
-		})
-	end
-	-- sorted by slot: `pairs` order is unspecified, and an unstable partner panel would flicker
-	table.sort(occupants, function(x, y): boolean
-		return if x.Slot == y.Slot then x.UserId < y.UserId else x.Slot < y.Slot
-	end)
-	local m = if type(o.Multipliers) == "table" then o.Multipliers else Economy.getMultipliers(plot, rebirthsList)
-	local you, yourProfile = prestigeOf(o, youId), tbl(tbl(o.Profiles)[youId :: any])
-	local attuneOk, attuneReason = Economy.attuneStatus(plot)
-	local transcendOk, transcendReason = Economy.transcendStatus(plot)
-	local nextStage = EvolutionData.next(plot.Stage)
-	return {
-		Full = true, Tick = snapshotTick, Essence = plot.Essence,
-		Plot = {
-			Id = int(root.Id, 0, 1e6, 0), Stage = plot.Stage, Affinity = plot.Affinity,
-			-- fresh tables straight from sanitizePlotState, so a queued payload can never be mutated
-			-- out from under the client by the next server tick
-			Droppers = plot.Droppers, Upgrades = plot.Upgrades, Sections = plot.Sections,
-			LifetimeEssence = plot.LifetimeEssence,
-			IncomePerSecond = Economy.estimateIncomePerSecond(plot, m),
-			Multiplier = Economy.totalMultiplier(m),
-			MoteCount = int(o.MoteCount, 0, 1e6, 0), MoteCapacity = Economy.getMoteCapacity(plot),
-		},
-		Occupants = occupants,
-		You = {
-			Rebirths = you.Rebirths, Multiplier = you.Multiplier, Badges = you.Badges,
-			Settings = sanitizeSettings(yourProfile.Settings), Slot = yourSlot,
-			TotalEssenceEarned = clamp(tbl(yourProfile.Stats).TotalEssenceEarned, 0, MAX_CURRENCY, 0),
-		},
-		Gates = {
-			Attune = { Ok = attuneOk, Reason = attuneReason, -- Cost is 0 at max stage, never nil
-				Cost = if nextStage then clamp(nextStage.RequiredEssence, 0, MAX_CURRENCY, 0) else 0,
-				NextStage = if nextStage then nextStage.Index else nil },
-			Transcend = { Ok = transcendOk, Reason = transcendReason },
-			-- Available means "the modal may open" (stage gate only); Chosen stays nil until the
-			-- pair picks, and the client uses the pair to choose prompt vs. read-only chip.
-			Affinity = { Available = plot.Stage >= EvolutionData.AffinityUnlockStage, Chosen = plot.Affinity },
-		},
-	}
-end
--- Degrades to a fast tick rather than throwing: it runs inside the replication loop, whose single
--- Heartbeat connection drives every sanctum.
-function StateSchema.snapshotForClient(sanctum: any, forPlayer: any, opts: any): { [string]: any }
-	local ok, snapshot = pcall(buildSnapshot, sanctum, forPlayer, opts)
-	return if ok then snapshot else { Full = false, Tick = 0, Essence = 0 }
-end
+-- NOTE: rendering the StateSync payload lives in Snapshot.luau, NOT here. It was split out to
+-- keep both files inside the project's 300-line budget, and because replication is a different
+-- concern from persistence. Do not re-add snapshotForClient to this module.
 -- Exposed so PlotService and the specs can repair a FRAGMENT of state without loading a whole
 -- Profile; they are the very functions the sanitiser uses, so "legal" has one definition.
 StateSchema.sanitizePlotState = sanitizePlotState
