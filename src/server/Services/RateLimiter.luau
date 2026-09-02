@@ -49,11 +49,16 @@ type RateLimiterService = {
 local Service = {} :: RateLimiterService
 Service.Name = "RateLimiter"
 
---[[ os.clock is a monotonic process clock. os.time would be wrong here: it can jump backwards or
-     forwards when the host's wall clock is corrected, which would hand a client either a free
-     refill or an hours-long lockout. Exposed as a field purely so tests can substitute a
-     deterministic clock -- production code must never reassign it. ]]
-Service.Clock = os.clock
+--[[ The one time source for every bucket, read through this field so it can be substituted.
+
+     tick() rather than os.clock(): both are continuous (no scheduled refill task either way), but
+     tick() is the clock the headless harness can advance, so the refill curve is testable instead
+     of taken on trust. tick()'s known weakness -- it follows the host wall clock and can jump if
+     that is corrected -- is fully contained here: `refill` credits nothing for non-positive
+     elapsed time (a backwards jump costs a client nothing and re-anchors), and a forward jump is
+     clamped by Capacity, so the worst case is one client getting one extra burst. Neither can
+     unbound the limiter, which is the only property that matters. ]]
+Service.Clock = tick
 
 Service._buckets = {}
 
@@ -74,10 +79,15 @@ local function refill(bucket: Bucket, now: number): ()
 end
 
 function Service:Init(_registry: any): ()
-	-- Rebuilt here rather than trusted from module scope so a re-Init (tests, a soft restart) never
-	-- inherits buckets belonging to players from a previous run.
+	-- Dropping a live connection without disconnecting it would leave an orphan handler writing
+	-- into the discarded bucket table forever, so a re-Init (a soft restart, a test) unwires first.
+	if self._connection ~= nil then
+		self._connection:Disconnect()
+		self._connection = nil
+	end
+	-- Rebuilt rather than carried over, so a re-Init never inherits buckets belonging to players
+	-- from a previous run.
 	self._buckets = {}
-	self._connection = nil
 end
 
 function Service:Start(): ()

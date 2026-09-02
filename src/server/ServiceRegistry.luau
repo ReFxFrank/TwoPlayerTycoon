@@ -145,6 +145,10 @@ function Registry.TryGet(self: Registry, name: string): any?
 	return self._services[name]
 end
 
+--[[ A second InitAll is refused, not absorbed. Init allocates state and resolves peers, so it is
+     not idempotent for most services -- a silent no-op would hide a genuine Bootstrap bug, and
+     re-running would hand every service a second copy of its own state. Nothing is re-run either
+     way; the error is what makes the mistake visible. ]]
 function Registry.InitAll(self: Registry): ()
 	if self._initialised then
 		error("ServiceRegistry:InitAll called twice -- Init is not idempotent for most services", 2)
@@ -158,11 +162,12 @@ end
 
 function Registry.StartAll(self: Registry): ()
 	if not self._initialised then
-		-- Start may call peers, and a peer that never ran Init has nil state. Ordering mistakes in
-		-- Bootstrap must be loud.
+		-- Not the same case as a double call: Start may talk to peers, and a peer that never ran
+		-- Init has nil state. A phase ordering mistake in Bootstrap must be loud.
 		error("ServiceRegistry:StartAll called before InitAll", 2)
 	end
 	if self._started then
+		-- Start connects events and opens loops; a replay would double-wire every one of them.
 		error("ServiceRegistry:StartAll called twice -- Start connects events and would double-wire", 2)
 	end
 	self._started = true

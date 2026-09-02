@@ -2327,6 +2327,10 @@ function Registry.TryGet(self: Registry, name: string): any?
 	return self._services[name]
 end
 
+--[[ A second InitAll is refused, not absorbed. Init allocates state and resolves peers, so it is
+     not idempotent for most services -- a silent no-op would hide a genuine Bootstrap bug, and
+     re-running would hand every service a second copy of its own state. Nothing is re-run either
+     way; the error is what makes the mistake visible. ]]
 function Registry.InitAll(self: Registry): ()
 	if self._initialised then
 		error("ServiceRegistry:InitAll called twice -- Init is not idempotent for most services", 2)
@@ -2340,11 +2344,12 @@ end
 
 function Registry.StartAll(self: Registry): ()
 	if not self._initialised then
-		-- Start may call peers, and a peer that never ran Init has nil state. Ordering mistakes in
-		-- Bootstrap must be loud.
+		-- Not the same case as a double call: Start may talk to peers, and a peer that never ran
+		-- Init has nil state. A phase ordering mistake in Bootstrap must be loud.
 		error("ServiceRegistry:StartAll called before InitAll", 2)
 	end
 	if self._started then
+		-- Start connects events and opens loops; a replay would double-wire every one of them.
 		error("ServiceRegistry:StartAll called twice -- Start connects events and would double-wire", 2)
 	end
 	self._started = true
@@ -2741,11 +2746,16 @@ type RateLimiterService = {
 local Service = {} :: RateLimiterService
 Service.Name = "RateLimiter"
 
---[[ os.clock is a monotonic process clock. os.time would be wrong here: it can jump backwards or
-     forwards when the host's wall clock is corrected, which would hand a client either a free
-     refill or an hours-long lockout. Exposed as a field purely so tests can substitute a
-     deterministic clock -- production code must never reassign it. ]]
-Service.Clock = os.clock
+--[[ The one time source for every bucket, read through this field so it can be substituted.
+
+     tick() rather than os.clock(): both are continuous (no scheduled refill task either way), but
+     tick() is the clock the headless harness can advance, so the refill curve is testable instead
+     of taken on trust. tick()'s known weakness -- it follows the host wall clock and can jump if
+     that is corrected -- is fully contained here: `refill` credits nothing for non-positive
+     elapsed time (a backwards jump costs a client nothing and re-anchors), and a forward jump is
+     clamped by Capacity, so the worst case is one client getting one extra burst. Neither can
+     unbound the limiter, which is the only property that matters. ]]
+Service.Clock = tick
 
 Service._buckets = {}
 
@@ -2766,10 +2776,15 @@ local function refill(bucket: Bucket, now: number): ()
 end
 
 function Service:Init(_registry: any): ()
-	-- Rebuilt here rather than trusted from module scope so a re-Init (tests, a soft restart) never
-	-- inherits buckets belonging to players from a previous run.
+	-- Dropping a live connection without disconnecting it would leave an orphan handler writing
+	-- into the discarded bucket table forever, so a re-Init (a soft restart, a test) unwires first.
+	if self._connection ~= nil then
+		self._connection:Disconnect()
+		self._connection = nil
+	end
+	-- Rebuilt rather than carried over, so a re-Init never inherits buckets belonging to players
+	-- from a previous run.
 	self._buckets = {}
-	self._connection = nil
 end
 
 function Service:Start(): ()
@@ -4722,9 +4737,10 @@ RemoteSchema.Remotes = {
 	},
 } :: { [string]: RemoteDef }
 
--- Deterministic creation order for RemoteService (and for the specs): server -> client first, so a
--- client that is already listening cannot miss an early push while the C2S events are still being
--- created, then alphabetical inside each direction.
+-- Deterministic creation order for RemoteService: `pairs` order is unspecified in Luau, so without
+-- this sort the folder would be built differently on every boot. Server -> client remotes are
+-- created FIRST, so a client that is already listening cannot miss an early push while the inbound
+-- events are still being made; alphabetical inside each direction keeps it diffable.
 RemoteSchema.List = {} :: { RemoteDef }
 for _, def in pairs(RemoteSchema.Remotes) do
 	table.insert(RemoteSchema.List, def)
@@ -5143,11 +5159,9 @@ MODULE_DEFS["ReplicatedStorage/Modules/StateSchema"] = function(script, require,
     The authoritative shape of everything saved, merged or replicated: PlotState, Prestige, Settings,
     Stats and the Profile wrapping them. It builds fresh state, repairs arbitrary input into a legal
     Profile, version-migrates old saves, max-merges two Sanctum states when a partner links in (§1.5)
-    and max-merges two Sanctum states when a partner links in (§1.5). PURE -- no services and no
-    Instances -- so ProfileService,
+    and renders the StateSync snapshot (§7). PURE -- no services, no Instances -- so ProfileService,
     PlotService, StateReplicator and the headless tests all share one definition.
-    Rendering the StateSync payload lives next door in Snapshot.luau.
-    Owner: shared  |  Consumers: Snapshot, ProfileService, PlotService, RebirthService, tests
+    Owner: shared  |  Consumers: ProfileService, PlotService, StateReplicator, Snapshot, tests
 ]]
 --[[ THREAT MODEL. Input to sanitizeProfile is whatever a DataStore returned: nil, a string, an
      array, a cyclic table, NaN/inf/negative numbers, or a profile forged on an older build. It must
@@ -5165,6 +5179,7 @@ local SectionData = require(script.Parent.SectionData)
 local EvolutionData = require(script.Parent.EvolutionData)
 local AffinityData = require(script.Parent.AffinityData)
 local RebirthData = require(script.Parent.RebirthData)
+
 type PlotState = {
 	Essence: number, Stage: number, Affinity: string?,
 	Droppers: { [string]: number }, Upgrades: { [string]: number }, Sections: { [string]: boolean },
@@ -5179,6 +5194,7 @@ type Profile = { SchemaVersion: number, Plot: PlotState, Prestige: Prestige, Set
 -- cached Multipliers. Full = false selects the essence-only fast tick.
 type SnapshotOpts = { Full: boolean?, Tick: number?, MoteCount: number?,
 	Profiles: { [number]: any }?, Names: { [number]: string }?, Multipliers: any? }
+
 local StateSchema = {}
 StateSchema.VERSION = 1
 -- Currency ceilings sit below 2^53 so every stored balance stays an exact integer; past that,
@@ -7720,6 +7736,228 @@ t.test("geometry helpers tolerate junk without erroring", function()
     t.noThrow(function() return PlotLayout.sanctumOrigin(0 / 0) end)
     t.noThrow(function() return PlotLayout.padCFrame(origin, SectionData.List[1], 0 / 0) end)
     t.noThrow(function() return PlotLayout.spawnSlotCFrame(origin, 99) end)
+end)
+
+--#endregion
+end }
+SPECS[#SPECS + 1] = { Name = "remoteschema.spec", Run = function(t, Mock, loadModule, runScript)
+--#region tests/specs/remoteschema.spec.luau
+--[[
+    remoteschema.spec
+    The client->server remotes are the only bytes an exploiter can put on the wire. Their validators
+    are therefore the game's outer wall, and this spec attacks them: wrong types, extra keys, missing
+    keys, cyclic tables, huge strings, metatables that error on read.
+
+    The single most important assertion in the file is the last one: no client->server payload may
+    carry a quantity, price, id-to-purchase or balance. If one ever does, the design has regressed.
+]]
+
+local RemoteSchema = loadModule("ReplicatedStorage/Modules/RemoteSchema")
+local AffinityData = loadModule("ReplicatedStorage/Modules/AffinityData")
+
+local function c2s()
+    local list = {}
+    for _, def in ipairs(RemoteSchema.List) do
+        if def.Direction == "ClientToServer" then table.insert(list, def) end
+    end
+    return list
+end
+
+local function accepts(def, payload)
+    local ok = def.Validate(payload)
+    return ok == true
+end
+
+t.test("the remote catalogue matches the protocol", function()
+    t.truthy(#RemoteSchema.List > 0)
+    local expected = { "StateSync", "Notify", "Fx", "LinkOffer", "RebirthVoteState",
+        "RequestSnapshot", "RebirthVote", "ChooseAffinity", "SetSetting", "LinkResponse", "ResetData" }
+    for _, name in ipairs(expected) do
+        local def = RemoteSchema.get(name)
+        t.truthy(def, ("remote %s is missing"):format(name))
+        t.eq(def.Name, name, "Name matches the key it is registered under")
+    end
+    t.eq(RemoteSchema.get("NotARemote"), nil)
+    t.eq(RemoteSchema.get(nil), nil)
+    t.eq(RemoteSchema.get(42), nil)
+    t.truthy(#RemoteSchema.FolderName > 0)
+end)
+
+t.test("List and Remotes agree, and List is deterministically ordered", function()
+    local seen = {}
+    for _, def in ipairs(RemoteSchema.List) do
+        t.eq(RemoteSchema.Remotes[def.Name], def)
+        t.falsy(seen[def.Name], "no duplicates in List")
+        seen[def.Name] = true
+    end
+    for name in pairs(RemoteSchema.Remotes) do
+        t.truthy(seen[name], ("%s is in Remotes but missing from List"):format(name))
+    end
+    -- RemoteService creates instances by walking List. `pairs` order is unspecified in Luau, so
+    -- without the sort the creation order would differ between server boots. The order is
+    -- deliberate: every ServerToClient remote is created first, so a client that is already
+    -- listening cannot miss an early push while the inbound events are still being made.
+    local seenInbound = false
+    for index, def in ipairs(RemoteSchema.List) do
+        if def.Direction == "ClientToServer" then
+            seenInbound = true
+        else
+            t.falsy(seenInbound,
+                ("outbound remote %s is created after an inbound one (position %d)"):format(def.Name, index))
+        end
+        local previous = RemoteSchema.List[index - 1]
+        if previous and previous.Direction == def.Direction then
+            t.truthy(previous.Name < def.Name,
+                ("%s and %s are out of alphabetical order"):format(previous.Name, def.Name))
+        end
+    end
+end)
+
+t.test("every client->server remote is rate limited AND validated", function()
+    local defs = c2s()
+    t.truthy(#defs >= 6, "the protocol has at least six inbound remotes")
+    for _, def in ipairs(defs) do
+        t.truthy(type(def.Validate) == "function", def.Name .. " has no validator")
+        t.truthy(type(def.RateLimit) == "table", def.Name .. " has no rate limit")
+        t.gt(def.RateLimit.Tokens, 0, def.Name .. " token budget")
+        t.gt(def.RateLimit.Interval, 0, def.Name .. " interval")
+        t.lt(def.RateLimit.Tokens, 100, def.Name .. " budget is too generous to be a limit")
+    end
+end)
+
+t.test("server->client remotes carry no inbound validator or limit", function()
+    for _, def in ipairs(RemoteSchema.List) do
+        if def.Direction == "ServerToClient" then
+            t.eq(def.RateLimit, nil, def.Name .. " is outbound; a rate limit there means nothing")
+            t.eq(def.Validate, nil, def.Name .. " is outbound; nothing arrives on it to validate")
+        end
+    end
+end)
+
+t.test("validators accept exactly the legal payloads", function()
+    t.truthy(accepts(RemoteSchema.Remotes.RequestSnapshot, nil), "RequestSnapshot takes no payload")
+    t.truthy(accepts(RemoteSchema.Remotes.RebirthVote, { Accept = true }))
+    t.truthy(accepts(RemoteSchema.Remotes.RebirthVote, { Accept = false }))
+    for _, affinity in ipairs(AffinityData.List) do
+        t.truthy(accepts(RemoteSchema.Remotes.ChooseAffinity, { Affinity = affinity.Id }),
+            affinity.Id .. " is a legal choice")
+    end
+    t.truthy(accepts(RemoteSchema.Remotes.SetSetting, { Key = "Music", Value = false }))
+    t.truthy(accepts(RemoteSchema.Remotes.SetSetting, { Key = "Sfx", Value = true }))
+    t.truthy(accepts(RemoteSchema.Remotes.LinkResponse, { PlotId = 3, Accept = true }))
+    t.truthy(accepts(RemoteSchema.Remotes.ResetData, { Confirm = true }))
+end)
+
+t.test("validators reject wrong types", function()
+    t.falsy(accepts(RemoteSchema.Remotes.RebirthVote, { Accept = "true" }))
+    t.falsy(accepts(RemoteSchema.Remotes.RebirthVote, { Accept = 1 }))
+    t.falsy(accepts(RemoteSchema.Remotes.RebirthVote, { Accept = nil }))
+    t.falsy(accepts(RemoteSchema.Remotes.ChooseAffinity, { Affinity = 1 }))
+    t.falsy(accepts(RemoteSchema.Remotes.SetSetting, { Key = "Music", Value = "off" }))
+    t.falsy(accepts(RemoteSchema.Remotes.LinkResponse, { PlotId = "3", Accept = true }))
+end)
+
+t.test("validators reject values outside their closed set", function()
+    t.falsy(accepts(RemoteSchema.Remotes.ChooseAffinity, { Affinity = "plasma" }),
+        "an unknown affinity is refused at the wire, not deep inside EvolutionService")
+    t.falsy(accepts(RemoteSchema.Remotes.ChooseAffinity, { Affinity = "" }))
+    t.falsy(accepts(RemoteSchema.Remotes.SetSetting, { Key = "Invincible", Value = true }),
+        "SetSetting must not become a generic profile writer")
+    t.falsy(accepts(RemoteSchema.Remotes.SetSetting, { Key = "Essence", Value = true }))
+    t.falsy(accepts(RemoteSchema.Remotes.ResetData, { Confirm = false }),
+        "the confirm flag must be literally true")
+end)
+
+t.test("validators reject EXTRA keys -- the classic probe", function()
+    t.falsy(accepts(RemoteSchema.Remotes.RebirthVote, { Accept = true, Amount = 1e9 }))
+    t.falsy(accepts(RemoteSchema.Remotes.ChooseAffinity, { Affinity = "ember", Essence = 1e9 }))
+    t.falsy(accepts(RemoteSchema.Remotes.SetSetting, { Key = "Music", Value = true, Stage = 6 }))
+    t.falsy(accepts(RemoteSchema.Remotes.LinkResponse, { PlotId = 1, Accept = true, Force = true }))
+    t.falsy(accepts(RemoteSchema.Remotes.ResetData, { Confirm = true, KeepPrestige = false }))
+end)
+
+t.test("validators reject missing keys", function()
+    t.falsy(accepts(RemoteSchema.Remotes.SetSetting, { Key = "Music" }))
+    t.falsy(accepts(RemoteSchema.Remotes.SetSetting, { Value = true }))
+    t.falsy(accepts(RemoteSchema.Remotes.LinkResponse, { PlotId = 1 }))
+    t.falsy(accepts(RemoteSchema.Remotes.LinkResponse, { Accept = true }))
+    t.falsy(accepts(RemoteSchema.Remotes.ChooseAffinity, {}))
+end)
+
+t.test("a payload-taking validator rejects a bare value", function()
+    for _, def in ipairs(c2s()) do
+        if def.Name ~= "RequestSnapshot" then
+            for _, junk in ipairs({ 5, "string", true, { 1, 2, 3 } }) do
+                t.falsy(accepts(def, junk), ("%s accepted a bare %s"):format(def.Name, typeof(junk)))
+            end
+            t.falsy(accepts(def, nil), def.Name .. " accepted nil")
+        end
+    end
+end)
+
+t.test("fuzz: no validator errors, whatever arrives", function()
+    local cyclic = { Accept = true }
+    cyclic.self = cyclic
+    local booby = setmetatable({}, { __index = function() error("gotcha") end })
+    local deep = {}
+    local node = deep
+    for _ = 1, 200 do
+        node.next = {}
+        node = node.next
+    end
+
+    local payloads = {
+        nil, 0, -1, 0 / 0, math.huge, "", ("x"):rep(100000), true, false,
+        {}, { 1, 2, 3 }, cyclic, booby, deep, print, coroutine.create(print),
+        Vector3.new(1, 2, 3), Color3.new(1, 1, 1), Enum.Material.Neon,
+        { Accept = booby }, { Affinity = booby }, { Key = booby, Value = true },
+        { PlotId = 0 / 0, Accept = true }, { PlotId = math.huge, Accept = true },
+        { PlotId = -1, Accept = true }, { Confirm = booby },
+        { [1] = "positional", Accept = true },
+        { ["Accept "] = true }, { accept = true },
+    }
+    for _, def in ipairs(c2s()) do
+        for index = 1, 29 do
+            local ok, result
+            t.noThrow(function() ok, result = def.Validate(payloads[index]) end,
+                ("%s.Validate errored on fuzz payload %d"):format(def.Name, index))
+            t.truthy(type(ok) == "boolean" or ok == nil,
+                ("%s.Validate returned a non-boolean"):format(def.Name))
+            if ok == false and result ~= nil then
+                t.truthy(type(result) == "string", "the rejection reason is a string when present")
+            end
+        end
+    end
+end)
+
+t.test("fuzz: a wrong-case or padded key never sneaks through", function()
+    t.falsy(accepts(RemoteSchema.Remotes.SetSetting, { key = "Music", value = true }))
+    t.falsy(accepts(RemoteSchema.Remotes.SetSetting, { Key = "music", Value = true }))
+    t.falsy(accepts(RemoteSchema.Remotes.ChooseAffinity, { Affinity = "EMBER" }))
+    t.falsy(accepts(RemoteSchema.Remotes.ChooseAffinity, { Affinity = " ember" }))
+    t.falsy(accepts(RemoteSchema.Remotes.ChooseAffinity, { Affinity = "ember\0" }))
+end)
+
+t.test("NO client->server payload may carry a quantity, price, id or balance", function()
+    -- This is the design invariant, not an implementation detail. Purchases go through
+    -- server-listened ProximityPrompts precisely so nothing here has an amount to forge; if this
+    -- test ever needs relaxing, the anti-exploit posture in the README has changed.
+    local FORBIDDEN = { "Amount", "Cost", "Price", "Essence", "Currency", "Quantity", "Count",
+        "Stage", "Multiplier", "Rebirths", "Balance", "DropperId", "UpgradeId", "SectionId",
+        "Id", "Value" }
+    local ALLOWED_VALUE_ON = { SetSetting = true } -- SetSetting.Value is a boolean toggle
+    for _, def in ipairs(c2s()) do
+        for _, field in ipairs(FORBIDDEN) do
+            if not (field == "Value" and ALLOWED_VALUE_ON[def.Name]) then
+                local payload = { [field] = 1 }
+                t.falsy(accepts(def, payload),
+                    ("%s accepted a payload carrying %s"):format(def.Name, field))
+            end
+        end
+    end
+    -- And positively: the only numeric field anywhere in the inbound protocol is LinkResponse.PlotId,
+    -- which names a plot rather than a quantity.
+    t.truthy(accepts(RemoteSchema.Remotes.LinkResponse, { PlotId = 1, Accept = false }))
 end)
 
 --#endregion

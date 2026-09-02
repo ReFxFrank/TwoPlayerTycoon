@@ -166,9 +166,10 @@ RemoteSchema.Remotes = {
 	},
 } :: { [string]: RemoteDef }
 
--- Deterministic creation order for RemoteService (and for the specs): server -> client first, so a
--- client that is already listening cannot miss an early push while the C2S events are still being
--- created, then alphabetical inside each direction.
+-- Deterministic creation order for RemoteService: `pairs` order is unspecified in Luau, so without
+-- this sort the folder would be built differently on every boot. Server -> client remotes are
+-- created FIRST, so a client that is already listening cannot miss an early push while the inbound
+-- events are still being made; alphabetical inside each direction keeps it diffable.
 RemoteSchema.List = {} :: { RemoteDef }
 for _, def in pairs(RemoteSchema.Remotes) do
 	table.insert(RemoteSchema.List, def)

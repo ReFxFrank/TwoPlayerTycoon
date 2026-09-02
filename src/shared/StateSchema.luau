@@ -4,11 +4,9 @@
     The authoritative shape of everything saved, merged or replicated: PlotState, Prestige, Settings,
     Stats and the Profile wrapping them. It builds fresh state, repairs arbitrary input into a legal
     Profile, version-migrates old saves, max-merges two Sanctum states when a partner links in (§1.5)
-    and max-merges two Sanctum states when a partner links in (§1.5). PURE -- no services and no
-    Instances -- so ProfileService,
+    and renders the StateSync snapshot (§7). PURE -- no services, no Instances -- so ProfileService,
     PlotService, StateReplicator and the headless tests all share one definition.
-    Rendering the StateSync payload lives next door in Snapshot.luau.
-    Owner: shared  |  Consumers: Snapshot, ProfileService, PlotService, RebirthService, tests
+    Owner: shared  |  Consumers: ProfileService, PlotService, StateReplicator, Snapshot, tests
 ]]
 --[[ THREAT MODEL. Input to sanitizeProfile is whatever a DataStore returned: nil, a string, an
      array, a cyclic table, NaN/inf/negative numbers, or a profile forged on an older build. It must
@@ -26,6 +24,7 @@ local SectionData = require(script.Parent.SectionData)
 local EvolutionData = require(script.Parent.EvolutionData)
 local AffinityData = require(script.Parent.AffinityData)
 local RebirthData = require(script.Parent.RebirthData)
+
 export type PlotState = {
 	Essence: number, Stage: number, Affinity: string?,
 	Droppers: { [string]: number }, Upgrades: { [string]: number }, Sections: { [string]: boolean },
@@ -40,6 +39,7 @@ export type Profile = { SchemaVersion: number, Plot: PlotState, Prestige: Presti
 -- cached Multipliers. Full = false selects the essence-only fast tick.
 export type SnapshotOpts = { Full: boolean?, Tick: number?, MoteCount: number?,
 	Profiles: { [number]: any }?, Names: { [number]: string }?, Multipliers: any? }
+
 local StateSchema = {}
 StateSchema.VERSION = 1
 -- Currency ceilings sit below 2^53 so every stored balance stays an exact integer; past that,
