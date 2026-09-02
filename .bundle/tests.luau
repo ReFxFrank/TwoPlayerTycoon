@@ -2177,6 +2177,2319 @@ return Testing
 end)()
 local MODULE_DEFS = {}
 local MODULE_ORDER = {}
+MODULE_ORDER[#MODULE_ORDER + 1] = { Path = "StarterPlayer/StarterPlayerScripts/Client/ClientBootstrap", Class = "LocalScript", File = "src/client/ClientBootstrap.client.luau" }
+MODULE_DEFS["StarterPlayer/StarterPlayerScripts/Client/ClientBootstrap"] = function(script, require, ...)
+--#region src/client/ClientBootstrap.client.luau
+--!strict
+--[[
+    ClientBootstrap
+    The client's only entry point. It waits for the remote folder, builds the SanctumHud, creates
+    the ClientStore, feeds StateSync into it, and then hands every controller the same context and
+    starts it. Nothing here decides anything about the game: it is wiring, and its one job is to
+    make sure a player always ends up with a HUD bound to the server's snapshot.
+]]
+--[[ WHY EVERY CONTROLLER IS ISOLATED IN A pcall. These eight controllers are independent surfaces
+     -- a toast stack, a sound bank, a settings panel. An error while requiring or initialising any
+     one of them must not stop the other seven, because the failure mode of an unguarded loop here
+     is a player standing in a fully working Sanctum with no interface at all. A broken controller
+     costs its own feature and one warn line, never the HUD.
+
+     WHY StateSync IS READ EXACTLY ONCE, HERE. If controllers connected to it themselves they would
+     each hold a private copy of the snapshot, and the copies would diverge the moment one of them
+     handled a payload slightly differently. The store is the single reader, and Observe is the only
+     way anything downstream learns that a value changed. ]]
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local Modules = ReplicatedStorage:WaitForChild("Modules")
+local ClientStore = require(Modules:WaitForChild("ClientStore"))
+local RemoteSchema = require(Modules:WaitForChild("RemoteSchema"))
+
+local ControllerFolder = script.Parent:WaitForChild("Controllers")
+local UiBuilder = require(ControllerFolder:WaitForChild("UiBuilder"))
+
+-- Deterministic order, HUD first: if something later in the list is going to fail, the most
+-- important surface in the game is already bound by the time it does.
+local CONTROLLER_ORDER = {
+	"HudController",
+	"NotifyController",
+	"PromptController",
+	"AffinityController",
+	"RebirthController",
+	"SettingsController",
+	"EvolutionFxController",
+	"SoundController",
+}
+
+-- Bounded so a missing remote surfaces as a warning instead of a client that hangs forever on a
+-- server built from an older RemoteSchema.
+local WAIT_SECONDS = 10
+
+local function collectRemotes(folder: Instance): { [string]: any }
+	local remotes: { [string]: any } = {}
+	for _, def in ipairs(RemoteSchema.List) do
+		local remote = folder:WaitForChild(def.Name, WAIT_SECONDS)
+		if remote ~= nil and remote:IsA("RemoteEvent") then
+			remotes[def.Name] = remote
+		else
+			-- Not fatal: a controller that needs a missing remote simply does nothing, which is a
+			-- far better outcome than refusing to build the rest of the interface.
+			warn("[ClientBootstrap] remote '" .. def.Name .. "' is missing from " .. RemoteSchema.FolderName)
+		end
+	end
+	return remotes
+end
+
+--[[ Init every controller, then Start every controller that survived Init. Two phases, mirroring
+     ServiceRegistry on the server: a controller may look another one up during Start (PromptController
+     reads HudController.ReasonText), and that is only safe once all of them have been built. ]]
+local function startControllers(context: { [string]: any }): ()
+	local started: { any } = {}
+
+	for _, name in ipairs(CONTROLLER_ORDER) do
+		local module = ControllerFolder:FindFirstChild(name)
+		if module == nil then
+			warn("[ClientBootstrap] no controller named '" .. name .. "'")
+			continue
+		end
+		local okRequire, controller = pcall(require, module)
+		if not okRequire or type(controller) ~= "table" then
+			warn("[ClientBootstrap] failed to require " .. name .. ": " .. tostring(controller))
+			continue
+		end
+		local okInit, initError = pcall(function()
+			controller:Init(context)
+		end)
+		if okInit then
+			table.insert(started, controller)
+		else
+			warn("[ClientBootstrap] " .. name .. ":Init failed: " .. tostring(initError))
+		end
+	end
+
+	for _, controller in ipairs(started) do
+		local okStart, startError = pcall(function()
+			controller:Start()
+		end)
+		if not okStart then
+			warn("[ClientBootstrap] " .. tostring(controller.Name) .. ":Start failed: " .. tostring(startError))
+		end
+	end
+end
+
+local player = Players.LocalPlayer
+if player == nil then
+	-- Only reachable if this script is run outside a client context; bailing beats erroring.
+	warn("[ClientBootstrap] no LocalPlayer, so there is nobody to build a HUD for")
+	return
+end
+
+local playerGui = player:WaitForChild("PlayerGui")
+local remoteFolder = ReplicatedStorage:WaitForChild(RemoteSchema.FolderName)
+if playerGui == nil or remoteFolder == nil then
+	warn("[ClientBootstrap] PlayerGui or " .. RemoteSchema.FolderName .. " never arrived; no HUD")
+	return
+end
+
+local remotes = collectRemotes(remoteFolder)
+local store = ClientStore.new()
+
+-- Parented only once the whole tree exists, so a half-built HUD is never on screen.
+local ui = UiBuilder.build()
+ui.ScreenGui.Parent = playerGui
+
+--[[ The ONLY StateSync listener in the client. ClientStore itself decides what a Full payload means
+     versus an essence-only tick, so this handler stays a single forwarding call -- it runs twice a
+     second and has no business doing anything more. ]]
+local stateSync = remotes[RemoteSchema.Remotes.StateSync.Name]
+if stateSync ~= nil then
+	stateSync.OnClientEvent:Connect(function(snapshot: any)
+		store:Set(snapshot)
+	end)
+else
+	warn("[ClientBootstrap] StateSync is missing; the HUD will show its zeroed default state")
+end
+
+local function requestSnapshot(): ()
+	local remote = remotes[RemoteSchema.Remotes.RequestSnapshot.Name]
+	if remote == nil then
+		return
+	end
+	-- No payload: the server derives the sanctum from the player's occupancy, so there is nothing
+	-- to ask for and nothing to forge.
+	remote:FireServer()
+end
+
+startControllers({
+	Store = store,
+	Remotes = remotes,
+	Player = player,
+	PlayerGui = playerGui,
+	Ui = ui,
+})
+
+--[[ Ask once now, and again on every respawn. The HUD survives a respawn (ResetOnSpawn = false), so
+     without this a player who died mid-attunement would keep reading a snapshot from before it --
+     and the throttled replicator only pushes a Full snapshot when the sanctum is dirty, so a stale
+     HUD could sit there indefinitely on a quiet plot. ]]
+requestSnapshot()
+player.CharacterAdded:Connect(requestSnapshot)
+
+--#endregion
+end
+MODULE_ORDER[#MODULE_ORDER + 1] = { Path = "StarterPlayer/StarterPlayerScripts/Client/Controllers/AffinityController", Class = "ModuleScript", File = "src/client/Controllers/AffinityController.luau" }
+MODULE_DEFS["StarterPlayer/StarterPlayerScripts/Client/Controllers/AffinityController"] = function(script, require, ...)
+--#region src/client/Controllers/AffinityController.luau
+--!strict
+--[[
+    AffinityController
+    The Stage 3 elemental choice: it opens the Affinity modal when the snapshot says the gate is
+    open and nothing has been chosen, renders the four elements straight out of AffinityData, and
+    forwards one press as ChooseAffinity { Affinity = id }. It closes only when the store reports a
+    Chosen affinity, so the modal never claims a commitment the server has not made.
+    Owner: client  |  Consumers: ClientBootstrap (lifecycle)
+]]
+--[[ WHY EVERY NUMBER ON A BUTTON IS READ FROM AffinityData. The choice is permanent for the run and
+     the four options are deliberately within 1% of each other on raw income (see the balance model
+     in AffinityData), so the trade-off numbers ARE the decision. Restating them here would let the
+     UI drift from the balance table, and a player would be choosing on a lie. Every figure below is
+     pulled from the def and formatted; not one is typed out.
+
+     WHY THERE IS A REMINDER CHIP. "Later" has to exist -- this is a shared, irreversible choice and
+     the pair should be able to talk about it -- but Observe only fires on a genuine change, so a
+     dismissed modal would never reopen on its own and the Affinity would become unreachable. The
+     chip is the standing way back in, and it is visible for exactly as long as the gate is open. ]]
+
+local Modules = game:GetService("ReplicatedStorage"):WaitForChild("Modules")
+local AffinityData = require(Modules:WaitForChild("AffinityData"))
+local EvolutionData = require(Modules:WaitForChild("EvolutionData"))
+local Format = require(Modules:WaitForChild("Format"))
+local RemoteSchema = require(Modules:WaitForChild("RemoteSchema"))
+local Theme = require(Modules:WaitForChild("Theme"))
+
+type Context = { Store: any, Remotes: { [string]: any }, Player: any, PlayerGui: any, Ui: any }
+
+local Controller = {}
+Controller.Name = "AffinityController"
+
+local BODY = table.concat({
+	"The Conflux has reached Stage " .. tostring(EvolutionData.AffinityUnlockStage)
+		.. " and will bind to one element.",
+	"The Sanctum has ONE Affinity, not one each -- either occupant can make this choice, and it"
+		.. " applies to both of you.",
+	"It is permanent until your next Transcendence: it cannot be changed, re-rolled or undone.",
+}, "\n")
+
+-- If the server never answers a choice (rate limited, or the gate closed underneath us) the button
+-- must not stay stuck on "Binding". Long enough that a normal round trip always wins the race.
+local ANSWER_GRACE = 3
+
+local connections: { any } = {}
+local remotes: { [string]: any } = {}
+local store: any = nil
+local modal: any = nil
+local chip: any = nil
+local strokes: { [string]: any } = {}
+local selected: string? = nil
+local pendingToken = 0
+
+local function new(className: string, properties: { [string]: any }, parent: Instance?): any
+	local instance = Instance.new(className)
+	for key, value in pairs(properties) do
+		(instance :: any)[key] = value
+	end
+	instance.Parent = parent -- parent last: one replication step instead of a dozen
+	return instance
+end
+
+--[[ The five trade-off figures, always all five and always in the same order, so the four buttons
+     read as one comparable table rather than four adverts. A neutral value prints as x1 / +0 on
+     purpose: "this element gives up nothing here" is information. ]]
+local function statsText(def: AffinityData.Affinity): string
+	return table.concat({
+		"Income   " .. Format.multiplier(def.IncomeMultiplier),
+		"Rate       " .. Format.multiplier(def.SpawnRateMultiplier),
+		"Mote      " .. Format.multiplier(def.MoteValueMultiplier),
+		"Rails      " .. Format.multiplier(def.RailSpeedMultiplier),
+		string.format("Speed    %+d", math.floor(def.WalkSpeedBonus)),
+	}, "\n")
+end
+
+--[[ Turns the builder's plain coloured button into a card: name, flavour, numbers. Done here rather
+     than in UiModals because it is entirely about what an Affinity MEANS, and the builder is inert
+     by design -- it does not know that AffinityData has a balance model. ]]
+local function decorate(button: any, def: AffinityData.Affinity): ()
+	button.Text = ""
+	-- The stroke is the selection marker, so the hover flash is turned off: two competing
+	-- highlights on the most consequential button in the game is one too many.
+	button.AutoButtonColor = false
+
+	local ink = Theme.Ui.Background -- dark ink on the element's own colour, which is always bright
+	new("TextLabel", {
+		Name = "NameLabel", BackgroundTransparency = 1, Font = Enum.Font.GothamBold,
+		Position = UDim2.fromScale(0.05, 0.03), Size = UDim2.fromScale(0.9, 0.14),
+		Text = def.Name, TextColor3 = ink, TextScaled = true, ZIndex = 24,
+	}, button)
+	new("TextLabel", {
+		Name = "DescLabel", BackgroundTransparency = 1, Font = Enum.Font.Gotham,
+		Position = UDim2.fromScale(0.07, 0.19), Size = UDim2.fromScale(0.86, 0.36),
+		Text = def.Description, TextColor3 = ink, TextSize = 10, TextWrapped = true,
+		TextXAlignment = Enum.TextXAlignment.Left, TextYAlignment = Enum.TextYAlignment.Top,
+		ZIndex = 24,
+	}, button)
+	new("TextLabel", {
+		Name = "StatsLabel", BackgroundTransparency = 1, Font = Enum.Font.Code,
+		Position = UDim2.fromScale(0.07, 0.57), Size = UDim2.fromScale(0.86, 0.4),
+		Text = statsText(def), TextColor3 = ink, TextSize = 11,
+		TextXAlignment = Enum.TextXAlignment.Left, TextYAlignment = Enum.TextYAlignment.Top,
+		ZIndex = 24,
+	}, button)
+
+	strokes[def.Id] = button:FindFirstChildOfClass("UIStroke")
+end
+
+local function renderSelection(): ()
+	for id, stroke in pairs(strokes) do
+		if stroke ~= nil then
+			local chosen = id == selected
+			stroke.Color = if chosen then Theme.Ui.Text else Theme.Ui.Stroke
+			stroke.Thickness = if chosen then 4 else 1.5
+			stroke.Transparency = if chosen then 0 else 0.6
+		end
+	end
+end
+
+local function renderConfirm(pending: boolean): ()
+	local def = if selected ~= nil then AffinityData.get(selected) else nil
+	local button = modal.Confirm
+	local ready = def ~= nil and not pending
+	if pending then
+		button.Text = "Binding..."
+	elseif def ~= nil then
+		button.Text = "Bind " .. def.Name .. " forever"
+	else
+		button.Text = "Pick an element"
+	end
+	button.BackgroundColor3 = if ready and def then def.Color else Theme.Ui.Panel
+	button.TextColor3 = if ready then Theme.Ui.Background else Theme.Ui.Muted
+	button.Active = ready
+	button.AutoButtonColor = ready
+end
+
+local function setSelected(id: string?): ()
+	selected = id
+	renderSelection()
+	renderConfirm(false)
+end
+
+function Controller:Init(context: Context): ()
+	remotes = context.Remotes
+	store = context.Store
+	modal = context.Ui.Modals.Affinity
+
+	modal.Body.Text = BODY
+	modal.Body.TextSize = 13
+	modal.Root.Visible = false
+
+	for _, def in ipairs(AffinityData.List) do
+		local button = modal.Buttons[def.Id]
+		if button ~= nil then
+			decorate(button, def)
+		end
+	end
+	setSelected(nil)
+
+	--[[ Parented to the ScreenGui rather than added to the action bar: the bar is a fixed
+	     UIListLayout whose three buttons already fill it, and a fourth entry would resize the
+	     Attune button every time the gate opened. ]]
+	chip = new("TextButton", {
+		Name = "AffinityChip", AnchorPoint = Vector2.new(0.5, 1), AutoButtonColor = true,
+		BackgroundColor3 = Theme.Ui.Warning, BorderSizePixel = 0, Font = Enum.Font.GothamBold,
+		Position = UDim2.fromScale(0.5, 0.885), Size = UDim2.fromScale(0.22, 0.045),
+		Text = "Choose the Sanctum's Affinity", TextColor3 = Theme.Ui.Background, TextScaled = true,
+		Visible = false, ZIndex = 12,
+	}, context.Ui.ScreenGui)
+	new("UICorner", { CornerRadius = UDim.new(0, 8) }, chip)
+end
+
+function Controller:Start(): ()
+	local function track(connection: any): ()
+		table.insert(connections, connection)
+	end
+
+	for _, def in ipairs(AffinityData.List) do
+		local button = modal.Buttons[def.Id]
+		if button ~= nil then
+			track(button.Activated:Connect(function()
+				setSelected(def.Id)
+			end))
+		end
+	end
+
+	track(chip.Activated:Connect(function()
+		modal.Root.Visible = true
+	end))
+
+	track(modal.Confirm.Activated:Connect(function()
+		local id = selected
+		local remote = remotes[RemoteSchema.Remotes.ChooseAffinity.Name]
+		if id == nil or remote == nil then
+			return
+		end
+		-- The id is the whole payload and it is one of four literal strings; the server re-checks it
+		-- against the catalogue and against the gate before committing anything.
+		remote:FireServer({ Affinity = id })
+		renderConfirm(true)
+
+		pendingToken += 1
+		local token = pendingToken
+		task.delay(ANSWER_GRACE, function()
+			-- Still ours and still unanswered: hand the button back rather than leave a dead modal.
+			if token == pendingToken then
+				renderConfirm(false)
+			end
+		end)
+	end))
+
+	-- "Later" hides the modal and nothing more. It sends no remote, because declining to choose is
+	-- not a choice the server needs to hear about -- the gate simply stays open.
+	track(modal.Cancel.Activated:Connect(function()
+		modal.Root.Visible = false
+	end))
+
+	--[[ The single source of truth for whether this whole surface exists. Available is the server's
+	     answer (Stage >= AffinityUnlockStage), Chosen is the commitment; the client computes
+	     neither. Observe fires once immediately, so a player who logs in already past Stage 3 with
+	     no Affinity gets the modal on the first Full snapshot. ]]
+	track(store:Observe("Gates.Affinity", function(gate: any)
+		local g = if type(gate) == "table" then gate else {}
+		local chosen = if type(g.Chosen) == "string" then g.Chosen else nil
+		local open = g.Available == true and chosen == nil
+
+		chip.Visible = open
+		if open then
+			modal.Root.Visible = true
+			return
+		end
+
+		-- Either the gate closed or an Affinity was bound. Both mean the same thing here: this
+		-- surface is done, and the confirmation of it came from the server, not from the click.
+		pendingToken += 1
+		modal.Root.Visible = false
+		if chosen ~= nil then
+			setSelected(chosen)
+		end
+	end))
+end
+
+function Controller:Stop(): ()
+	for _, connection in ipairs(connections) do
+		connection:Disconnect()
+	end
+	table.clear(connections)
+	pendingToken += 1
+	if modal ~= nil then
+		modal.Root.Visible = false
+	end
+	if chip ~= nil then
+		chip:Destroy()
+		chip = nil
+	end
+end
+
+return Controller
+
+--#endregion
+end
+MODULE_ORDER[#MODULE_ORDER + 1] = { Path = "StarterPlayer/StarterPlayerScripts/Client/Controllers/EvolutionFxController", Class = "ModuleScript", File = "src/client/Controllers/EvolutionFxController.luau" }
+MODULE_DEFS["StarterPlayer/StarterPlayerScripts/Client/Controllers/EvolutionFxController"] = function(script, require, ...)
+--#region src/client/Controllers/EvolutionFxController.luau
+--!strict
+--[[
+    EvolutionFxController
+    The client's reaction to the Fx remote: a stage-tinted screen flash, a short camera shake and a
+    banner for an Attunement, a longer and brighter version for a Transcendence, a cheap pulse for a
+    purchase, and a banner naming the partner on a link. It renders celebration and nothing else --
+    every fact it announces was decided by the server and already exists in the snapshot.
+    Owner: client  |  Consumers: ClientBootstrap (lifecycle)
+]]
+--[[ WHY EVERY EFFECT IS NON-BLOCKING AND TOTAL. An error raised inside a remote handler kills the
+     connection, so one malformed payload would silently end every later effect. The payload is
+     therefore untrusted throughout: an unknown Kind, a missing Data table, a NaN stage and a nil
+     camera all fall through to a no-op, and nothing here ever yields.
+
+     WHY GENERATION TOKENS RATHER THAN WAITING ON A TWEEN. Two Attunements can land back to back,
+     and a naive "hide when my tween finishes" would let the first effect's completion hide the
+     second effect's banner. Each sequence claims a token; a hide applies only if it still holds. ]]
+
+local RunService = game:GetService("RunService")
+local TweenService = game:GetService("TweenService")
+
+local Modules = game:GetService("ReplicatedStorage"):WaitForChild("Modules")
+local EvolutionData = require(Modules:WaitForChild("EvolutionData"))
+local RemoteSchema = require(Modules:WaitForChild("RemoteSchema"))
+local Theme = require(Modules:WaitForChild("Theme"))
+
+-- Sibling require, not a context lookup: controllers are singletons, so this is the same instance
+-- ClientBootstrap started, and every entry point into it is a guarded no-op if it never did.
+local SoundController = require(script.Parent.SoundController)
+
+type Context = { Store: any, Remotes: { [string]: any }, Player: any, PlayerGui: any, Ui: any }
+
+local Controller = {}
+Controller.Name = "EvolutionFxController"
+
+-- Flash opacity at its peak (0 = opaque). Attune is a wash, Transcend nearly whites out the screen.
+local ATTUNE_FLASH, ATTUNE_FADE = 0.35, 0.9
+local TRANSCEND_FLASH, TRANSCEND_FADE = 0.08, 2.2
+local BANNER_HOLD = 2.6
+local BANNER_FADE = 0.35
+local SHAKE_SMALL, SHAKE_BIG = { 0.35, 0.010 }, { 1.10, 0.022 } -- { seconds, radians }
+
+local rng = Random.new()
+local connections: { any } = {}
+local store: any = nil
+local remotes: { [string]: any } = {}
+local flash: any = nil
+local banner: any = nil
+local hudStroke: any = nil
+local flashToken, bannerToken = 0, 0
+local shakeConnection: any = nil
+local shakeUntil, shakeMagnitude, shakeSpan = 0, 0, 1
+
+local function num(value: any, default: number): number
+	if type(value) == "number" and value == value and value ~= math.huge and value ~= -math.huge then
+		return value
+	end
+	return default
+end
+
+local function make(className: string, properties: { [string]: any }, parent: Instance): any
+	local instance = Instance.new(className)
+	for key, value in pairs(properties) do
+		(instance :: any)[key] = value
+	end
+	instance.Parent = parent -- parent last: one replication step rather than one per property
+	return instance
+end
+
+local function tween(instance: any, seconds: number, properties: { [string]: any }): ()
+	-- Sine/Out: fast at the start so the peak is instant and the decay is what the eye follows.
+	local info = TweenInfo.new(seconds, Enum.EasingStyle.Sine, Enum.EasingDirection.Out)
+	TweenService:Create(instance, info, properties):Play()
+end
+
+-- Hidden rather than left transparent between flashes: an invisible frame still sits over the HUD.
+local function playFlash(colour: Color3, peak: number, fade: number): ()
+	if flash == nil then
+		return
+	end
+	flashToken += 1
+	local token = flashToken
+	flash.BackgroundColor3 = colour
+	flash.BackgroundTransparency = peak
+	flash.Visible = true
+	tween(flash, fade, { BackgroundTransparency = 1 })
+	task.delay(fade, function()
+		if token == flashToken and flash ~= nil then
+			flash.Visible = false
+		end
+	end)
+end
+
+local function playBanner(text: string, colour: Color3): ()
+	if banner == nil then
+		return
+	end
+	bannerToken += 1
+	local token = bannerToken
+	banner.Text = text
+	banner.TextColor3 = colour
+	banner.TextTransparency = 1
+	banner.Visible = true
+	tween(banner, BANNER_FADE, { TextTransparency = 0 })
+	task.delay(BANNER_HOLD, function()
+		if token ~= bannerToken or banner == nil then
+			return
+		end
+		tween(banner, BANNER_FADE, { TextTransparency = 1 })
+		task.delay(BANNER_FADE, function()
+			if token == bannerToken and banner ~= nil then
+				banner.Visible = false
+			end
+		end)
+	end)
+end
+
+--[[ Camera shake, so an Attunement is felt as well as seen. Applied as a per-frame angular nudge:
+     Roblox's default camera script rewrites CFrame from its subject every frame, so the offset
+     decays naturally instead of accumulating, and a nil camera degrades to no shake at all.
+     MOCK-EXTRA: workspace.CurrentCamera and Camera.CFrame (the camera is the only handle on this). ]]
+local function shake(seconds: number, magnitude: number): ()
+	shakeSpan = math.max(seconds, 0.05)
+	shakeUntil = os.clock() + shakeSpan
+	shakeMagnitude = magnitude
+	if shakeConnection ~= nil then
+		return
+	end
+	shakeConnection = RunService.RenderStepped:Connect(function()
+		-- MOCK-EXTRA: workspace.CurrentCamera (and Camera.CFrame written below)
+		local camera = workspace.CurrentCamera
+		local remaining = shakeUntil - os.clock()
+		if remaining <= 0 or camera == nil then
+			if shakeConnection ~= nil then
+				shakeConnection:Disconnect()
+				shakeConnection = nil
+			end
+			return
+		end
+		-- Linear falloff: the jolt is strongest on the first frame and settles, which reads as an
+		-- impact rather than a wobble.
+		local amount = shakeMagnitude * (remaining / shakeSpan)
+		camera.CFrame = camera.CFrame
+			* CFrame.Angles(rng:NextNumber(-amount, amount), rng:NextNumber(-amount, amount), 0)
+	end)
+end
+
+-- The stage colour as the player actually sees it on the Conflux, affinity tint included: a flash
+-- that did not match the thing it is celebrating would read as a different event.
+local function stageColour(stage: number): Color3
+	local affinity = if store ~= nil then store:GetPath("Plot.Affinity") else nil
+	return Theme.getConfluxAppearance(stage, if type(affinity) == "string" then affinity else nil).Color
+end
+
+local function onAttune(data: { [string]: any }): ()
+	-- Prefer the payload, fall back to the snapshot: a Full StateSync usually lands first, and
+	-- either way the banner must name a real stage rather than guess.
+	local fallback = if store ~= nil then store:GetPath("Plot.Stage") else 1
+	local stage = math.clamp(math.floor(num(data.Stage, num(fallback, 1))), 1, EvolutionData.MaxStage)
+	local def = EvolutionData.get(stage)
+	local colour = stageColour(stage)
+	playFlash(colour, ATTUNE_FLASH, ATTUNE_FADE)
+	shake(SHAKE_SMALL[1], SHAKE_SMALL[2])
+	playBanner(
+		string.format(
+			"%s  -  %s   (Stage %d of %d)",
+			if def then def.Name else "Attuned",
+			if def then def.Title else "the Conflux has grown",
+			stage,
+			EvolutionData.MaxStage
+		),
+		colour
+	)
+	SoundController:PlaySfx("Attune")
+end
+
+local function onTranscend(data: { [string]: any }): ()
+	local fallback = if store ~= nil then store:GetPath("You.Rebirths") else 0
+	local rebirths = math.max(0, math.floor(num(data.Rebirths, num(fallback, 0))))
+	-- Primordial white regardless of affinity: the Sanctum has just been given up, so the tint that
+	-- belonged to it is exactly what should not be on screen.
+	local colour = Theme.Stage[EvolutionData.MaxStage].Color
+	playFlash(colour, TRANSCEND_FLASH, TRANSCEND_FADE)
+	shake(SHAKE_BIG[1], SHAKE_BIG[2])
+	playBanner(string.format("TRANSCENDED  -  Rebirth %d", rebirths), colour)
+	SoundController:PlaySfx("Transcend")
+end
+
+-- Cheap on purpose: a purchase happens every few seconds at a built-out Sanctum, so it gets one
+-- stroke tween on the HUD panel and no flash, no shake and no banner.
+local function onPurchase(): ()
+	if hudStroke ~= nil then
+		hudStroke.Color = Theme.Ui.Positive
+		hudStroke.Transparency = 0
+		tween(hudStroke, 0.45, { Transparency = 0.25 })
+		task.delay(0.5, function()
+			if hudStroke ~= nil then
+				hudStroke.Color = Theme.Ui.Stroke
+			end
+		end)
+	end
+	SoundController:PlaySfx("Purchase")
+end
+
+local function onLink(data: { [string]: any }): ()
+	local who = data.Name
+	playBanner(
+		(if type(who) == "string" and who ~= "" then who else "A partner") .. " joined the Sanctum",
+		Theme.Ui.Positive
+	)
+	SoundController:PlaySfx("Notify")
+end
+
+local HANDLERS: { [string]: (data: { [string]: any }) -> () } = {
+	attune = onAttune, transcend = onTranscend, purchase = function() onPurchase() end, link = onLink,
+}
+
+function Controller:Init(context: Context): ()
+	store = context.Store
+	remotes = context.Remotes
+	local screen = context.Ui.ScreenGui
+
+	-- Built here, not in UiBuilder: pure effect surfaces with no bound state, kept beside the code
+	-- that animates them so a teardown cannot leave them behind.
+	flash = make("Frame", {
+		Name = "FxFlash", BackgroundColor3 = Theme.Ui.Accent, BackgroundTransparency = 1,
+		BorderSizePixel = 0, Size = UDim2.fromScale(1, 1), Visible = false, ZIndex = 40,
+	}, screen)
+
+	banner = make("TextLabel", {
+		Name = "FxBanner", AnchorPoint = Vector2.new(0.5, 0), BackgroundTransparency = 1,
+		Font = Enum.Font.GothamBold, Position = UDim2.fromScale(0.5, 0.14),
+		Size = UDim2.fromScale(0.6, 0.08), Text = "", TextColor3 = Theme.Ui.Text,
+		TextScaled = true, TextTransparency = 1, Visible = false, ZIndex = 41,
+	}, screen)
+
+	local hudRoot = context.Ui.Hud.Root
+	hudStroke = if hudRoot ~= nil then hudRoot:FindFirstChildOfClass("UIStroke") else nil
+end
+
+function Controller:Start(): ()
+	local fx = remotes[RemoteSchema.Remotes.Fx.Name]
+	if fx == nil then
+		return
+	end
+
+	table.insert(connections, fx.OnClientEvent:Connect(function(payload: any)
+		if type(payload) ~= "table" then
+			return
+		end
+		local handler = if type(payload.Kind) == "string" then HANDLERS[payload.Kind] else nil
+		if handler == nil then
+			return
+		end
+		--[[ Only reject a PlotId we can positively identify as somebody else's. Before the first
+		     Full snapshot our own id is 0, and dropping the link/attune effects of the first minute
+		     would be a worse bug than rendering a stray one. ]]
+		local mine = num(if store ~= nil then store:GetPath("Plot.Id") else 0, 0)
+		local theirs = num(payload.PlotId, mine)
+		if mine > 0 and theirs > 0 and mine ~= theirs then
+			return
+		end
+		handler(if type(payload.Data) == "table" then payload.Data else {})
+	end))
+end
+
+function Controller:Stop(): ()
+	for _, connection in ipairs(connections) do
+		connection:Disconnect()
+	end
+	table.clear(connections)
+	if shakeConnection ~= nil then
+		shakeConnection:Disconnect()
+		shakeConnection = nil
+	end
+	-- Bump both tokens so any delayed hide still in flight becomes a no-op against a destroyed tree.
+	flashToken += 1
+	bannerToken += 1
+	if flash ~= nil then
+		flash:Destroy()
+		flash = nil
+	end
+	if banner ~= nil then
+		banner:Destroy()
+		banner = nil
+	end
+	hudStroke = nil
+end
+
+return Controller
+
+--#endregion
+end
+MODULE_ORDER[#MODULE_ORDER + 1] = { Path = "StarterPlayer/StarterPlayerScripts/Client/Controllers/HudController", Class = "ModuleScript", File = "src/client/Controllers/HudController.luau" }
+MODULE_DEFS["StarterPlayer/StarterPlayerScripts/Client/Controllers/HudController"] = function(script, require, ...)
+--#region src/client/Controllers/HudController.luau
+--!strict
+--[[
+    HudController
+    Binds the always-on regions of the SanctumHud -- the essence/income/stage readout, the two
+    partner slots and the action bar -- to the ClientStore snapshot. It renders and nothing else:
+    every number it shows was computed by the server, and every gate it reports was decided by
+    Economy. It also owns the single reason-code -> human-text table the whole client shares.
+    Owner: client  |  Consumers: ClientBootstrap (lifecycle), PromptController (ReasonText)
+]]
+--[[ WHY THE OBSERVERS ARE SPLIT THIS FINELY. StateSync pushes essence twice a second and everything
+     else only when the sanctum is dirty. One coarse "re-render the HUD" observer would therefore
+     rebuild the partner panel, re-read EvolutionData and reformat six labels 120 times a minute for
+     the sake of one number. Each observer below owns exactly the widgets its own path can change,
+     and the two that ride the essence tick do a single assignment each. ]]
+
+local Modules = game:GetService("ReplicatedStorage"):WaitForChild("Modules")
+local Economy = require(Modules:WaitForChild("Economy"))
+local EvolutionData = require(Modules:WaitForChild("EvolutionData"))
+local Format = require(Modules:WaitForChild("Format"))
+local Theme = require(Modules:WaitForChild("Theme"))
+
+type Context = { Store: any, Remotes: { [string]: any }, Player: any, PlayerGui: any, Ui: any }
+
+local Controller = {}
+Controller.Name = "HudController"
+
+local Reason = Economy.Reason
+
+--[[ THE reason table. Economy returns closed-set codes and never sentences (§11 of DECISIONS), so
+     exactly one file is allowed to decide what a code means in English -- this one. PromptController
+     reads it through Controller.ReasonText rather than restating any of it, which is what stops a
+     pad saying "Locked" while the HUD says "Not enough Essence" about the same refusal. ]]
+local REASON_TEXT: { [string]: string } = {
+	[Reason.Ok] = "Ready",
+	[Reason.LockedStage] = "Attune the Conflux further first",
+	[Reason.LockedSection] = "Unlock the Wing it stands in first",
+	[Reason.MaxOwned] = "You own every one of these",
+	[Reason.MaxLevel] = "Fully upgraded",
+	[Reason.AlreadyOwned] = "Already part of the Sanctum",
+	[Reason.Insufficient] = "Not enough Essence",
+	[Reason.MaxStage] = "Primordial -- nothing further to attune into",
+	[Reason.NeedEssence] = "Not enough Essence banked",
+	[Reason.NeedLifetime] = "Earn more Essence this run",
+	[Reason.NeedDroppers] = "Raise more Wellsprings first",
+	[Reason.NeedStage] = "Reach Stage " .. tostring(EvolutionData.MaxStage) .. " first",
+	[Reason.UnknownId] = "Unavailable",
+}
+Controller.ReasonText = REASON_TEXT
+
+--[[ Resolver rather than a raw index, because a reason code arrives over the wire: a server built
+     from newer data could name a code this client has never heard of, and a blank button is worse
+     than a vague one. ]]
+function Controller.reasonText(code: any): string
+	if type(code) == "string" then
+		local text = REASON_TEXT[code]
+		if text ~= nil then
+			return text
+		end
+	end
+	return "Not available yet"
+end
+
+-- Snapshot fields are untrusted in the same sense Economy treats them: a malformed push must show a
+-- zero, never propagate a NaN into a UDim2 (which would collapse the bar to an unrenderable size).
+local function num(value: any, default: number): number
+	if type(value) == "number" and value == value and value ~= math.huge and value ~= -math.huge then
+		return value
+	end
+	return default
+end
+
+local connections: { any } = {}
+local hud: any, partners: any, bar: any
+local store: any
+-- Cached so the two multi-source labels (income + motes) and the progress bar can each be redrawn
+-- from one changed input without re-reading the whole snapshot.
+local income, motes, stageTarget = 0, 0, 0
+
+local function renderIncome(): ()
+	hud.IncomeLabel.Text = string.format("%s/s   %d motes", Format.essence(income), motes)
+end
+
+-- Progress towards the NEXT stage's entry price. stageTarget of 0 means Primordial: the bar reads
+-- full, because there is no further stage to be a fraction of.
+local function renderProgress(essence: any): ()
+	local fraction = if stageTarget > 0 then math.clamp(num(essence, 0) / stageTarget, 0, 1) else 1
+	hud.StageFill.Size = UDim2.fromScale(fraction, 1)
+end
+
+local function renderStage(value: any): ()
+	local index = math.clamp(math.floor(num(value, 1)), 1, EvolutionData.MaxStage)
+	local def = EvolutionData.get(index)
+	hud.StageLabel.Text = string.format(
+		"%s  -  Stage %d / %d",
+		if def then def.Name else "Unknown",
+		index,
+		EvolutionData.MaxStage
+	)
+	local nextStage = EvolutionData.next(index)
+	stageTarget = if nextStage then num(nextStage.RequiredEssence, 0) else 0
+	-- The bar's denominator just moved, so redraw it now rather than waiting for the next essence
+	-- tick to make an attunement look like it reset the progress it just completed.
+	renderProgress(store:GetPath("Essence"))
+end
+
+--[[ Two rows, filled by Slot rather than by array order: the server may list occupants in join
+     order, and a partner leaving must not shuffle the surviving player into the other row. ]]
+local function renderOccupants(list: any): ()
+	local bySlot: { [number]: any } = {}
+	if type(list) == "table" then
+		for _, entry in ipairs(list) do
+			if type(entry) == "table" then
+				local slot = math.floor(num(entry.Slot, 0))
+				if slot >= 1 and slot <= #partners.Slots then
+					bySlot[slot] = entry
+				end
+			end
+		end
+	end
+
+	for slot, row in ipairs(partners.Slots) do
+		local occupant = bySlot[slot]
+		local filled = occupant ~= nil
+		row.NameLabel.Visible = filled
+		row.ContributionLabel.Visible = filled
+		row.RebirthChip.Visible = filled
+		row.EmptyLabel.Visible = not filled
+		if occupant ~= nil then
+			local you = occupant.IsYou == true
+			row.NameLabel.Text = tostring(occupant.Name) .. (if you then "  (you)" else "")
+			row.ContributionLabel.Text = Format.abbreviate(num(occupant.Contribution, 0)) .. " contributed"
+			-- "R3" rather than "3 rebirths": the chip is a quarter of a row wide and the R reads as
+			-- a rank at a glance, which is the only thing it needs to do.
+			row.RebirthChip.Text = "R" .. tostring(math.max(0, math.floor(num(occupant.Rebirths, 0))))
+			-- The accent stroke is the only "this row is you" marker that survives being read at a
+			-- glance; the "(you)" suffix is the accessible fallback for it.
+			row.Highlight.Transparency = if you then 0 else 1
+		else
+			row.Highlight.Transparency = 1
+		end
+	end
+end
+
+--[[ The Attune button is a SIGNPOST, not a purchase: attunement happens at a server-listened pad
+     (§1.7), so this only ever mirrors Gates.Attune. Blocked states keep the cost visible, because
+     "Not enough Essence" without a number tells the player nothing about how far off they are. ]]
+local function renderAttune(gate: any): ()
+	local g = if type(gate) == "table" then gate else {}
+	local ok = g.Ok == true
+	local cost = num(g.Cost, 0)
+	local costText = if cost > 0 then Format.essence(cost) else ""
+	local button = bar.AttuneButton
+
+	if ok then
+		button.Text = if costText ~= "" then ("Attune  " .. costText) else "Attune"
+		button.BackgroundColor3 = Theme.Ui.Accent
+		button.TextColor3 = Theme.Ui.Background
+	else
+		local why = Controller.reasonText(g.Reason)
+		button.Text = if costText ~= "" then (why .. "  " .. costText) else why
+		button.BackgroundColor3 = Theme.Ui.Panel
+		button.TextColor3 = Theme.Ui.Muted
+	end
+	-- Both flags, not just the colour: AutoButtonColor alone would still flash a hover highlight on
+	-- a button that cannot do anything.
+	button.Active = ok
+	button.AutoButtonColor = ok
+end
+
+function Controller:Init(context: Context): ()
+	store = context.Store
+	hud = context.Ui.Hud
+	partners = context.Ui.Partners
+	bar = context.Ui.ActionBar
+end
+
+function Controller:Start(): ()
+	local function track(connection: any): ()
+		table.insert(connections, connection)
+	end
+
+	-- The hot path. Essence arrives ~twice a second, so these two observers do one assignment each
+	-- and share no work; everything they would otherwise need was cached by a colder observer.
+	track(store:Observe("Essence", function(value: any)
+		hud.EssenceLabel.Text = Format.essence(num(value, 0))
+	end))
+	track(store:Observe("Essence", renderProgress))
+
+	track(store:Observe("Plot.IncomePerSecond", function(value: any)
+		income = num(value, 0)
+		renderIncome()
+	end))
+	track(store:Observe("Plot.MoteCount", function(value: any)
+		motes = math.max(0, math.floor(num(value, 0)))
+		renderIncome()
+	end))
+	track(store:Observe("Plot.Multiplier", function(value: any)
+		hud.MultiplierChip.Text = Format.multiplier(num(value, 1))
+	end))
+	track(store:Observe("Plot.Stage", renderStage))
+	track(store:Observe("Occupants", renderOccupants))
+	track(store:Observe("Gates.Attune", renderAttune))
+
+	-- Hidden entirely rather than greyed out: an ineligible Transcendence is not a decision the pair
+	-- is being offered, and a permanently dead button trains players to ignore the action bar.
+	track(store:Observe("Gates.Transcend", function(gate: any)
+		bar.TranscendButton.Visible = type(gate) == "table" and gate.Ok == true
+	end))
+end
+
+function Controller:Stop(): ()
+	for _, connection in ipairs(connections) do
+		connection:Disconnect()
+	end
+	table.clear(connections)
+end
+
+return Controller
+
+--#endregion
+end
+MODULE_ORDER[#MODULE_ORDER + 1] = { Path = "StarterPlayer/StarterPlayerScripts/Client/Controllers/NotifyController", Class = "ModuleScript", File = "src/client/Controllers/NotifyController.luau" }
+MODULE_DEFS["StarterPlayer/StarterPlayerScripts/Client/Controllers/NotifyController"] = function(script, require, ...)
+--#region src/client/Controllers/NotifyController.luau
+--!strict
+--[[
+    NotifyController
+    The toast stack. It is the client's only reader of the Notify remote: it renders at most four
+    messages at a time in the bottom-left corner, colour-coded by Kind, each fading out on its own
+    timer. Nothing else in the UI may invent a toast, because a message the server did not send is a
+    claim about state the client has no way to know.
+    Owner: client  |  Consumers: ClientBootstrap (lifecycle)
+]]
+--[[ WHY A TOKEN BUCKET AND NOT A QUEUE. GameConfig.Network.MaxNotifyPerSecond is the server's own
+     Notify budget, and matching it here means a burst -- a Transcendence firing one message per
+     unlocked Wing, a bugged loop, a hostile server -- can never paper over the game. An unbounded
+     queue would only defer the damage: the player would then sit through a minute of stale toasts
+     draining while the Sanctum kept running. Over budget the message is DROPPED, and dropping the
+     NEWEST is the honest choice: the toasts already on screen are the ones being read, and a toast
+     that arrives during a flood is the least likely one to be the important one.
+
+     WHY THE CAP AND THE BUDGET ARE BOTH NEEDED. The budget bounds the RATE; the four-slot cap
+     bounds what is on screen at once, because six per second held for five seconds each would
+     still stack thirty toasts up the side of the screen. ]]
+
+local Debris = game:GetService("Debris")
+local TweenService = game:GetService("TweenService")
+
+local Modules = game:GetService("ReplicatedStorage"):WaitForChild("Modules")
+local GameConfig = require(Modules:WaitForChild("GameConfig"))
+local RemoteSchema = require(Modules:WaitForChild("RemoteSchema"))
+local Theme = require(Modules:WaitForChild("Theme"))
+
+type Context = { Store: any, Remotes: { [string]: any }, Player: any, PlayerGui: any, Ui: any }
+type Toast = { Frame: any, Label: any, Stroke: any, Dismissed: boolean }
+
+local Controller = {}
+Controller.Name = "NotifyController"
+
+local MAX_VISIBLE = 4
+local HOLD_SECONDS = 5 -- long enough to read a sentence, short enough not to own the corner
+local FADE_SECONDS = 0.35
+-- A toast is a glance, not a document. Truncating here means a pathological Text cannot resize the
+-- stack or push the older toasts off screen.
+local MAX_TEXT = 140
+
+-- Kind -> Theme colour. Unknown kinds fall back to Accent rather than being dropped: a message the
+-- server bothered to send is worth showing even if this build does not recognise its severity.
+local KIND_COLOUR: { [string]: Color3 } = {
+	info = Theme.Ui.Accent,
+	success = Theme.Ui.Positive,
+	warn = Theme.Ui.Warning,
+	error = Theme.Ui.Negative,
+}
+
+local FADE_TWEEN = TweenInfo.new(FADE_SECONDS, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+
+local active: { Toast } = {}
+local connections: { any } = {}
+local root: any
+local remotes: { [string]: any }
+-- Monotonic, never reset: the list is bottom-aligned and sorted by LayoutOrder, so an ever-growing
+-- order keeps the newest toast at the bottom and stops a new arrival from shuffling the one above
+-- it while it is still being read.
+local order = 0
+
+local budget = math.max(1, math.floor(GameConfig.Network.MaxNotifyPerSecond))
+local tokens = budget
+local lastRefill = os.clock()
+
+--[[ A leaky bucket refilled from the clock rather than a loop: no Heartbeat connection, no timer,
+     and it stays correct across a frame hitch that a per-frame refill would under-count. ]]
+local function consume(): boolean
+	local now = os.clock()
+	local elapsed = now - lastRefill
+	if elapsed > 0 then
+		tokens = math.min(budget, tokens + elapsed * budget)
+		lastRefill = now
+	end
+	if tokens < 1 then
+		return false
+	end
+	tokens -= 1
+	return true
+end
+
+local function fade(instance: any, properties: { [string]: any }): ()
+	-- Tweens are created per surface because a Frame tween cannot reach its label's TextTransparency
+	-- or its stroke's Transparency, and a toast that faded its background but kept crisp text would
+	-- look like a rendering bug rather than a dismissal.
+	TweenService:Create(instance, FADE_TWEEN, properties):Play()
+end
+
+local function dismiss(toast: Toast): ()
+	if toast.Dismissed then
+		return
+	end
+	toast.Dismissed = true
+	for index, entry in ipairs(active) do
+		if entry == toast then
+			table.remove(active, index)
+			break
+		end
+	end
+
+	fade(toast.Frame, { BackgroundTransparency = 1 })
+	fade(toast.Label, { TextTransparency = 1, TextStrokeTransparency = 1 })
+	fade(toast.Stroke, { Transparency = 1 })
+	-- Debris rather than task.delay + Destroy: the Instance is reclaimed even if this client tears
+	-- the controller down before the tween finishes, and there is no dangling closure holding it.
+	Debris:AddItem(toast.Frame, FADE_SECONDS)
+end
+
+local function buildToast(kind: string, text: string): Toast
+	local colour = KIND_COLOUR[kind] or Theme.Ui.Accent
+	order += 1
+
+	local frame = Instance.new("Frame")
+	frame.Name = "Toast"
+	frame.LayoutOrder = order
+	frame.Size = UDim2.fromScale(1, 0.155)
+	frame.BackgroundColor3 = Theme.Ui.Panel
+	frame.BackgroundTransparency = 0.08
+	frame.BorderSizePixel = 0
+
+	local corner = Instance.new("UICorner")
+	corner.CornerRadius = UDim.new(0, 8)
+	corner.Parent = frame
+
+	-- The stroke carries the severity in colour; the text carries it too, so the toast still reads
+	-- correctly for a player who cannot separate the two hues.
+	local stroke = Instance.new("UIStroke")
+	stroke.Color = colour
+	stroke.Thickness = 2
+	stroke.Parent = frame
+
+	local padding = Instance.new("UIPadding")
+	padding.PaddingTop = UDim.new(0.1, 0)
+	padding.PaddingBottom = UDim.new(0.1, 0)
+	padding.PaddingLeft = UDim.new(0.05, 0)
+	padding.PaddingRight = UDim.new(0.05, 0)
+	padding.Parent = frame
+
+	local label = Instance.new("TextLabel")
+	label.Name = "Message"
+	label.Size = UDim2.fromScale(1, 1)
+	label.BackgroundTransparency = 1
+	label.Font = Enum.Font.Gotham
+	-- Wrapped at a fixed size rather than TextScaled: scaling to fill would make a three-word toast
+	-- enormous next to a two-line one, and the stack would visibly jump between messages.
+	label.TextScaled = false
+	label.TextSize = 15
+	label.TextWrapped = true
+	label.TextColor3 = colour
+	label.TextStrokeTransparency = 0.6
+	label.TextXAlignment = Enum.TextXAlignment.Left
+	label.TextYAlignment = Enum.TextYAlignment.Center
+	label.Text = text
+	label.Parent = frame
+
+	-- Parented last, so a half-built toast never appears in the stack.
+	frame.Parent = root
+	return { Frame = frame, Label = label, Stroke = stroke, Dismissed = false }
+end
+
+local function push(payload: any): ()
+	if root == nil or type(payload) ~= "table" then
+		return
+	end
+	local text = payload.Text
+	if type(text) ~= "string" or text == "" then
+		return
+	end
+	local kind = payload.Kind
+	if type(kind) ~= "string" or KIND_COLOUR[kind] == nil then
+		kind = "info"
+	end
+	if not consume() then
+		return
+	end
+
+	-- Trim BEFORE building, and pop from the front (the oldest) so the stack never exceeds the cap
+	-- even for a frame. table.remove first: dismiss() early-returns on an already-dismissed toast,
+	-- so a search-and-remove inside the loop could otherwise spin forever.
+	while #active >= MAX_VISIBLE do
+		dismiss(table.remove(active, 1) :: Toast)
+	end
+
+	local toast = buildToast(kind, string.sub(text, 1, MAX_TEXT))
+	table.insert(active, toast)
+	-- Idempotent with the trim above and with Stop(): whichever dismissal happens first wins.
+	task.delay(HOLD_SECONDS, function()
+		dismiss(toast)
+	end)
+end
+
+function Controller:Init(context: Context): ()
+	remotes = context.Remotes
+	root = context.Ui.Toasts.Root
+end
+
+function Controller:Start(): ()
+	local remote = remotes[RemoteSchema.Remotes.Notify.Name]
+	if remote == nil then
+		-- Silent: ClientBootstrap already warned once per missing remote, and a second line per
+		-- controller would bury the one that matters.
+		return
+	end
+	table.insert(connections, remote.OnClientEvent:Connect(push))
+end
+
+function Controller:Stop(): ()
+	for _, connection in ipairs(connections) do
+		connection:Disconnect()
+	end
+	table.clear(connections)
+	-- Destroy outright rather than fade: Stop means the HUD is going away, and a toast tweening out
+	-- over a torn-down interface is a leak with an animation.
+	for _, toast in ipairs(active) do
+		toast.Dismissed = true
+		toast.Frame:Destroy()
+	end
+	table.clear(active)
+end
+
+return Controller
+
+--#endregion
+end
+MODULE_ORDER[#MODULE_ORDER + 1] = { Path = "StarterPlayer/StarterPlayerScripts/Client/Controllers/PadVerdict", Class = "ModuleScript", File = "src/client/Controllers/PadVerdict.luau" }
+MODULE_DEFS["StarterPlayer/StarterPlayerScripts/Client/Controllers/PadVerdict"] = function(script, require, ...)
+--#region src/client/Controllers/PadVerdict.luau
+--!strict
+--[[
+    PadVerdict
+    What one purchase pad MEANS, with no Instance in sight. It keeps a PlotState-shaped view of the
+    snapshot and answers, for a given PadKind and id: what the pad is called, whether it can be acted
+    on right now, the closed-set reason code if it cannot, and what it costs. Every answer is
+    Economy's -- the same pure module PurchaseService runs on the server -- and every name comes
+    straight from the catalogues.
+    Split out of PromptController for the 300-line rule: this is that controller's pure half, and
+    keeping it separate means the wording rules can be read without the Instance plumbing.
+    Owner: client  |  Consumers: PromptController (only)
+]]
+
+local Modules = game:GetService("ReplicatedStorage"):WaitForChild("Modules")
+local DropperData = require(Modules:WaitForChild("DropperData"))
+local Economy = require(Modules:WaitForChild("Economy"))
+local EvolutionData = require(Modules:WaitForChild("EvolutionData"))
+local SectionData = require(Modules:WaitForChild("SectionData"))
+local UpgradeData = require(Modules:WaitForChild("UpgradeData"))
+
+-- Exactly the fields Economy reads out of a PlotState, and nothing else. It is a PROJECTION of the
+-- server's state rebuilt from each Full snapshot, never a second copy the client may edit.
+type PlotView = {
+	Essence: number,
+	Stage: number,
+	Affinity: string?,
+	Droppers: { [string]: number },
+	Upgrades: { [string]: number },
+	Sections: { [string]: boolean },
+	LifetimeEssence: number,
+}
+
+local PadVerdict = {}
+
+local Reason = Economy.Reason
+local EMPTY: { [string]: any } = {}
+
+-- Re-exported so PromptController never has to spell a reason code as a literal: the closed set has
+-- exactly one definition, in Economy, and this is the client's handle on it.
+PadVerdict.Reason = Reason
+
+-- The verb each PadKind uses when it CAN be acted on. Everything else a pad ever says is reason
+-- text, so this table is the whole of the affordable vocabulary.
+local VERBS: { [string]: string } = {
+	dropper = "Buy for",
+	upgrade = "Buy for",
+	section = "Buy for",
+	attune = "Attune for",
+	transcend = "Transcend",
+	link = "Share this Sanctum",
+}
+
+-- Snapshot fields are untrusted in the same sense Economy treats them: a NaN reaching a cost makes
+-- every comparison against it false, and the pad would silently read as affordable.
+local function num(value: any, default: number): number
+	if type(value) == "number" and value == value and value ~= math.huge and value ~= -math.huge then
+		return value
+	end
+	return default
+end
+
+local function map(value: any): { [string]: any }
+	return if type(value) == "table" then value else EMPTY
+end
+
+--[[ The zeroed view a controller starts from. Stage 1 with nothing owned is the emptiest legal
+     PlotState, so every pad reads "locked" or "cannot afford" until the first snapshot lands --
+     which is the honest answer before the server has told this client anything. ]]
+function PadVerdict.new(): PlotView
+	return {
+		Essence = 0,
+		Stage = 1,
+		Affinity = nil,
+		Droppers = EMPTY :: any,
+		Upgrades = EMPTY :: any,
+		Sections = EMPTY :: any,
+		LifetimeEssence = 0,
+	}
+end
+
+-- Mutates in place rather than returning a fresh table: the view is held by one controller for the
+-- life of the session, and reallocating it on every Full snapshot would churn for no benefit.
+function PadVerdict.update(view: PlotView, source: any): ()
+	local raw = map(source)
+	view.Stage = math.clamp(math.floor(num(raw.Stage, 1)), 1, EvolutionData.MaxStage)
+	view.Affinity = if type(raw.Affinity) == "string" then raw.Affinity else nil
+	-- Referenced, not copied. ClientStore already deep-copies each Full payload, so these tables are
+	-- private to the store and nothing on the client mutates them.
+	view.Droppers = map(raw.Droppers) :: any
+	view.Upgrades = map(raw.Upgrades) :: any
+	view.Sections = map(raw.Sections) :: any
+	view.LifetimeEssence = num(raw.LifetimeEssence, 0)
+end
+
+function PadVerdict.setEssence(view: PlotView, value: any): ()
+	view.Essence = num(value, 0)
+end
+
+function PadVerdict.verb(kind: string): string
+	return VERBS[kind] or "Buy for"
+end
+
+--[[ One switch over PadKind, and every branch DEFERS: the display name comes from the catalogue and
+     the verdict from Economy, run on the same PlotState shape the server holds. An id this build has
+     never heard of is made UNAVAILABLE, never free -- the same doctrine Economy applies to a corrupt
+     def, for the same reason. ]]
+function PadVerdict.evaluate(view: PlotView, kind: string, id: string): (string, boolean, string, number)
+	if kind == "dropper" then
+		local def = DropperData.get(id)
+		if def == nil then
+			return "Wellspring", false, Reason.UnknownId, 0
+		end
+		local ok, reason = Economy.dropperStatus(view, def)
+		return def.Name, ok, reason, Economy.getDropperCost(def, num(view.Droppers[id], 0))
+	elseif kind == "upgrade" then
+		local def = UpgradeData.get(id)
+		if def == nil then
+			return "Upgrade", false, Reason.UnknownId, 0
+		end
+		local ok, reason = Economy.upgradeStatus(view, def)
+		return def.Name, ok, reason, Economy.getUpgradeCost(def, Economy.upgradeLevel(view, id))
+	elseif kind == "section" then
+		local def = SectionData.get(id)
+		if def == nil then
+			return "Wing", false, Reason.UnknownId, 0
+		end
+		local ok, reason = Economy.sectionStatus(view, def)
+		return def.Name, ok, reason, Economy.getSectionCost(def)
+	elseif kind == "attune" then
+		local ok, reason = Economy.attuneStatus(view)
+		local nextStage = EvolutionData.next(view.Stage)
+		if nextStage == nil then
+			-- Primordial. attuneStatus already returned max_stage, so the pad reads as a landmark
+			-- rather than as a purchase with a missing price.
+			return "The Conflux", ok, reason, 0
+		end
+		return "Attune: " .. nextStage.Name, ok, reason, num(nextStage.RequiredEssence, 0)
+	elseif kind == "transcend" then
+		local ok, reason = Economy.transcendStatus(view)
+		-- Transcendence spends the run, not the wallet: quoting a price here would be a lie.
+		return "Transcendence", ok, reason, 0
+	elseif kind == "link" then
+		-- Not a purchase at all: the link pad costs nothing and PlotService alone decides who may
+		-- use it, so the only honest thing the client can put on it is what it does.
+		return "Sanctum Link", true, Reason.Ok, 0
+	end
+	return "Pad", false, Reason.UnknownId, 0
+end
+
+return PadVerdict
+
+--#endregion
+end
+MODULE_ORDER[#MODULE_ORDER + 1] = { Path = "StarterPlayer/StarterPlayerScripts/Client/Controllers/PromptController", Class = "ModuleScript", File = "src/client/Controllers/PromptController.luau" }
+MODULE_DEFS["StarterPlayer/StarterPlayerScripts/Client/Controllers/PromptController"] = function(script, require, ...)
+--#region src/client/Controllers/PromptController.luau
+--!strict
+--[[
+    PromptController
+    Makes every in-world purchase pad readable at a glance. It finds each pad's ProximityPrompt,
+    reads the pad's server-published attributes (PadKind, PadId, PadCost, PadLocked), and writes
+    ObjectText, ActionText and the sign colour. It buys nothing and judges nothing: what a pad means
+    is PadVerdict's answer (which is Economy's answer), and how a refusal is worded is
+    HudController's one reason-code table.
+    Owner: client  |  Consumers: ClientBootstrap (lifecycle)
+]]
+--[[ WHY DISCOVERY AND RENDERING ARE TWO SEPARATE PASSES. A Sanctum carries ~40 pads and StateSync
+     pushes Essence twice a second, so anything done per pad per tick runs ~80 times a second per
+     Sanctum -- and six Sanctums stand in the same Workspace. So discovery (walk the tree, resolve
+     the attribute holder, find the sign, wire the signals) happens ONCE per prompt and is never
+     redone on a tick; the Essence observer only walks the ALREADY-BOUND table and writes two
+     strings and a colour per pad. Rebuilding the binding table on every tick would re-resolve
+     hundreds of Instances and allocate a table per pad, twice a second, for a number that moved by
+     one -- and it would drop every attribute connection on the floor while doing it. ]]
+
+local Modules = game:GetService("ReplicatedStorage"):WaitForChild("Modules")
+local Format = require(Modules:WaitForChild("Format"))
+local Theme = require(Modules:WaitForChild("Theme"))
+
+-- The reason-code -> English table lives in exactly one file (§11 of DECISIONS). Restating any of
+-- it here is what would let a pad say "Locked" while the HUD says "Not enough Essence" about the
+-- same refusal, so this controller borrows the resolver rather than owning a second table.
+local HudController = require(script.Parent.HudController)
+-- The pure half of this controller: the PlotState view and the per-kind verdicts.
+local PadVerdict = require(script.Parent.PadVerdict)
+
+type Context = { Store: any, Remotes: { [string]: any }, Player: any, PlayerGui: any, Ui: any }
+
+-- Holder is the Instance the four Pad* attributes are read from; Label is the sign's TextLabel.
+type Binding = {
+	Prompt: any,
+	Holder: Instance,
+	Label: any,
+	Kind: string,
+	Id: string,
+	Connections: { any },
+}
+
+local Controller = {}
+Controller.Name = "PromptController"
+
+-- A prompt normally sits directly on its pad; two hops covers a prompt nested one level deeper
+-- (inside an Attachment, say) without walking the whole Sanctum for every unrelated prompt.
+local MAX_ANCESTOR_HOPS = 2
+
+local bindings: { [any]: Binding } = {}
+local connections: { any } = {}
+local store: any
+local plot = PadVerdict.new()
+
+-- Local rather than shared: a NaN PadCost must not survive into a comparison, and HudController
+-- keeps its own copy of this same three-line guard for the same reason.
+local function num(value: any, default: number): number
+	if type(value) == "number" and value == value and value ~= math.huge and value ~= -math.huge then
+		return value
+	end
+	return default
+end
+
+-- BuildKit parents a BillboardGui named "Sign" to each pad with a single TextLabel inside it.
+local function signLabel(holder: Instance): any
+	local sign = holder:FindFirstChild("Sign")
+	return if sign ~= nil then sign:FindFirstChildOfClass("TextLabel") else nil
+end
+
+--[[ PadKind is published on the pad Part by PlotBuilder, but a prompt is allowed to carry its own
+     copy, so the first Instance up the chain that has one wins and becomes the SINGLE place this
+     binding reads all four attributes from. Reading Kind off one Instance and Cost off another is
+     exactly how a pad ends up quoting a price for something it is not selling. ]]
+local function holderFor(prompt: any): Instance?
+	local node: Instance? = prompt
+	for _ = 0, MAX_ANCESTOR_HOPS do
+		if node == nil then
+			return nil
+		end
+		if type(node:GetAttribute("PadKind")) == "string" then
+			return node
+		end
+		node = node.Parent
+	end
+	return nil
+end
+
+local function render(binding: Binding): ()
+	local holder = binding.Holder
+	local locked = holder:GetAttribute("PadLocked") == true
+	local name, ok, reason, cost = PadVerdict.evaluate(plot, binding.Kind, binding.Id)
+	-- The server's published price outranks the one derived here: PurchaseService rewrites PadCost
+	-- on every refresh, and if the two ever disagree the pad must quote what it will actually
+	-- charge. The Economy figure is the fallback for the window before the first refresh lands.
+	cost = num(holder:GetAttribute("PadCost"), cost)
+
+	local prompt = binding.Prompt
+	prompt.ObjectText = name
+
+	if locked then
+		-- PadLocked is the server's word and it outranks affordability: a Wing that has not been
+		-- unlocked must never read "Buy for X", however much Essence is in the shared wallet. The
+		-- fallback covers the disagreement case, where the pad is locked but Economy says "ok".
+		prompt.Enabled = false
+		prompt.ActionText = HudController.reasonText(if ok then PadVerdict.Reason.LockedSection else reason)
+	else
+		-- Enabled is driven from PadLocked ALONE, and only ever locally: a client-side write does
+		-- not replicate, and PurchaseService re-checks occupancy and affordability on every trigger,
+		-- so the worst this can do is offer a prompt the server then refuses.
+		prompt.Enabled = true
+		if ok then
+			local verb = PadVerdict.verb(binding.Kind)
+			prompt.ActionText = if cost > 0 then (verb .. " " .. Format.essence(cost)) else verb
+		else
+			prompt.ActionText = HudController.reasonText(reason)
+		end
+	end
+
+	local label = binding.Label
+	if label ~= nil then
+		-- Three states, three colours, legible from across the Sanctum: Negative reads "you cannot
+		-- be here yet", Muted reads "come back with more Essence", Positive reads "press E".
+		label.TextColor3 = if locked
+			then Theme.Ui.Negative
+			elseif ok then Theme.Ui.Positive
+			else Theme.Ui.Muted
+	end
+end
+
+local function renderAll(): ()
+	for _, binding in pairs(bindings) do
+		render(binding)
+	end
+end
+
+local function unbind(prompt: any): ()
+	local binding = bindings[prompt]
+	if binding == nil then
+		return
+	end
+	bindings[prompt] = nil
+	for _, connection in ipairs(binding.Connections) do
+		connection:Disconnect()
+	end
+end
+
+local function bind(prompt: any): ()
+	if bindings[prompt] ~= nil then
+		return
+	end
+	local holder = holderFor(prompt)
+	if holder == nil then
+		return -- not a purchase pad; every other prompt in the world is somebody else's business
+	end
+	local kind = holder:GetAttribute("PadKind")
+	local id = holder:GetAttribute("PadId")
+	if type(kind) ~= "string" or type(id) ~= "string" then
+		return
+	end
+
+	local binding: Binding = {
+		Prompt = prompt,
+		Holder = holder,
+		Label = signLabel(holder),
+		Kind = kind,
+		Id = id,
+		Connections = {},
+	}
+	bindings[prompt] = binding
+
+	--[[ Only PadCost and PadLocked earn a signal. PadKind/PadId are the pad's identity, written once
+	     at build time, so watching them would cost a connection per pad per Sanctum for an event
+	     that never fires. These two are what PurchaseService:RefreshPads rewrites. ]]
+	table.insert(binding.Connections, holder:GetAttributeChangedSignal("PadCost"):Connect(function()
+		render(binding)
+	end))
+	table.insert(binding.Connections, holder:GetAttributeChangedSignal("PadLocked"):Connect(function()
+		render(binding)
+	end))
+	-- MOCK-EXTRA: Instance.Destroying. Without it a Transcendence -- which tears the Sanctum down
+	-- and rebuilds every pad -- would leave this table holding dead prompts and their attribute
+	-- connections for the rest of the session, and every rebuild would leak another ~40.
+	table.insert(binding.Connections, prompt.Destroying:Connect(function()
+		unbind(prompt)
+	end))
+
+	render(binding)
+end
+
+local function bindDescendants(root: Instance): ()
+	for _, descendant in ipairs(root:GetDescendants()) do
+		if descendant:IsA("ProximityPrompt") then
+			bind(descendant)
+		end
+	end
+end
+
+function Controller:Init(context: Context): ()
+	store = context.Store
+	-- Seed from whatever the store already holds so the sweep in Start renders real numbers instead
+	-- of a zeroed default that the next snapshot would immediately overwrite.
+	PadVerdict.update(plot, store:GetPath("Plot"))
+	PadVerdict.setEssence(plot, store:GetPath("Essence"))
+end
+
+function Controller:Start(): ()
+	local function track(connection: any): ()
+		table.insert(connections, connection)
+	end
+
+	--[[ PlotBuilder does not tag pads with CollectionService, so discovery is the plain pair: one
+	     sweep for the Sanctums that already exist when this client joins, plus DescendantAdded for
+	     everything built afterwards. Both funnel into bind(), which is idempotent, so overlap
+	     between the two is free. ]]
+	bindDescendants(workspace)
+	-- MOCK-EXTRA: workspace.DescendantAdded.
+	track(workspace.DescendantAdded:Connect(function(descendant: Instance)
+		if descendant:IsA("ProximityPrompt") then
+			bind(descendant)
+		elseif descendant:IsA("Model") or descendant:IsA("Folder") then
+			-- A whole Wing arriving at once (an unlock reparents it back into the world) is one
+			-- container add, so scan it. Restricted to containers because scanning the descendants
+			-- of every Part that ever streams in would be an unbounded cost on a hot signal.
+			bindDescendants(descendant)
+		end
+	end))
+
+	--[[ Two observers, deliberately asymmetric. "Plot" only changes on a Full snapshot -- the server
+	     marks a Sanctum dirty -- so rebuilding the PlotState view there is rare and cheap. "Essence"
+	     arrives twice a second and writes ONE field before re-rendering the bound pads: no
+	     allocation, no attribute walk, no re-resolution of a sign. ]]
+	track(store:Observe("Plot", function(value: any)
+		PadVerdict.update(plot, value)
+		renderAll()
+	end))
+	track(store:Observe("Essence", function(value: any)
+		PadVerdict.setEssence(plot, value)
+		renderAll()
+	end))
+end
+
+function Controller:Stop(): ()
+	for _, connection in ipairs(connections) do
+		connection:Disconnect()
+	end
+	table.clear(connections)
+	for prompt in pairs(bindings) do
+		unbind(prompt)
+	end
+end
+
+return Controller
+
+--#endregion
+end
+MODULE_ORDER[#MODULE_ORDER + 1] = { Path = "StarterPlayer/StarterPlayerScripts/Client/Controllers/RebirthController", Class = "ModuleScript", File = "src/client/Controllers/RebirthController.luau" }
+MODULE_DEFS["StarterPlayer/StarterPlayerScripts/Client/Controllers/RebirthController"] = function(script, require, ...)
+--#region src/client/Controllers/RebirthController.luau
+--!strict
+--[[
+    RebirthController
+    Owns the Transcendence modal: the irreversible-action warning, the live consensus vote list and
+    its countdown. It decides nothing. The server opens a vote by pushing RebirthVoteState, counts
+    the votes and executes; this file renders that state and forwards two button presses as
+    RebirthVote { Accept = true } / { Accept = false }.
+    Owner: client  |  Consumers: ClientBootstrap (lifecycle)
+]]
+--[[ WHY THE COPY IS BLUNT. Transcendence deletes an hour of shared work and the pair have thirty
+     seconds to agree to it. Softening the wording to "reset your progress" would make the most
+     destructive button in the game read like a menu option, so the modal names every category of
+     thing that is destroyed and every category that survives, in exactly those words.
+
+     WHY THE MODAL IS CLOSED FROM FOUR DIRECTIONS. A vote can end in four ways: unanimous yes,
+     somebody votes no, an occupant leaves, or the window expires -- and only the first is visible
+     in the payload. So it closes on a terminal push (an ExpiresAt that is not in the future), on a
+     local countdown reaching zero, on unanimity, and on a Confirm the server never answered. A
+     stuck modal is a full-screen scrim over a running Sanctum, which is unrecoverable in-game. ]]
+
+local RunService = game:GetService("RunService")
+
+local Modules = game:GetService("ReplicatedStorage"):WaitForChild("Modules")
+local Format = require(Modules:WaitForChild("Format"))
+local RemoteSchema = require(Modules:WaitForChild("RemoteSchema"))
+local Theme = require(Modules:WaitForChild("Theme"))
+
+type Context = { Store: any, Remotes: { [string]: any }, Player: any, PlayerGui: any, Ui: any }
+
+local Controller = {}
+Controller.Name = "RebirthController"
+
+-- Named in full, in the player's vocabulary, with no hedging. "Everything" alone is not a warning.
+local WARNING = table.concat({
+	"This cannot be undone, and it takes the whole Sanctum with it.",
+	"LOST -- every Essence in the shared wallet, your Stage (back to Mote), every Wellspring, every"
+		.. " Upgrade, every Wing, and the Affinity the pair chose.",
+	"KEPT -- your rebirth count, your permanent multiplier, and the badges you have earned. Those"
+		.. " are per player and are never merged or reset.",
+	"Every occupant must vote yes inside the window. Everyone who votes yes keeps the reward.",
+}, "\n\n")
+
+-- How long a Confirm may go unanswered before the modal gives up. The server replies with a vote
+-- state within a tick when it accepts, so silence past this means it refused.
+local ANSWER_GRACE = 5
+local TICK_INTERVAL = 0.25 -- countdown redraw cadence; a 30s window does not need per-frame text
+
+local connections: { any } = {}
+local remotes: { [string]: any } = {}
+local modal: any = nil
+local transcendButton: any = nil
+local selfKey = ""
+local names: { [string]: string } = {}
+local votes: { [string]: boolean } = {}
+local expiresAt = 0 -- os.time() deadline of the live vote; 0 = no vote in progress
+-- os.clock() at which Confirm was sent with no live vote. nil, not 0, because os.clock() is zero
+-- at the first frame of a session and a sentinel that collides with a real reading is a bug.
+local pendingSince: number? = nil
+local accumulator = 0
+
+local function num(value: any, default: number): number
+	if type(value) == "number" and value == value and value ~= math.huge and value ~= -math.huge then
+		return value
+	end
+	return default
+end
+
+--[[ Rows are filled in sorted key order, not pairs order: Luau's pairs order is unspecified, so
+     without the sort a partner could visibly swap rows between two pushes of the same vote. ]]
+local function renderVotes(): ()
+	local keys: { string } = {}
+	for key in pairs(names) do
+		table.insert(keys, key)
+	end
+	table.sort(keys)
+
+	for index, row in ipairs(modal.VoteRows) do
+		local key = keys[index]
+		if key == nil then
+			row.Visible = false
+			continue
+		end
+		local who = tostring(names[key])
+		if key == selfKey then
+			who ..= "  (you)"
+		end
+		local vote = votes[key]
+		if vote == true then
+			row.Text = who .. "  --  yes"
+			row.TextColor3 = Theme.Ui.Positive
+		elseif vote == false then
+			row.Text = who .. "  --  no"
+			row.TextColor3 = Theme.Ui.Negative
+		else
+			-- "deciding", not "no": an occupant who has not answered yet has refused nothing.
+			row.Text = who .. "  --  deciding"
+			row.TextColor3 = Theme.Ui.Muted
+		end
+		row.Visible = true
+	end
+end
+
+-- The Confirm button is the player's own vote, so once it is cast it stops being a button: leaving
+-- it live would invite a second press that says nothing new.
+local function renderConfirm(): ()
+	local cast = votes[selfKey] == true
+	local button = modal.Confirm
+	button.Text = if cast then "Waiting for the Sanctum" else (if expiresAt > 0 then "Vote yes" else "Begin the vote")
+	button.BackgroundColor3 = if cast then Theme.Ui.Panel else Theme.Ui.Warning
+	button.TextColor3 = if cast then Theme.Ui.Muted else Theme.Ui.Background
+	button.Active = not cast
+	button.AutoButtonColor = not cast
+end
+
+local function close(): ()
+	expiresAt = 0
+	pendingSince = nil
+	names = {}
+	votes = {}
+	modal.TimerLabel.Text = ""
+	for _, row in ipairs(modal.VoteRows) do
+		row.Visible = false
+	end
+	modal.Root.Visible = false
+end
+
+local function open(): ()
+	modal.Root.Visible = true
+	renderVotes()
+	renderConfirm()
+end
+
+-- Vacuously-true guard: a push whose Names table is empty must not read as "everybody agreed".
+local function unanimous(): boolean
+	local count = 0
+	for key in pairs(names) do
+		count += 1
+		if votes[key] ~= true then
+			return false
+		end
+	end
+	return count > 0
+end
+
+local function send(accept: boolean): ()
+	local remote = remotes[RemoteSchema.Remotes.RebirthVote.Name]
+	if remote == nil then
+		return
+	end
+	-- Accept is the whole payload: the server derives the sanctum from occupancy, so there is no
+	-- plot, player or amount here for anyone to forge.
+	remote:FireServer({ Accept = accept })
+end
+
+--[[ The server's vote state. It is the only thing that puts a vote on screen -- pressing the HUD
+     button opens the warning, but until a state arrives there is no vote, no list and no clock. ]]
+local function onVoteState(payload: any): ()
+	if type(payload) ~= "table" then
+		return
+	end
+	local deadline = num(payload.ExpiresAt, 0)
+	if deadline <= os.time() then
+		-- A cancel, an expiry or a completed vote all arrive looking like this. Close, do not guess.
+		close()
+		return
+	end
+
+	names = {}
+	votes = {}
+	if type(payload.Names) == "table" then
+		for key, value in pairs(payload.Names) do
+			if type(key) == "string" and type(value) == "string" then
+				names[key] = value
+			end
+		end
+	end
+	if type(payload.Votes) == "table" then
+		for key, value in pairs(payload.Votes) do
+			if type(key) == "string" and type(value) == "boolean" then
+				votes[key] = value
+			end
+		end
+	end
+
+	expiresAt = deadline
+	pendingSince = nil
+	if unanimous() then
+		-- Everyone has agreed; the server is already executing and the Fx is on its way.
+		close()
+		return
+	end
+	open()
+end
+
+local function tick(deltaTime: number): ()
+	accumulator += deltaTime
+	if accumulator < TICK_INTERVAL then
+		return
+	end
+	accumulator = 0
+	if modal == nil or modal.Root.Visible ~= true then
+		return
+	end
+
+	if expiresAt > 0 then
+		local remaining = expiresAt - os.time()
+		if remaining <= 0 then
+			close()
+			return
+		end
+		modal.TimerLabel.Text = "Vote closes in " .. Format.time(remaining)
+	elseif pendingSince ~= nil and os.clock() - pendingSince > ANSWER_GRACE then
+		-- Confirmed, but the server never opened a vote: it refused (gate not met, or a vote is
+		-- already running elsewhere). It said why through Notify; the modal simply gets out of the way.
+		close()
+	end
+end
+
+function Controller:Init(context: Context): ()
+	remotes = context.Remotes
+	modal = context.Ui.Modals.Transcend
+	transcendButton = context.Ui.ActionBar.TranscendButton
+	selfKey = tostring(context.Player.UserId)
+
+	modal.Body.Text = WARNING
+	-- Smaller than the shell default: this is the longest body copy in the game and it must fit
+	-- without scrolling, because a warning the player has to scroll is a warning they will not read.
+	modal.Body.TextSize = 13
+	modal.TimerLabel.Text = ""
+	modal.Root.Visible = false
+	renderConfirm()
+end
+
+function Controller:Start(): ()
+	local function track(connection: any): ()
+		table.insert(connections, connection)
+	end
+
+	-- The HUD button only ever opens the warning. HudController shows it solely when
+	-- Gates.Transcend.Ok is true, and the server re-checks the gate before opening a vote anyway.
+	track(transcendButton.Activated:Connect(open))
+
+	track(modal.Confirm.Activated:Connect(function()
+		if votes[selfKey] == true then
+			return
+		end
+		send(true)
+		if expiresAt == 0 then
+			-- Opening the vote, not answering one: start the answer clock so a refusal cannot leave
+			-- the modal sitting open forever.
+			pendingSince = os.clock()
+		end
+		-- Optimistic only in the UI: the row and the button say "sent", the server still decides.
+		votes[selfKey] = true
+		renderVotes()
+		renderConfirm()
+	end))
+
+	track(modal.Cancel.Activated:Connect(function()
+		-- A no is worth sending even with no vote running: it is how a partner declines the vote
+		-- the other one just opened, and the server ignores it otherwise.
+		send(false)
+		close()
+	end))
+
+	local remote = remotes[RemoteSchema.Remotes.RebirthVoteState.Name]
+	if remote ~= nil then
+		track(remote.OnClientEvent:Connect(onVoteState))
+	end
+
+	-- One always-on Heartbeat rather than connect/disconnect per vote: the handler is a numeric
+	-- compare and an early return, and a countdown that fails to start is worse than a free frame.
+	track(RunService.Heartbeat:Connect(tick))
+end
+
+function Controller:Stop(): ()
+	for _, connection in ipairs(connections) do
+		connection:Disconnect()
+	end
+	table.clear(connections)
+	if modal ~= nil then
+		close()
+	end
+end
+
+return Controller
+
+--#endregion
+end
+MODULE_ORDER[#MODULE_ORDER + 1] = { Path = "StarterPlayer/StarterPlayerScripts/Client/Controllers/SettingsController", Class = "ModuleScript", File = "src/client/Controllers/SettingsController.luau" }
+MODULE_DEFS["StarterPlayer/StarterPlayerScripts/Client/Controllers/SettingsController"] = function(script, require, ...)
+--#region src/client/Controllers/SettingsController.luau
+--!strict
+--[[
+    SettingsController
+    Owns the Settings modal and the action-bar button that opens it: the Music and Sfx toggles, and
+    the developer-only "reset my save" control behind a two-second hold. It renders the Settings the
+    snapshot reports and asks the server to change them; it keeps no preference of its own, so a
+    setting the server refuses simply never appears to have changed.
+    Owner: client  |  Consumers: ClientBootstrap (lifecycle)
+]]
+--[[ WHY THE TOGGLES ARE NOT OPTIMISTIC IN STATE. A click fires SetSetting and then does nothing
+     else -- it does not touch the label. The label is rewritten only when "You.Settings" comes back
+     changed. That costs one round trip of latency and buys the guarantee that the button never
+     lies: a setting dropped by the rate limiter or refused by ProfileService snaps back on its own,
+     with no reconciliation code and no second source of truth to drift out of sync. They still
+     FEEL optimistic, because the snapshot that confirms them is already on a 0.5s cadence. ]]
+--[[ CONFIRMED DECISION §9.5.6 -- THE RESET CONTROL. It exists only when GameConfig.Debug
+     .AllowDataReset is set and, when DataResetStudioOnly is also set, only in Studio. Hiding the
+     button here is a COURTESY, not the control: RemoteSchema refuses the payload and ProfileService
+     refuses the action under exactly the same conditions, so a player who fabricates the remote
+     call on a live server still gets nothing. This check exists so that a live server never shows a
+     button that could not work, not so that the button is safe to show. ]]
+
+local RunService = game:GetService("RunService")
+
+local Modules = game:GetService("ReplicatedStorage"):WaitForChild("Modules")
+local GameConfig = require(Modules:WaitForChild("GameConfig"))
+local RemoteSchema = require(Modules:WaitForChild("RemoteSchema"))
+local Theme = require(Modules:WaitForChild("Theme"))
+
+type Context = { Store: any, Remotes: { [string]: any }, Player: any, PlayerGui: any, Ui: any }
+
+local Controller = {}
+Controller.Name = "SettingsController"
+
+local HOLD_SECONDS = 2
+local RESET_LABEL = "Hold to reset my save" -- must match the wording UiModals builds the button with
+local WARNING_TEXT = "Resetting deletes your save outright: every Wellspring, Wing, Stage,"
+	.. " Transcendence and badge. There is no undo and no backup."
+
+local connections: { any } = {}
+local store: any
+local remotes: { [string]: any }
+local modal: any
+local openButton: any
+local fill: any
+local warning: any
+-- Hold state lives here rather than on the widget so cancelling is a single call from three
+-- different signals (button up, pointer leave, modal close) that cannot disagree.
+local held = 0
+local holdConnection: any = nil
+
+--[[ Both halves of the gate, in one place, so the Init-time visibility and the Start-time signal
+     wiring can never be decided differently. ]]
+local function resetAllowed(): boolean
+	if GameConfig.Debug.AllowDataReset ~= true then
+		return false
+	end
+	return GameConfig.Debug.DataResetStudioOnly ~= true or RunService:IsStudio()
+end
+
+-- Absent means on: a brand new profile has both enabled, and the pre-snapshot default must match
+-- what the server will report rather than showing "Off" for half a second on every join.
+local function settingOn(key: string): boolean
+	return store:GetPath("You.Settings." .. key) ~= false
+end
+
+local function renderToggle(button: any, name: string, on: boolean): ()
+	button.Text = name .. ": " .. (if on then "On" else "Off")
+	button.BackgroundColor3 = if on then Theme.Ui.Positive else Theme.Ui.Background
+	button.TextColor3 = if on then Theme.Ui.Background else Theme.Ui.Muted
+end
+
+local function renderSettings(value: any): ()
+	local settings = if type(value) == "table" then value else {}
+	renderToggle(modal.MusicToggle, "Music", settings.Music ~= false)
+	renderToggle(modal.SfxToggle, "Sfx", settings.Sfx ~= false)
+end
+
+--[[ Fire and forget. The store is the only thing that decides what the toggle says, so there is
+     nothing to roll back if the rate limiter drops this. The NEXT value is derived from the
+     SNAPSHOT, never from the widget: two fast clicks then send the same intent twice instead of
+     flip-flopping around a value the server never accepted. ]]
+local function send(key: string): ()
+	local remote = remotes[RemoteSchema.Remotes.SetSetting.Name]
+	if remote == nil then
+		return
+	end
+	remote:FireServer({ Key = key, Value = not settingOn(key) })
+end
+
+local function stopHold(): ()
+	if holdConnection ~= nil then
+		holdConnection:Disconnect()
+		holdConnection = nil
+	end
+	held = 0
+	if fill ~= nil then
+		fill.Size = UDim2.fromScale(0, 1)
+	end
+end
+
+local function fireReset(): ()
+	-- Disconnect FIRST: this runs from inside the Heartbeat handler, and leaving it connected for
+	-- even one more frame would fire a second ResetData that the rate limiter would then reject.
+	stopHold()
+	local remote = remotes[RemoteSchema.Remotes.ResetData.Name]
+	if remote == nil then
+		return
+	end
+	modal.ResetButton.Text = "Reset requested"
+	remote:FireServer({ Confirm = true })
+end
+
+--[[ Accumulated dt rather than a start timestamp: it makes the fill and the threshold read the same
+     clock, so the bar is never visibly full while the action has not fired (or the reverse). ]]
+local function beginHold(): ()
+	if holdConnection ~= nil then
+		return
+	end
+	held = 0
+	holdConnection = RunService.Heartbeat:Connect(function(delta: number)
+		held += (if type(delta) == "number" and delta == delta then delta else 0)
+		fill.Size = UDim2.fromScale(math.clamp(held / HOLD_SECONDS, 0, 1), 1)
+		if held >= HOLD_SECONDS then
+			fireReset()
+		end
+	end)
+end
+
+local function setOpen(open: boolean): ()
+	modal.Root.Visible = open
+	if not open then
+		-- A modal closed mid-hold must not resume a destructive action when it is reopened.
+		stopHold()
+		modal.ResetButton.Text = RESET_LABEL
+	end
+end
+
+function Controller:Init(context: Context): ()
+	store = context.Store
+	remotes = context.Remotes
+	modal = context.Ui.Modals.Settings
+	openButton = context.Ui.ActionBar.SettingsButton
+
+	--[[ The hold meter is a CHILD of the button, not a sibling, so it tracks the button's size and
+	     position for free. It is semi-transparent because a TextButton draws its own text underneath
+	     its children: an opaque fill would hide the very label it is confirming. ]]
+	fill = Instance.new("Frame")
+	fill.Name = "HoldFill"
+	fill.BackgroundColor3 = Theme.Ui.Negative
+	fill.BackgroundTransparency = 0.45
+	fill.BorderSizePixel = 0
+	fill.Size = UDim2.fromScale(0, 1)
+	fill.ZIndex = modal.ResetButton.ZIndex
+	fill.Parent = modal.ResetButton
+
+	local corner = Instance.new("UICorner")
+	corner.CornerRadius = UDim.new(0, 8)
+	corner.Parent = fill
+
+	--[[ Blunt, and built here rather than in UiModals: the warning only makes sense next to a button
+	     that exists, and whether that button exists is this controller's decision. ]]
+	warning = Instance.new("TextLabel")
+	warning.Name = "ResetWarning"
+	warning.LayoutOrder = 4 -- Content is a vertical UIListLayout; this sits under ResetButton
+	warning.Size = UDim2.fromScale(0.9, 0.3)
+	warning.BackgroundTransparency = 1
+	warning.Font = Enum.Font.Gotham
+	warning.TextScaled = false
+	warning.TextSize = 13
+	warning.TextWrapped = true
+	warning.TextColor3 = Theme.Ui.Negative
+	warning.TextXAlignment = Enum.TextXAlignment.Center
+	warning.Text = WARNING_TEXT
+	warning.ZIndex = modal.ResetButton.ZIndex
+	warning.Parent = modal.Content
+
+	local allowed = resetAllowed()
+	modal.ResetButton.Visible = allowed
+	warning.Visible = allowed
+end
+
+function Controller:Start(): ()
+	local function track(connection: any): ()
+		table.insert(connections, connection)
+	end
+
+	track(openButton.Activated:Connect(function()
+		setOpen(true)
+	end))
+	-- Both footer buttons close: "Done" and "Close" mean the same thing here, because every setting
+	-- was already committed the moment it was toggled. There is nothing left to confirm.
+	track(modal.Confirm.Activated:Connect(function()
+		setOpen(false)
+	end))
+	track(modal.Cancel.Activated:Connect(function()
+		setOpen(false)
+	end))
+
+	track(modal.MusicToggle.Activated:Connect(function()
+		send("Music")
+	end))
+	track(modal.SfxToggle.Activated:Connect(function()
+		send("Sfx")
+	end))
+	track(store:Observe("You.Settings", renderSettings))
+
+	--[[ The hold signals are wired ONLY when the reset is allowed. A hidden-but-live button would
+	     still be reachable by anything that can flip Visible, and there is no reason to leave a
+	     destructive path armed behind a boolean. MouseLeave is treated as a release because a
+	     pointer dragged off the button never delivers MouseButton1Up to it. ]]
+	if resetAllowed() then
+		track(modal.ResetButton.MouseButton1Down:Connect(beginHold))
+		track(modal.ResetButton.MouseButton1Up:Connect(stopHold))
+		track(modal.ResetButton.MouseLeave:Connect(stopHold))
+	end
+end
+
+function Controller:Stop(): ()
+	stopHold()
+	for _, connection in ipairs(connections) do
+		connection:Disconnect()
+	end
+	table.clear(connections)
+end
+
+return Controller
+
+--#endregion
+end
+MODULE_ORDER[#MODULE_ORDER + 1] = { Path = "StarterPlayer/StarterPlayerScripts/Client/Controllers/SoundController", Class = "ModuleScript", File = "src/client/Controllers/SoundController.luau" }
+MODULE_DEFS["StarterPlayer/StarterPlayerScripts/Client/Controllers/SoundController"] = function(script, require, ...)
+--#region src/client/Controllers/SoundController.luau
+--!strict
+--[[
+    SoundController
+    Every sound the client can play, behind one deliberate gate: all asset ids live in a single
+    table at the top of this file, all of them empty. An empty id makes the play call a silent
+    no-op rather than an error, so Sanctum of Embers is fully playable before any audio exists and
+    becomes audible the moment the ids are filled in -- with no other file touched.
+    Owner: client  |  Consumers: ClientBootstrap (lifecycle), EvolutionFxController, NotifyController
+]]
+--[[ WHY SILENT-BY-DEFAULT IS THE WHOLE DESIGN (confirmed decision 9.5.7). Inventing plausible
+     looking asset ids was rejected: an unverifiable id is either silent anyway or, worse, ships the
+     wrong sound confidently. So the wiring is finished -- the toggles, the pool, every cue -- and
+     only the ids are outstanding. Nothing downstream needs to know whether audio exists yet.
+
+     WHY A POOL. Purchases fire a cue per click and a player mashing a Wellspring pad can trigger
+     several a second. Allocating a Sound per click would churn Instances on the hot path, so a
+     fixed ring of voices is created once at Init and reused forever; when every voice is busy the
+     oldest is stolen, because a dropped cue is better than an unbounded allocation. ]]
+
+local SoundService = game:GetService("SoundService")
+
+type Context = { Store: any, Remotes: { [string]: any }, Player: any, PlayerGui: any, Ui: any }
+
+local Controller = {}
+Controller.Name = "SoundController"
+
+--[[ THE one asset table. Every id is a `rbxassetid://...` string when supplied; each is empty until
+     then. Do not scatter ids into the code below -- the silent no-op check reads this table only. ]]
+local ASSETS = {
+	Music = {
+		Ambient = "", -- TODO: asset id -- looping sanctum ambience
+	},
+	Sfx = {
+		Purchase = "", -- TODO: asset id -- a Wellspring/Upgrade/Wing pad was bought
+		Attune = "", -- TODO: asset id -- the Conflux reached a new Stage
+		Transcend = "", -- TODO: asset id -- the pair Transcended
+		Notify = "", -- TODO: asset id -- a toast appeared
+		Error = "", -- TODO: asset id -- a refused action
+		Collect = "", -- TODO: asset id -- a Mote reached the Conflux Font
+	},
+}
+
+-- Mix levels, kept out of ASSETS so that table stays exactly "the ids". Collect is the quietest by
+-- a wide margin: it can fire many times a second at a built-out Sanctum.
+local VOLUME: { [string]: number } = {
+	Purchase = 0.35, Attune = 0.60, Transcend = 0.80, Notify = 0.30, Error = 0.40, Collect = 0.12,
+}
+local MUSIC_VOLUME = 0.22
+local DEFAULT_VOLUME = 0.35
+local POOL_SIZE = 6 -- enough overlap for a purchase burst, small enough to be free
+
+local connections: { any } = {}
+local store: any = nil
+local root: any = nil
+local music: any = nil
+local pool: { any } = {}
+local cursor = 0
+-- Both default to ON, matching StateSchema's Settings default: the store hands us `true` before the
+-- first snapshot arrives, and a player whose profile says otherwise is corrected within a tick.
+local musicEnabled = true
+local sfxEnabled = true
+
+-- The single definition of "we have an id for this". Anything that is not a non-empty string is a
+-- cue that has not been supplied yet.
+local function isPlayable(id: any): boolean
+	return type(id) == "string" and id ~= ""
+end
+
+local function applyMusic(): ()
+	if music == nil then
+		return
+	end
+	if musicEnabled and isPlayable(ASSETS.Music.Ambient) then
+		music.SoundId = ASSETS.Music.Ambient
+		if music.Playing ~= true then
+			music:Play()
+		end
+	elseif music.Playing == true then
+		music:Stop()
+	end
+end
+
+-- Round-robin, preferring an idle voice. Returns nil only if Init never ran, which is the one case
+-- where a caller must still not error.
+local function nextVoice(): any?
+	local size = #pool
+	if size == 0 then
+		return nil
+	end
+	for _ = 1, size do
+		cursor = (cursor % size) + 1
+		local candidate = pool[cursor]
+		if candidate ~= nil and candidate.Playing ~= true then
+			return candidate
+		end
+	end
+	return pool[cursor]
+end
+
+--[[ Play one named cue. Silent (and harmless) for an unknown name, a missing id, a disabled Sfx
+     setting or a controller that failed to Init -- every one of those is a normal state, not a
+     fault, so none of them warns. ]]
+function Controller:PlaySfx(name: string): ()
+	if not sfxEnabled then
+		return
+	end
+	local id = if type(name) == "string" then (ASSETS.Sfx :: { [string]: any })[name] else nil
+	if not isPlayable(id) then
+		return
+	end
+	local voice = nextVoice()
+	if voice == nil then
+		return
+	end
+	voice.SoundId = id
+	voice.Volume = VOLUME[name] or DEFAULT_VOLUME
+	voice:Play()
+end
+
+--[[ Local override for the music bed. It deliberately does NOT fire SetSetting: SettingsController
+     owns that remote and the saved preference, and this must stay usable for a momentary duck. ]]
+function Controller:SetMusicEnabled(enabled: boolean): ()
+	musicEnabled = enabled == true
+	applyMusic()
+end
+
+function Controller:Init(context: Context): ()
+	store = context.Store
+
+	-- One folder so a teardown is a single Destroy and nothing is left parented to SoundService.
+	root = Instance.new("Folder")
+	root.Name = "SanctumAudio"
+	root.Parent = SoundService
+
+	music = Instance.new("Sound")
+	music.Name = "Ambient"
+	music.Looped = true
+	music.Volume = MUSIC_VOLUME
+	music.SoundId = ASSETS.Music.Ambient
+	music.Parent = root
+
+	for index = 1, POOL_SIZE do
+		local voice = Instance.new("Sound")
+		voice.Name = "Sfx" .. tostring(index)
+		voice.Looped = false
+		voice.Volume = DEFAULT_VOLUME
+		voice.Parent = root
+		pool[index] = voice
+	end
+end
+
+function Controller:Start(): ()
+	if store == nil then
+		return
+	end
+
+	--[[ `value ~= false` rather than `value == true`: a snapshot that predates the profile load has
+	     no You.Settings at all, and the honest default for both switches is on. Only an explicit
+	     false silences anything. ]]
+	table.insert(connections, store:Observe("You.Settings.Music", function(value: any)
+		Controller:SetMusicEnabled(value ~= false)
+	end))
+
+	table.insert(connections, store:Observe("You.Settings.Sfx", function(value: any)
+		sfxEnabled = value ~= false
+		if not sfxEnabled then
+			-- Stop in-flight voices too: a player who just turned SFX off should hear silence now,
+			-- not after the current cue finishes.
+			for _, voice in ipairs(pool) do
+				if voice.Playing == true then
+					voice:Stop()
+				end
+			end
+		end
+	end))
+end
+
+function Controller:Stop(): ()
+	for _, connection in ipairs(connections) do
+		connection:Disconnect()
+	end
+	table.clear(connections)
+
+	musicEnabled = false
+	applyMusic()
+	table.clear(pool)
+	cursor = 0
+	music = nil
+	if root ~= nil then
+		root:Destroy()
+		root = nil
+	end
+end
+
+return Controller
+
+--#endregion
+end
 MODULE_ORDER[#MODULE_ORDER + 1] = { Path = "StarterPlayer/StarterPlayerScripts/Client/Controllers/UiBuilder", Class = "ModuleScript", File = "src/client/Controllers/UiBuilder.luau" }
 MODULE_DEFS["StarterPlayer/StarterPlayerScripts/Client/Controllers/UiBuilder"] = function(script, require, ...)
 --#region src/client/Controllers/UiBuilder.luau
@@ -3452,6 +5765,1052 @@ function Service:Stop(): ()
 end
 
 return Service
+
+--#endregion
+end
+MODULE_ORDER[#MODULE_ORDER + 1] = { Path = "ServerScriptService/Core/Services/PlotLinkController", Class = "ModuleScript", File = "src/server/Services/PlotLinkController.luau" }
+MODULE_DEFS["ServerScriptService/Core/Services/PlotLinkController"] = function(script, require, ...)
+--#region src/server/Services/PlotLinkController.luau
+--!strict
+--[[
+	PlotLinkController
+	The offer book behind PlotService:RequestLink / :ResolveLink. It holds at most one outstanding
+	LinkOffer per Sanctum, pushes it to the occupants whose consent is required, expires it after
+	GameConfig.Plot.LinkConfirmSeconds, and hands an accepted offer back to its owner so the
+	max-merge can happen there. It owns no occupancy and no PlotState: every gate that depends on who
+	is actually in a Sanctum is PlotService's, checked once before the offer goes out and again when
+	it lands, because up to thirty seconds of world can happen in between.
+	Owner: server/Services  |  Consumers: PlotService (which owns exactly one of these)
+]]
+
+local Modules = game:GetService("ReplicatedStorage"):WaitForChild("Modules")
+local GameConfig = require(Modules:WaitForChild("GameConfig"))
+
+type Offer = { PlotId: number, Joiner: any, JoinerId: number, ExpiresAt: number, Token: number }
+-- Remotes is RemoteService and OnAccepted is PlotService's merge step. Both are optional so a spec
+-- can drive the offer book with plain tables and no server standing behind it.
+type Deps = { Remotes: any?, OnAccepted: ((sanctum: any, joiner: any) -> ())? }
+
+local PlotLinkController = {}
+
+--[[ CLOSED SET, exactly like Economy's gate reasons (DECISIONS #11): the client owns the wording,
+     and a free-text reason handed back through the link pad is free reconnaissance for whoever is
+     probing it. ]]
+local Reason = {
+	Ok = "ok",
+	OfferPending = "offer_pending", -- someone else is already asking to join that Sanctum
+	NoRecipient = "no_recipient", -- nobody is there to consent
+	NoOffer = "no_offer", -- an answer with nothing behind it: stale, or forged
+	SelfOffer = "self_offer", -- the joiner tried to approve their own request
+	Declined = "declined",
+}
+PlotLinkController.Reason = Reason
+
+local Controller = {}
+Controller.__index = Controller
+
+type ControllerSelf = {
+	_offers: { [number]: Offer }, -- keyed by PlotId: one open offer per Sanctum, never more
+	_remotes: any,
+	_onAccepted: (sanctum: any, joiner: any) -> (),
+	_token: number, -- monotonic; identifies WHICH offer an expiry closure belongs to
+}
+type Controller = typeof(setmetatable({} :: ControllerSelf, Controller))
+
+-- pcall'd because a Player is userdata and reading a field off one who has already disconnected can
+-- throw. This runs on the path a remote reaches, where an escaping error is a free denial of service.
+local function userIdOf(player: any): number
+	local ok, id = pcall(function(): any
+		return (player :: any).UserId
+	end)
+	return if ok and type(id) == "number" and id == id then id else 0
+end
+
+local function nameOf(player: any): string
+	local ok, name = pcall(function(): any
+		return (player :: any).Name
+	end)
+	return if ok and type(name) == "string" and #name > 0 then name else "A wanderer"
+end
+
+function PlotLinkController.new(deps: Deps): Controller
+	local given: Deps = if type(deps) == "table" then deps else {}
+	return setmetatable({
+		_offers = {},
+		_remotes = given.Remotes,
+		-- A no-op default keeps every call site total: a controller built without an owner still
+		-- expires and declines correctly, it simply has nowhere to hand an acceptance.
+		_onAccepted = given.OnAccepted or function() end,
+		_token = 0,
+	}, Controller)
+end
+
+function Controller._notify(self: Controller, player: any, kind: string, text: string): ()
+	if self._remotes == nil then
+		return
+	end
+	self._remotes:FireClient(player, "Notify", { Kind = kind, Text = text })
+end
+
+--[[ Opens an offer and pushes it to `recipients`. PlotService has already established that the
+     joiner is unattached, that the Sanctum has a free slot and that the joiner's Profile is loaded;
+     everything left is bookkeeping. ]]
+function Controller.Open(self: Controller, joiner: any, sanctum: any, recipients: { any }): (boolean, string)
+	local plotId = (sanctum :: any).Id
+	if type(plotId) ~= "number" then
+		return false, Reason.NoRecipient
+	end
+	--[[ One offer per Sanctum. Two in flight would race for a single slot, and the loser would be
+	     merged into a plot that had no room left by the time their acceptance arrived. ]]
+	if self._offers[plotId] ~= nil then
+		return false, Reason.OfferPending
+	end
+	if type(recipients) ~= "table" or #recipients == 0 then
+		return false, Reason.NoRecipient
+	end
+
+	self._token += 1
+	local token = self._token
+	-- Floored at one second: a hand-edited config of 0 would expire the offer before the client
+	-- could render the modal, making the link pad silently unusable.
+	local window = math.max(1, GameConfig.Plot.LinkConfirmSeconds)
+	local offer: Offer = {
+		PlotId = plotId,
+		Joiner = joiner,
+		JoinerId = userIdOf(joiner),
+		-- os.time, not tick: the client compares it against its own os.time to draw the countdown.
+		ExpiresAt = os.time() + window,
+		Token = token,
+	}
+	self._offers[plotId] = offer
+	if self._remotes ~= nil then
+		self._remotes:FireClients(recipients, "LinkOffer", {
+			PlotId = plotId,
+			FromUserId = offer.JoinerId,
+			FromName = nameOf(joiner),
+			ExpiresAt = offer.ExpiresAt,
+		})
+	end
+	--[[ The TOKEN is the cancellation, not the thread: an offer that is answered or replaced is
+	     removed from the book, so this closure finds a mismatch and does nothing. Nothing in it
+	     yields, so a wedged client can never hold a Sanctum's second slot open past its window. ]]
+	task.delay(window, function()
+		local current = self._offers[plotId]
+		if current == nil or current.Token ~= token then
+			return
+		end
+		self._offers[plotId] = nil
+		self:_notify(current.Joiner, "warn", "Nobody answered your link request.")
+	end)
+	self:_notify(joiner, "info", "Link requested. Waiting for the sanctum to answer.")
+	return true, Reason.Ok
+end
+
+--[[ Answers the open offer for `sanctum`. PlotService has already established that `responder` is a
+     current occupant of it -- the offer was addressed to them and to nobody else. ]]
+function Controller.Resolve(self: Controller, responder: any, sanctum: any, accept: boolean): (boolean, string)
+	local plotId = (sanctum :: any).Id
+	local offer = if type(plotId) == "number" then self._offers[plotId] else nil
+	if offer == nil then
+		return false, Reason.NoOffer
+	end
+	-- The joiner cannot wave their own request through: the occupant's consent IS the opt-in (§1.5),
+	-- and without this check a stranger could join any plot by answering for themselves.
+	if userIdOf(responder) == offer.JoinerId then
+		return false, Reason.SelfOffer
+	end
+	-- Consumed either way, BEFORE the callback: the merge inside OnAccepted must not be able to see
+	-- a still-open offer and act on it a second time.
+	self._offers[plotId :: number] = nil
+	if accept ~= true then
+		self:_notify(offer.Joiner, "warn", "Your link request was declined.")
+		return true, Reason.Declined
+	end
+	self._onAccepted(sanctum, offer.Joiner)
+	return true, Reason.Ok
+end
+
+function Controller.Pending(self: Controller, plotId: any): Offer?
+	return if type(plotId) == "number" then self._offers[plotId] else nil
+end
+
+-- Called when a Sanctum empties: there is nobody left who could consent, so the offer dies with it.
+function Controller.Cancel(self: Controller, plotId: any): ()
+	local offer = self:Pending(plotId)
+	if offer == nil then
+		return
+	end
+	self._offers[plotId :: number] = nil
+	self:_notify(offer.Joiner, "warn", "That sanctum is no longer available.")
+end
+
+-- The joiner left before anyone answered. Dropped silently -- there is nobody to tell.
+function Controller.CancelForPlayer(self: Controller, player: any): ()
+	local userId = userIdOf(player)
+	-- 0 is the "could not read a UserId" sentinel, and matching on it would cancel every offer whose
+	-- joiner was equally unreadable rather than the one that belongs to this player.
+	if userId == 0 then
+		return
+	end
+	for plotId, offer in pairs(self._offers) do
+		if offer.JoinerId == userId then
+			self._offers[plotId] = nil
+		end
+	end
+end
+
+--[[ Builds the in-world way to ASK. The link pads belong here rather than to PurchaseService:
+     standing on one buys nothing, it opens the offer above, and PurchaseService's contract is
+     purchases. Listened to on the SERVER, so there is no inbound message to forge (§1.7) -- the
+     player and the pad both arrive from the engine. Returns its connections for the owner to hold. ]]
+function Controller.AttachPads(self: Controller, sanctum: any, onRequest: (player: any) -> ()): { any }
+	local made: { any } = {}
+	local runtime = (sanctum :: any).Runtime
+	local pads = if type(runtime) == "table" then (runtime :: any).Pads else nil
+	if type(pads) ~= "table" then
+		return made
+	end
+	for slot = 1, GameConfig.Plot.SlotsPerSanctum do
+		local pad = pads["link:" .. tostring(slot)]
+		-- Re-entrancy guard: a second Start must not stack two prompts on one pad, which would open
+		-- (and immediately refuse) two offers for a single hold.
+		if pad ~= nil and pad:FindFirstChildOfClass("ProximityPrompt") == nil then
+			local prompt = Instance.new("ProximityPrompt")
+			prompt.ActionText = "Link"
+			prompt.ObjectText = "Sanctum " .. tostring((sanctum :: any).Id)
+			prompt.RequiresLineOfSight = false
+			prompt.MaxActivationDistance = 10
+			prompt.HoldDuration = 0
+			prompt.Parent = pad
+			table.insert(made, prompt.Triggered:Connect(onRequest))
+		end
+	end
+	return made
+end
+
+-- Teardown. Outstanding expiry threads survive, but every one of them now finds an empty book.
+function Controller.Clear(self: Controller): ()
+	table.clear(self._offers)
+end
+
+return PlotLinkController
+
+--#endregion
+end
+MODULE_ORDER[#MODULE_ORDER + 1] = { Path = "ServerScriptService/Core/Services/PlotRuntime", Class = "ModuleScript", File = "src/server/Services/PlotRuntime.luau" }
+MODULE_DEFS["ServerScriptService/Core/Services/PlotRuntime"] = function(script, require, ...)
+--#region src/server/Services/PlotRuntime.luau
+--!strict
+--[[
+	PlotRuntime
+	One Sanctum's live machinery: the Instance tree PlotBuilder made, the DropperSystem emit clock,
+	the MoteSystem flight pool, the rail geometry each Wellspring's Motes ride, and the Wing
+	visibility that follows PlotState. It turns an emit into a Mote and a landed Mote into a credit,
+	and exposes exactly one non-yielding Step for PlotService's shared Heartbeat to call. It knows
+	nothing about claims, links, Profiles or the release grace: those are policy, and policy lives in
+	the service. Split out of PlotService only to keep both files inside the 300-line budget.
+	Owner: server/Services  |  Consumers: PlotService (which owns one per Sanctum)
+]]
+
+local Modules = game:GetService("ReplicatedStorage"):WaitForChild("Modules")
+local Economy = require(Modules:WaitForChild("Economy"))
+local PlotLayout = require(Modules:WaitForChild("PlotLayout"))
+local SectionData = require(Modules:WaitForChild("SectionData"))
+local StateSchema = require(Modules:WaitForChild("StateSchema"))
+
+local Systems = script.Parent.Parent:WaitForChild("Systems")
+local DropperSystem = require(Systems:WaitForChild("DropperSystem"))
+local MoteSystem = require(Systems:WaitForChild("MoteSystem"))
+local PlotBuilder = require(Systems:WaitForChild("PlotBuilder"))
+
+type PlotState = StateSchema.PlotState
+-- Player is `any` here rather than Player: the harness drives a Sanctum with plain tables, and this
+-- module only ever passes an occupant's Player straight back to EconomyService.
+type Occupant = { UserId: number, Player: any, Slot: number, JoinedAt: number, Contribution: number, Vote: boolean? }
+type Sanctum = { Id: number, Model: Instance, State: PlotState, Occupants: { [number]: Occupant },
+	AnchorUserId: number?, Runtime: any, Dirty: boolean }
+type Connection = { Disconnect: (self: any) -> () }
+
+local PlotRuntime = {}
+
+local Plot = {}
+Plot.__index = Plot
+
+type PlotSelf = {
+	Sanctum: Sanctum,
+	--[[ Release-grace and replication bookkeeping. Written ONLY by PlotService -- they live on this
+	     record rather than in a parallel table so a plot is one object, but they are its policy, not
+	     this module's: Reserved is who may reclaim the plot, GraceToken lets a claim cancel an armed
+	     timer without hunting for its thread, and Announced coalesces SanctumChanged. ]]
+	Reserved: { [number]: boolean }, GraceToken: number, Announced: boolean, LastWarn: number,
+	_droppers: any, _motes: any, _economy: any,
+	_paths: { [string]: { CFrame } },
+	_characters: { [number]: Connection }, -- one respawn watch per occupant, dropped when they leave
+}
+type Plot = typeof(setmetatable({} :: PlotSelf, Plot))
+
+--[[ Cached for the life of the plot: rail geometry is fixed once PlotBuilder has run, and MoteSystem
+     borrows the path by reference and never mutates it, so one table serves every Mote a Wellspring
+     ever emits. The pad publishes its own (section, order), so this can never drift from the pad
+     numbering PlotBuilder invented. ]]
+local function railPathFor(self: Plot, def: any): { CFrame }?
+	local cached = self._paths[def.Id]
+	if cached ~= nil then return cached end
+	local runtime = self.Sanctum.Runtime
+	local pads = if type(runtime) == "table" then (runtime :: any).Pads else nil
+	local pad = if type(pads) == "table" then pads["dropper:" .. tostring(def.Id)] else nil
+	if pad == nil then return nil end
+	local section = SectionData.get(pad:GetAttribute("PadSection") :: any)
+	local order = pad:GetAttribute("PadOrder")
+	-- A pad with no usable (section, order) would send PlotLayout arithmetic on nil, inside the
+	-- income loop that drives every Sanctum on the server.
+	if section == nil or type(order) ~= "number" then return nil end
+	local path = PlotLayout.railPath((runtime :: any).Origin, section, order)
+	self._paths[def.Id] = path
+	return path
+end
+
+--[[ Passive income has no single author, so each occupant is credited the share earned WHILE THEY
+     WERE PRESENT: a partner who joins for the last five minutes shows a small contribution and the
+     player who carried the hour shows a large one, which is the whole point of tracking it next to a
+     wallet that is shared (§1.2). It moves no Essence -- AddContribution is leaderboard flavour. ]]
+local function shareContribution(self: Plot, credited: any): ()
+	if type(credited) ~= "number" or credited <= 0 then return end
+	local occupants, count = self.Sanctum.Occupants, 0
+	for _ in pairs(occupants) do count += 1 end
+	if count == 0 then return end -- a Mote landing on the frame the last occupant left
+	local share = credited / count
+	for _, occupant in pairs(occupants) do
+		self._economy:AddContribution(self.Sanctum, occupant.Player, share)
+	end
+end
+
+local function emit(self: Plot, def: any): ()
+	local path = railPathFor(self, def)
+	--[[ No rail means PlotBuilder never gave this Wellspring a pad -- a build bug, not a game state.
+	     Following MoteSystem's rule for a malformed path, it is NOT credited: paying for it would
+	     hide the bug behind income that still looks correct. ]]
+	if path == nil then return end
+	local sanctum = self.Sanctum
+	local multipliers = self._economy:GetMultipliers(sanctum)
+	self._motes:Spawn(def, Economy.getMoteValue(def, sanctum.State, multipliers), path,
+		Economy.getRailTravelTime(sanctum.State, multipliers))
+end
+
+function PlotRuntime.new(id: number, parent: Instance, economy: any): Plot
+	local model, runtime = PlotBuilder.build(id, parent)
+	local sanctum: Sanctum = { Id = id, Model = model, State = StateSchema.newPlotState(),
+		Occupants = {}, AnchorUserId = nil, Runtime = runtime, Dirty = false }
+	local self: Plot = setmetatable({
+		Sanctum = sanctum, Reserved = {}, GraceToken = 0, Announced = false, LastWarn = 0,
+		_droppers = DropperSystem.new(sanctum), _motes = MoteSystem.new(sanctum),
+		_economy = economy, _paths = {}, _characters = {},
+	}, Plot)
+	self._droppers.OnSpawn:Connect(function(def: any)
+		emit(self, def)
+	end)
+	-- The one place a Mote's value becomes Essence, and it only ASKS: EconomyService owns the wallet.
+	self._motes.OnCollected:Connect(function(value: number)
+		shareContribution(self, self._economy:Credit(sanctum, value))
+	end)
+	-- Every Wing but the core starts locked, so the fresh plot must not ship with all five standing.
+	self:ApplySections()
+	return self
+end
+
+--[[ Locked Wings are REPARENTED out of the world by PlotBuilder, which is what makes their pads
+     unreachable rather than merely invisible -- PurchaseService then never has to re-check the Wing
+     lock on a trigger, because the prompt cannot be reached at all. ]]
+function Plot.ApplySections(self: Plot): ()
+	local unlocked = self.Sanctum.State.Sections
+	for _, section in ipairs(SectionData.List) do
+		local visible = section.Id == SectionData.Base or unlocked[section.Id] == true
+		PlotBuilder.setSectionVisible(self.Sanctum.Runtime, section.Id, visible)
+	end
+end
+
+-- NOTHING on this path may yield: it runs inside the one Heartbeat that drives every Sanctum, and a
+-- yield there would stall income for the whole server behind one plot's slow call.
+function Plot.Step(self: Plot, dt: number): ()
+	self._droppers:Step(dt, self._economy:GetMultipliers(self.Sanctum))
+	self._motes:Step(dt)
+end
+
+-- Re-derives everything downstream of PlotState. Called after a load, a link merge, a purchase, an
+-- attunement and a reset -- anything that can change what the Sanctum owns.
+function Plot.Rebuild(self: Plot): ()
+	self._droppers:Rebuild()
+	self:ApplySections()
+	self._economy:RefreshMultipliers(self.Sanctum)
+end
+
+--[[ Back to a blank Sanctum: the grace window expired, or a claimer took a plot that was counting
+     down for somebody else. Motes in flight are DISCARDED rather than credited -- there is no longer
+     a wallet that earned them, and the previous pair's progress is already in their Profiles. ]]
+function Plot.Reset(self: Plot): ()
+	self.Sanctum.State = StateSchema.newPlotState()
+	self.Sanctum.AnchorUserId = nil
+	self.Reserved = {}
+	self._motes:Clear()
+	self:Rebuild()
+end
+
+--[[ Puts a character on its slot's spawn. Only a BasePart carries a CFrame, and a character mid
+     respawn is a Model whose root has not arrived yet -- both are normal, so a missing root simply
+     leaves the player where they are rather than erroring inside a join. ]]
+function Plot.Seat(self: Plot, player: any, slot: number): ()
+	local character = (player :: any).Character
+	if character == nil then return end
+	local root = character:FindFirstChild("HumanoidRootPart")
+	if root ~= nil and root:IsA("Part") then
+		root.CFrame = PlotLayout.spawnSlotCFrame((self.Sanctum.Runtime :: any).Origin, slot)
+	end
+end
+
+--[[ MOCK-EXTRA: Player.CharacterAdded. Without this watch a death respawns the player at the world
+     origin, which is Sanctum 1's floor -- i.e. inside a stranger's plot, every time anybody dies. ]]
+function Plot.Watch(self: Plot, player: any, userId: number): ()
+	self:Unwatch(userId) -- a rejoin must not stack a second watch on the same player
+	self._characters[userId] = (player :: any).CharacterAdded:Connect(function()
+		-- Re-read rather than capture: by the time a respawn lands, this player may have been
+		-- released from the plot entirely, and seating them here would drag them back.
+		local occupant = self.Sanctum.Occupants[userId]
+		if occupant ~= nil then self:Seat(player, occupant.Slot) end
+	end)
+end
+
+function Plot.Unwatch(self: Plot, userId: number): ()
+	local existing = self._characters[userId]
+	if existing ~= nil then
+		existing:Disconnect()
+		self._characters[userId] = nil
+	end
+end
+
+function Plot.ClearMotes(self: Plot): ()
+	self._motes:Clear()
+end
+
+function Plot.MoteCount(self: Plot): number
+	return self._motes:Count()
+end
+
+function Plot.Destroy(self: Plot): ()
+	-- Respawn watches hold a reference to this plot; left connected they would keep seating players
+	-- on a Sanctum that no longer exists.
+	for userId in pairs(self._characters) do self:Unwatch(userId) end
+	self._droppers:Destroy()
+	self._motes:Destroy()
+	-- PlotBuilder.destroy, not Model:Destroy: locked Wings live OUTSIDE the model and would leak.
+	PlotBuilder.destroy(self.Sanctum.Model)
+end
+
+return PlotRuntime
+
+--#endregion
+end
+MODULE_ORDER[#MODULE_ORDER + 1] = { Path = "ServerScriptService/Core/Services/PlotService", Class = "ModuleScript", File = "src/server/Services/PlotService.luau" }
+MODULE_DEFS["ServerScriptService/Core/Services/PlotService"] = function(script, require, ...)
+--#region src/server/Services/PlotService.luau
+--!strict
+--[[
+	PlotService
+	Owns every Sanctum on the server: it builds the six plots at boot, hands one to each arriving
+	player, links a consenting second occupant in, holds a vacated plot through its grace window, and
+	drives ALL of them from a SINGLE Heartbeat connection. It is the one authority on occupancy and
+	the one place a live PlotState is mirrored back into a Profile.
+	Three plain modules do the work under it, split out only to keep every file inside the 300-line
+	budget: PlotRuntime is one Sanctum's machinery, PlotSession is a player's relationship to a plot
+	(claim, link, release, grace), and PlotLinkController is the link offer book.
+	Owner: server/Services  |  Consumers: EconomyService, PurchaseService, EvolutionService,
+	                                      RebirthService, StateReplicator, LeaderboardService
+]]
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+
+local Modules = game:GetService("ReplicatedStorage"):WaitForChild("Modules")
+local GameConfig = require(Modules:WaitForChild("GameConfig"))
+local Signal = require(Modules:WaitForChild("Signal"))
+
+local Peers = script.Parent
+local PlotLinkController = require(Peers:WaitForChild("PlotLinkController"))
+local PlotRuntime = require(Peers:WaitForChild("PlotRuntime"))
+local PlotSession = require(Peers:WaitForChild("PlotSession"))
+
+type Occupant = { UserId: number, Player: any, Slot: number, JoinedAt: number, Contribution: number, Vote: boolean? }
+type Sanctum = { Id: number, Model: Instance, State: any, Occupants: { [number]: Occupant },
+	AnchorUserId: number?, Runtime: any, Dirty: boolean }
+type Plot = any -- PlotRuntime's object; typed there, and naming it here would be a require cycle
+type Connection = { Disconnect: (self: any) -> () }
+
+-- Heartbeat is DECIMATED to GameConfig.Income.TickRate: DropperSystem's catch-up bound is sized off
+-- a 0.1s step, and stepping six Sanctums at render rate buys nothing a Mote's flight can show.
+local STEP_INTERVAL = 1 / math.max(1, GameConfig.Income.TickRate)
+local MAX_STEP = 0.5 -- after a hitch the banked dt would teleport every Mote to the Font in one frame
+local MIRROR_SECONDS = 1 -- how often a dirty Sanctum is copied into its occupants' Profiles
+local WARN_SECONDS = 10 -- throttle on the per-Sanctum step-failure warning
+local FOLDER_NAME = "Sanctums"
+
+local Service = {}
+Service.Name = "PlotService"
+-- Built at module scope, never in Init: rebuilding them would silently drop every connection a peer
+-- made at boot, and those peers are already running by the time a re-Init could happen.
+Service.SanctumChanged = Signal.new()
+Service.OccupantAdded = Signal.new()
+Service.OccupantRemoved = Signal.new()
+Service.Reason = PlotSession.Reason -- the closed set of link/claim gate codes (DECISIONS #11)
+
+local plots: { Plot } = {}
+local byId: { [number]: Plot } = {}
+local connections: { Connection } = {}
+local heartbeat: Connection? = nil
+local links: any, profiles: any, economy: any, remotes: any = nil, nil, nil, nil
+local purchases: any, registryRef: any = nil, nil
+local accumulator, mirrorClock = 0, 0
+
+--[[ Resolves a caller's Sanctum back to the plot that owns it. The IDENTITY check matters: a spec
+     fixture (or a stale reference to a rebuilt plot) can share an Id with a live Sanctum, and
+     driving the real one from it would move a live player's occupancy. ]]
+local function plotOf(sanctum: any): Plot?
+	if type(sanctum) ~= "table" then return nil end
+	local id = (sanctum :: any).Id
+	local plot = if type(id) == "number" then byId[id] else nil
+	return if plot ~= nil and plot.Sanctum == sanctum then plot else nil
+end
+
+--[[ Public API ]]
+
+function Service:GetSanctum(id: any): Sanctum?
+	local plot = if type(id) == "number" then byId[id] else nil
+	return if plot ~= nil then plot.Sanctum else nil
+end
+
+function Service:GetSanctumForPlayer(player: any): Sanctum?
+	local plot = PlotSession.plotFor(player)
+	return if plot ~= nil then plot.Sanctum else nil
+end
+
+-- Read structurally rather than through plotOf, so a spec fixture's Sanctum works here too.
+function Service:GetOccupants(sanctum: any): { Player }
+	local list: { Player } = {}
+	local occupants = if type(sanctum) == "table" then (sanctum :: any).Occupants else nil
+	if type(occupants) ~= "table" then return list end
+	local ordered: { Occupant } = {}
+	for _, occupant in pairs(occupants :: { [any]: Occupant }) do table.insert(ordered, occupant) end
+	-- Sorted by slot: `pairs` order is unspecified, and an unstable partner panel would flicker.
+	table.sort(ordered, function(a: Occupant, b: Occupant): boolean return a.Slot < b.Slot end)
+	for _, occupant in ipairs(ordered) do table.insert(list, occupant.Player) end
+	return list
+end
+
+function Service:ForEachSanctum(fn: (Sanctum) -> ()): ()
+	if type(fn) ~= "function" then return end
+	for _, plot in ipairs(plots) do fn(plot.Sanctum) end
+end
+
+function Service:MarkDirty(sanctum: any): ()
+	if type(sanctum) ~= "table" then return end
+	local target = sanctum :: any
+	target.Dirty = true
+	local plot = plotOf(sanctum)
+	if plot == nil then
+		Service.SanctumChanged:Fire(sanctum) -- not one of ours; there is nothing to coalesce against
+		return
+	end
+	--[[ COALESCED to one announcement per income tick. EconomyService calls this on EVERY credit --
+	     dozens a second per Sanctum -- and Signal.Fire spawns a thread per handler, so an
+	     uncoalesced version would spend more time waking listeners than earning. The flag is
+	     re-armed at the top of each tick, so no change ever waits longer than one tick to be seen. ]]
+	if plot.Announced then return end
+	plot.Announced = true
+	Service.SanctumChanged:Fire(plot.Sanctum)
+end
+
+--[[ Re-derives everything downstream of PlotState -- emit streams, Wing visibility, the multiplier
+     cache and the pads' wording. Call it after a load, a link merge, a purchase, an attunement or a
+     reset: anything that changes what the Sanctum owns. ]]
+function Service:RebuildSanctum(sanctum: any): ()
+	local plot = plotOf(sanctum)
+	if plot == nil then return end
+	plot:Rebuild()
+	-- PurchaseService is registered AFTER this service, so it is resolved lazily; TryGet, never Get,
+	-- because Get errors by design and this runs on paths that must not throw.
+	if purchases == nil and registryRef ~= nil then purchases = registryRef:TryGet("PurchaseService") end
+	if purchases ~= nil and type(purchases.RefreshPads) == "function" then
+		purchases:RefreshPads(plot.Sanctum)
+	end
+	Service:MarkDirty(plot.Sanctum)
+end
+
+function Service:ClaimEmpty(player: any): Sanctum?
+	local plot = PlotSession.claim(player)
+	return if plot ~= nil then plot.Sanctum else nil
+end
+
+function Service:RequestLink(player: any, sanctum: any): (boolean, string)
+	local plot = plotOf(sanctum)
+	if plot == nil then return false, Service.Reason.UnknownSanctum end
+	return PlotSession.requestLink(player, plot)
+end
+
+function Service:ResolveLink(player: any, sanctum: any, accept: boolean): (boolean, string)
+	local plot = plotOf(sanctum)
+	if plot == nil then return false, Service.Reason.UnknownSanctum end
+	return PlotSession.resolveLink(player, plot, accept)
+end
+
+function Service:ReleaseOccupant(player: any): ()
+	PlotSession.release(player)
+end
+
+--[[ Mirrors first, then hands every write to ProfileService: the shutdown budget and the session
+     locking live there, and a second save loop here would double every player's write rate. ]]
+function Service:SaveAll(release: boolean?): ()
+	PlotSession.mirrorAll()
+	if profiles ~= nil then profiles:SaveAll(release) end
+end
+
+-- PurchaseService needs the pads and signs, EvolutionService the Conflux. nil for a foreign Sanctum.
+function Service:GetSanctumRuntime(sanctum: any): any
+	local plot = plotOf(sanctum)
+	return if plot ~= nil then plot.Sanctum.Runtime else nil
+end
+
+-- StateReplicator publishes MoteCount in the §7 snapshot; RebirthService clears the flight pool on a
+-- reset, where crediting Motes still in the air would pay the pair for pressing the button.
+function Service:GetMoteCount(sanctum: any): number
+	local plot = plotOf(sanctum)
+	return if plot ~= nil then plot:MoteCount() else 0
+end
+
+function Service:ClearMotes(sanctum: any): ()
+	local plot = plotOf(sanctum)
+	if plot ~= nil then plot:ClearMotes() end
+end
+
+--[[ The one loop -- one connection for the WHOLE service, never one per Sanctum. ]]
+
+local function stepPlot(plot: Plot, dt: number, mirroring: boolean): ()
+	plot:Step(dt)
+	-- Cheap and non-yielding, so it rides the income tick: any save (autosave, release, shutdown)
+	-- then finds a Profile at most MIRROR_SECONDS behind the live Sanctum, whoever triggered it.
+	if mirroring and plot.Sanctum.Dirty then PlotSession.mirrorOne(plot) end
+end
+
+local function tick(dt: any): ()
+	accumulator += if type(dt) == "number" and dt == dt then dt else 0
+	if accumulator < STEP_INTERVAL then return end
+	local step = math.min(accumulator, MAX_STEP)
+	accumulator = 0
+	mirrorClock += step
+	local mirroring = mirrorClock >= MIRROR_SECONDS
+	if mirroring then mirrorClock = 0 end
+	for _, plot in ipairs(plots) do
+		plot.Announced = false -- re-arm the coalesced SanctumChanged for this tick
+		if next(plot.Sanctum.Occupants) ~= nil then
+			--[[ Per-Sanctum pcall, not one around the whole loop: an error in plot 3 must not stop
+			     plots 4-6 earning, and an unguarded error would kill this connection for every
+			     player on the server for the rest of its life. ]]
+			local ok, err = pcall(stepPlot, plot, step, mirroring)
+			if not ok and os.clock() - plot.LastWarn >= WARN_SECONDS then
+				plot.LastWarn = os.clock()
+				warn(("[PlotService] sanctum %d step failed: %s"):format(plot.Sanctum.Id, tostring(err)))
+			end
+		end
+	end
+end
+
+local function teardown(): ()
+	for _, connection in ipairs(connections) do connection:Disconnect() end
+	table.clear(connections)
+	if heartbeat ~= nil then
+		heartbeat:Disconnect()
+		heartbeat = nil
+	end
+	PlotSession.reset()
+	for _, plot in ipairs(plots) do plot:Destroy() end
+	table.clear(plots)
+	table.clear(byId)
+end
+
+--[[ ServiceRegistry contract ]]
+
+function Service:Init(registry: any): ()
+	registryRef = registry
+	-- Resolved only: section 6 forbids cross-service calls during Init.
+	profiles = registry:Get("ProfileService")
+	economy = registry:Get("EconomyService")
+	remotes = registry:Get("RemoteService")
+	purchases = nil -- registered AFTER this service; resolved lazily in RebuildSanctum
+	links = PlotLinkController.new({
+		Remotes = remotes,
+		OnAccepted = function(sanctum: any, joiner: any)
+			local plot = plotOf(sanctum)
+			if plot ~= nil then PlotSession.linkAccepted(plot, joiner) end
+		end,
+	})
+	teardown() -- a re-Init must not leave the previous boot's models, runtimes or connections behind
+	PlotSession.bind(Service, plots, profiles, links)
+	accumulator, mirrorClock = 0, 0
+	-- Rebuilt from scratch: a leftover folder would leave six abandoned Sanctums in the world, and
+	-- their pads would still answer a ProximityPrompt.
+	local previous = workspace:FindFirstChild(FOLDER_NAME)
+	if previous ~= nil then previous:Destroy() end
+	local created = Instance.new("Folder")
+	created.Name = FOLDER_NAME
+	created.Parent = workspace
+	for id = 1, GameConfig.Plot.SanctumCount do
+		local plot = PlotRuntime.new(id, created, economy)
+		table.insert(plots, plot)
+		byId[id] = plot
+	end
+end
+
+function Service:Start(): ()
+	purchases = if registryRef ~= nil then registryRef:TryGet("PurchaseService") else nil
+	for _, plot in ipairs(plots) do
+		if purchases ~= nil and type(purchases.BuildPads) == "function" then
+			purchases:BuildPads(plot.Sanctum)
+		end
+		for _, connection in ipairs(links:AttachPads(plot.Sanctum, function(player: Player)
+			Service:RequestLink(player, plot.Sanctum)
+		end)) do
+			table.insert(connections, connection)
+		end
+	end
+	--[[ Claiming hangs off ProfileLoaded, not PlayerAdded: the claim reads the saved PlotState, and
+	     claiming before it arrived would seed a blank Sanctum and merge the real save over it. ]]
+	table.insert(connections, profiles.ProfileLoaded:Connect(function(player: Player)
+		if Service:ClaimEmpty(player) == nil and remotes ~= nil then
+			remotes:FireClient(player, "Notify", { Kind = "error", Text = "Every sanctum is occupied right now." })
+		end
+	end))
+	table.insert(connections, profiles.ProfileReleasing:Connect(PlotSession.flush))
+	table.insert(connections, Players.PlayerRemoving:Connect(function(player: Player)
+		Service:ReleaseOccupant(player)
+	end))
+	if remotes ~= nil then
+		remotes:On("LinkResponse", function(player: Player, payload: any)
+			-- Never trust the client: the payload names a plot, never an outcome. Occupancy and the
+			-- pending offer are both re-checked from live state inside ResolveLink.
+			local id = if type(payload) == "table" then (payload :: any).PlotId else nil
+			local plot = if type(id) == "number" then byId[id] else nil
+			if plot ~= nil then Service:ResolveLink(player, plot.Sanctum, (payload :: any).Accept == true) end
+		end)
+	end
+	heartbeat = RunService.Heartbeat:Connect(tick)
+	-- A Profile that loaded before Start (a boot-order edge, or a spec) still needs its Sanctum.
+	for _, player in ipairs(Players:GetPlayers()) do
+		if profiles:IsLoaded(player) then Service:ClaimEmpty(player) end
+	end
+end
+
+function Service:Stop(): ()
+	teardown()
+	if links ~= nil then links:Clear() end
+end
+
+return Service
+
+--#endregion
+end
+MODULE_ORDER[#MODULE_ORDER + 1] = { Path = "ServerScriptService/Core/Services/PlotSession", Class = "ModuleScript", File = "src/server/Services/PlotSession.luau" }
+MODULE_DEFS["ServerScriptService/Core/Services/PlotSession"] = function(script, require, ...)
+--#region src/server/Services/PlotSession.luau
+--!strict
+--[[
+	PlotSession
+	Everything about a PLAYER's relationship to a Sanctum, kept apart from the machinery that makes a
+	Sanctum run: which plot a claim lands on, the slot and spawn they get, the max-merge that admits
+	a linked partner, the mirror of the live state into every occupant's Profile, and the grace
+	window that lets a disconnect-and-rejoin keep the plot. PlotService owns it, drives it and
+	publishes its results; it was split out only to keep every file inside the 300-line budget.
+	Owner: server/Services  |  Consumers: PlotService (which binds exactly one)
+]]
+
+local Modules = game:GetService("ReplicatedStorage"):WaitForChild("Modules")
+local DropperData = require(Modules:WaitForChild("DropperData"))
+local Economy = require(Modules:WaitForChild("Economy"))
+local GameConfig = require(Modules:WaitForChild("GameConfig"))
+local StateSchema = require(Modules:WaitForChild("StateSchema"))
+
+type PlotState = StateSchema.PlotState
+type Occupant = { UserId: number, Player: any, Slot: number, JoinedAt: number, Contribution: number, Vote: boolean? }
+type Plot = any -- PlotRuntime's object; typed there, and naming it here would be a require cycle
+
+local SLOTS = GameConfig.Plot.SlotsPerSanctum
+local STARTER_DROPPER = "ember_vent" -- DropperData's balance model names this as the cold-start seed
+
+local PlotSession = {}
+
+-- Closed set (DECISIONS #11): the client maps a code to wording, and the server never sends prose.
+local Reason = {
+	Ok = "ok", UnknownSanctum = "unknown_sanctum",
+	NoPlayer = "no_player", -- not a live player, or not an occupant entitled to answer
+	AlreadyHere = "already_here", AlreadyLinked = "already_linked", -- §1.5: one Sanctum at a time
+	SanctumEmpty = "sanctum_empty", -- claim it outright; there is nobody there to ask
+	SanctumFull = "sanctum_full",
+	NotLoaded = "not_loaded", -- no saved PlotState to merge, so no offer is made
+}
+PlotSession.Reason = Reason
+
+local owner: any, plots: { Plot }, profiles: any, links: any = nil, {}, nil, nil
+local byUserId: { [number]: Plot } = {}
+
+-- pcall'd: a Player is userdata, and reading a field off one who has already left can throw.
+local function userIdOf(player: any): number?
+	if player == nil then return nil end
+	local ok, id = pcall(function(): any return (player :: any).UserId end)
+	return if ok and type(id) == "number" and id == id then id else nil
+end
+
+local function occupantCount(plot: Plot): number
+	local total = 0
+	for _ in pairs(plot.Sanctum.Occupants) do total += 1 end
+	return total
+end
+
+local function freeSlot(plot: Plot): number?
+	local taken: { [number]: boolean } = {}
+	for _, occupant in pairs(plot.Sanctum.Occupants) do taken[occupant.Slot] = true end
+	for slot = 1, SLOTS do
+		if not taken[slot] then return slot end
+	end
+	return nil
+end
+
+local function addOccupant(plot: Plot, player: any, userId: number): Occupant?
+	local slot = freeSlot(plot)
+	if slot == nil then return nil end
+	local occupant: Occupant = { UserId = userId, Player = player, Slot = slot,
+		JoinedAt = os.time(), Contribution = 0, Vote = nil }
+	plot.Sanctum.Occupants[userId] = occupant
+	byUserId[userId] = plot
+	-- Bumping the token cancels any armed release timer: a live occupant must never have their
+	-- Sanctum blanked by a countdown that started before they arrived.
+	plot.GraceToken += 1
+	plot.Reserved = {}
+	if plot.Sanctum.AnchorUserId == nil then plot.Sanctum.AnchorUserId = userId end
+	plot:Watch(player, userId)
+	plot:Seat(player, slot)
+	owner.OccupantAdded:Fire(plot.Sanctum, player)
+	return occupant
+end
+
+local function removeOccupant(plot: Plot, occupant: Occupant): ()
+	local sanctum = plot.Sanctum
+	sanctum.Occupants[occupant.UserId] = nil
+	if byUserId[occupant.UserId] == plot then byUserId[occupant.UserId] = nil end
+	--[[ Reserved for the grace window: a disconnect-and-rejoin must land back on this plot with its
+	     progress intact, because losing a Sanctum to a dropped connection would be the single most
+	     frustrating thing in the game (DECISIONS #6). ]]
+	plot.Reserved[occupant.UserId] = true
+	plot:Unwatch(occupant.UserId) -- their respawns are no longer this Sanctum's business
+	if sanctum.AnchorUserId == occupant.UserId then
+		-- Promote whoever is left, so the plot always has a nameable owner; nil when nobody is.
+		sanctum.AnchorUserId = nil
+		for id in pairs(sanctum.Occupants) do
+			sanctum.AnchorUserId = id
+			break
+		end
+	end
+end
+
+--[[ Writes the live shared PlotState into EVERY occupant's Profile (§1.5). Co-op means both players
+     carry the same result home, so there is no host copy and no guest copy. CLONED, not aliased: a
+     leaver's Profile must stop tracking a Sanctum they are no longer in. ]]
+local function mirror(plot: Plot): ()
+	if profiles == nil then return end
+	for _, occupant in pairs(plot.Sanctum.Occupants) do
+		local profile = profiles:Get(occupant.Player)
+		if type(profile) == "table" then
+			(profile :: any).Plot = StateSchema.clonePlotState(plot.Sanctum.State)
+		end
+	end
+end
+
+local function savedPlotOf(player: any): PlotState?
+	local profile = if profiles ~= nil then profiles:Get(player) else nil
+	local saved = if type(profile) == "table" then (profile :: any).Plot else nil
+	return if type(saved) == "table" then saved :: PlotState else nil
+end
+
+--[[ Brings the claimer's saved PlotState into the Sanctum. A RECLAIM inside the grace window
+     max-merges rather than replacing: the two should already be identical (the save ran on release),
+     and merging means a save that silently failed cannot cost the pair their progress. ]]
+local function adopt(plot: Plot, player: any, reclaiming: boolean): ()
+	local saved = savedPlotOf(player)
+	local state: PlotState = plot.Sanctum.State
+	if saved ~= nil then
+		state = if reclaiming then StateSchema.mergePlotStates(state, saved) else StateSchema.clonePlotState(saved)
+	end
+	--[[ COLD START. newPlotState owns nothing, so without this seed a fresh Sanctum earns zero and
+	     the first purchase never becomes affordable -- DropperData's balance model documents the one
+	     free ember_vent as a contract with this service. Granted only when the pair owns NOTHING at
+	     all, so it can never top up a real save. ]]
+	if Economy.totalDroppersOwned(state) == 0 then
+		local starter = DropperData.get(STARTER_DROPPER) or DropperData.List[1]
+		if starter ~= nil then state.Droppers[starter.Id] = 1 end
+	end
+	plot.Sanctum.State = state
+end
+
+local function beginGrace(plot: Plot): ()
+	plot.GraceToken += 1
+	local token = plot.GraceToken
+	task.delay(math.max(0, GameConfig.Plot.ReleaseGraceSeconds), function()
+		-- The TOKEN, not the thread, is the cancellation: any claim bumps it, so a plot that was
+		-- reclaimed or taken by someone else simply finds a mismatch here and is left alone.
+		if plot.GraceToken ~= token or next(plot.Sanctum.Occupants) ~= nil then return end
+		plot:Reset()
+		owner:MarkDirty(plot.Sanctum)
+	end)
+end
+
+--[[ Public surface -- every entry point PlotService forwards to. ]]
+
+function PlotSession.bind(service: any, list: { Plot }, profileService: any, linkController: any): ()
+	owner, plots, profiles, links = service, list, profileService, linkController
+end
+
+-- Teardown for Stop / re-Init. The respawn watches belong to each plot and die with it in Destroy.
+function PlotSession.reset(): ()
+	table.clear(byUserId)
+end
+
+function PlotSession.plotFor(player: any): Plot?
+	local userId = userIdOf(player)
+	return if userId ~= nil then byUserId[userId] else nil
+end
+
+--[[ Picks a plot in a deliberate order: the one this player just left (still inside its grace
+     window) first, then a genuinely idle one, and only then one that is counting down for somebody
+     else. Stealing a graced plot is safe -- its state was mirrored into every occupant's Profile
+     before that timer started -- and it is what stops a busy server turning a player away. ]]
+function PlotSession.claim(player: any): Plot?
+	local userId = userIdOf(player)
+	if userId == nil then return nil end
+	local existing = byUserId[userId]
+	if existing ~= nil then return existing end -- idempotent: never move a settled player
+
+	local reserved: Plot?, idle: Plot?, graced: Plot? = nil, nil, nil
+	for _, plot in ipairs(plots) do
+		if next(plot.Sanctum.Occupants) == nil then
+			if plot.Reserved[userId] then
+				reserved = plot
+				break
+			elseif next(plot.Reserved) == nil then
+				idle = idle or plot
+			else
+				graced = graced or plot
+			end
+		end
+	end
+	local plot = reserved or idle or graced
+	if plot == nil then return nil end
+
+	local reclaiming = plot == reserved
+	-- A stolen graced plot still holds the previous pair's progress; blank it first so the claimer
+	-- never sees, or earns from, a stranger's Wellsprings.
+	if not reclaiming then plot:Reset() end
+	plot.Reserved = {}
+	if addOccupant(plot, player, userId) == nil then return nil end
+	adopt(plot, player, reclaiming)
+	owner:RebuildSanctum(plot.Sanctum)
+	return plot
+end
+
+function PlotSession.release(player: any): ()
+	local userId = userIdOf(player)
+	if userId == nil then return end
+	if links ~= nil then links:CancelForPlayer(player) end
+	local plot = byUserId[userId]
+	if plot == nil then return end
+	local occupant = plot.Sanctum.Occupants[userId]
+	if occupant == nil then
+		byUserId[userId] = nil -- a stale index entry; there is nothing else to unwind
+		return
+	end
+	-- Mirrored BEFORE the occupant is dropped, so the leaver's own Profile carries the shared result
+	-- home (§1.5) rather than the state they arrived with.
+	mirror(plot)
+	removeOccupant(plot, occupant)
+	owner.OccupantRemoved:Fire(plot.Sanctum, player)
+	-- Income is NOT paused for whoever is left (DECISIONS #6): nothing here touches the runtime.
+	if profiles ~= nil then
+		for _, other in ipairs(owner:GetOccupants(plot.Sanctum)) do profiles:Save(other) end
+	end
+	if next(plot.Sanctum.Occupants) == nil then
+		if links ~= nil then links:Cancel(plot.Sanctum.Id) end
+		beginGrace(plot)
+	end
+	owner:MarkDirty(plot.Sanctum)
+end
+
+--[[ ProfileService saves AND releases on PlayerRemoving, and its own handler is connected first
+     (registration order), so ProfileReleasing is the last window in which the leaver's Profile can
+     still be given the shared result. Nothing here yields, so it lands before that write. ]]
+function PlotSession.flush(player: any, profile: any): ()
+	local userId = userIdOf(player)
+	local plot = if userId ~= nil then byUserId[userId] else nil
+	if plot ~= nil and type(profile) == "table" then
+		profile.Plot = StateSchema.clonePlotState(plot.Sanctum.State)
+	end
+end
+
+function PlotSession.mirrorAll(): ()
+	for _, plot in ipairs(plots) do mirror(plot) end
+end
+
+function PlotSession.mirrorOne(plot: Plot): ()
+	mirror(plot)
+end
+
+function PlotSession.requestLink(player: any, plot: Plot): (boolean, string)
+	local userId = userIdOf(player)
+	if userId == nil then return false, Reason.NoPlayer end
+	local current = byUserId[userId]
+	if current == plot then return false, Reason.AlreadyHere end
+	-- §1.5: one Sanctum at a time. Linking out of an occupied plot would strand the partner in a
+	-- state that is about to be merged somewhere else.
+	if current ~= nil then return false, Reason.AlreadyLinked end
+	local recipients = owner:GetOccupants(plot.Sanctum)
+	if #recipients == 0 then return false, Reason.SanctumEmpty end
+	if #recipients >= SLOTS then return false, Reason.SanctumFull end
+	-- The merge reads the joiner's SAVED PlotState, so an unloaded Profile must not be offered:
+	-- accepting one would link them in with nothing of their own and read as data loss.
+	if savedPlotOf(player) == nil then return false, Reason.NotLoaded end
+	return links:Open(player, plot.Sanctum, recipients)
+end
+
+function PlotSession.resolveLink(player: any, plot: Plot, accept: boolean): (boolean, string)
+	local userId = userIdOf(player)
+	-- Only a CURRENT occupant may answer. The offer was addressed to them, and the opt-in exists
+	-- precisely to stop anyone else waving a stranger into their plot.
+	if userId == nil or plot.Sanctum.Occupants[userId] == nil then return false, Reason.NoPlayer end
+	return links:Resolve(player, plot.Sanctum, accept == true)
+end
+
+--[[ Runs up to LinkConfirmSeconds after the request, so EVERY gate is re-checked against live state:
+     the joiner may have claimed a plot of their own in the meantime, and the second slot may have
+     been taken by an offer that was accepted first. ]]
+function PlotSession.linkAccepted(plot: Plot, joiner: any): ()
+	local userId = userIdOf(joiner)
+	if userId == nil or byUserId[userId] ~= nil or occupantCount(plot) >= SLOTS then return end
+	local saved = savedPlotOf(joiner)
+	if saved ~= nil then
+		--[[ MAX-MERGE (§1.5): per-field max, union of sets, so nobody can lose anything they owned
+		     by being sociable. The LIVE state is the left argument, which is what keeps the Affinity
+		     the pair has already been playing rather than the joiner's. ]]
+		plot.Sanctum.State = StateSchema.mergePlotStates(plot.Sanctum.State, saved)
+	end
+	if addOccupant(plot, joiner, userId) == nil then return end
+	owner:RebuildSanctum(plot.Sanctum)
+	mirror(plot) -- the merged state belongs to BOTH of them from this moment on
+end
+
+return PlotSession
 
 --#endregion
 end
