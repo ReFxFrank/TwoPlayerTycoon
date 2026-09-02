@@ -17,6 +17,8 @@ local GameConfig = require(Modules:WaitForChild("GameConfig"))
 local Signal = require(Modules:WaitForChild("Signal"))
 local StateSchema = require(Modules:WaitForChild("StateSchema"))
 
+local ProfileLock = require(script.Parent.ProfileLock)
+
 type Profile = StateSchema.Profile
 type Lock = { JobId: string, Stamp: number }
 -- Spec section 3.1: a connection is anything with :Disconnect(). Structural, so this module behaves
@@ -38,7 +40,10 @@ local SESSION = GameConfig.Session
 -- Studio reports an empty JobId. A constant stand-in is right there: Studio runs one server at a
 -- time, so a restarted play-test reclaims its own lock immediately instead of waiting out
 -- LockStaleSeconds. Live, JobId is unique per server, which is the entire mechanism.
-local JOB_ID: string = if type(game.JobId) == "string" and #game.JobId > 0 then game.JobId else "studio-solo"
+-- ONE definition, shared with ProfileLock. Two fallbacks would differ in Studio (where JobId is
+-- empty), and a server that writes one id while blocks() compares another would refuse to
+-- recognise its own lock.
+local JOB_ID: string = ProfileLock.JobId
 -- Poll cadence and ceiling for a caller waiting on an in-flight save. The ceiling clears
 -- DataStoreWrapper's full 1+2+4+8s backoff, so a slow-but-healthy save is waited out while one
 -- wedged behind an outage cannot park a PlayerRemoving or a shutdown forever.
@@ -62,38 +67,8 @@ local running = false
 -- systems draw from, which would make their tests non-reproducible.
 local rng = Random.new(os.time())
 
-local function keyFor(player: Player): string return SAVE.KeyPrefix .. tostring(player.UserId) end
-
---[[ The stored value is { Lock = {JobId, Stamp}, Data = Profile }. A raw legacy Profile (written by
-     a build predating the lock) has no Data field and is read as unlocked data, so an old save is
-     adopted rather than mistaken for garbage and overwritten. ]]
-local function unwrap(raw: any): (Lock?, any)
-	if type(raw) ~= "table" then return nil, nil end
-	local stored = raw :: { [string]: any }
-	if type(stored.Data) ~= "table" then return nil, raw end
-	local lock = stored.Lock
-	if type(lock) ~= "table" or type(lock.JobId) ~= "string" or type(lock.Stamp) ~= "number" then
-		-- A malformed or absent lock is no lock. Refusing to load over a half-written lock record
-		-- would strand the player for LockStaleSeconds over a value we can simply replace.
-		return nil, stored.Data
-	end
-	return { JobId = lock.JobId, Stamp = lock.Stamp }, stored.Data
-end
-
---[[ A lock blocks a load only while it is live AND belongs to someone else.
-     WHY a stale lock MUST be stealable: a server that crashes never runs its release-save, so its
-     lock is left behind forever. Without the steal, one crash locks that player out of their own
-     save permanently -- the account becomes unloadable. The steal is the repair for a dead server.
-     WHY the window must sit well above the autosave interval: every save refreshes the stamp, so a
-     live session's lock is never older than one autosave period (120s +/-20s). LockStaleSeconds is
-     900 -- seven autosaves of slack -- so a laggy but living server is never mistaken for a dead
-     one. A window near or below the autosave period would steal locks from LIVE sessions and let
-     two servers write one profile: exactly the corruption the lock exists to prevent. ]]
-local function blocks(lock: Lock?, now: number): boolean
-	if lock == nil or lock.JobId == JOB_ID then return false end -- unlocked, or ours (a rejoin here)
-	return (now - lock.Stamp) <= SESSION.LockStaleSeconds
-end
-
+-- The lock protocol lives in ProfileLock; aliased so call sites below read unchanged.
+local keyFor, unwrap, blocks = ProfileLock.keyFor, ProfileLock.unwrap, ProfileLock.blocks
 local function startAutosave(entry: Entry): ()
 	if entry.Autosave then return end -- a second thread would double this player's write rate
 	entry.Autosave = true
@@ -266,8 +241,32 @@ function Service:Init(registry: any): ()
 	entries = {}
 end
 
+--[[ The first domino. Every downstream system hangs off ProfileLoaded -- PlotService claims a
+     Sanctum on it, LeaderboardService builds leaderstats, StateReplicator starts pushing -- so
+     without this connection a joining player loads no profile, claims no plot and stands in an
+     empty world with a blank HUD. Nothing else in the game calls LoadAsync. ]]
+local function admit(player: Player): ()
+	if Service:IsLoaded(player) then return end
+	local profile = Service:LoadAsync(player)
+	if profile ~= nil then return end
+	--[[ nil means the session lock belongs to a live server after every retry. Kicking is the only
+	     safe answer: letting them play on a blank profile would end with the next save overwriting
+	     a real one. They rejoin in seconds, usually onto the server that holds the lock. ]]
+	if player.Parent ~= nil then
+		player:Kick("Your sanctum is still saving on another server. Please rejoin in a moment.")
+	end
+end
+
 function Service:Start(): ()
 	running = true
+	table.insert(connections, Players.PlayerAdded:Connect(function(player: Player)
+		task.spawn(admit, player) -- LoadAsync yields; PlayerAdded must not block on a DataStore
+	end))
+	-- A player whose join beat this script (a fresh server fills before the first Heartbeat) still
+	-- needs admitting, so the connection alone is not enough.
+	for _, player in ipairs(Players:GetPlayers()) do
+		task.spawn(admit, player)
+	end
 	local leaving = Players.PlayerRemoving:Connect(function(player: Player)
 		Service:Release(player) -- saves with Release = true, then drops the in-memory profile
 	end)

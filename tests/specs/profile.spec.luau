@@ -365,9 +365,52 @@ t.test("a player leaving is saved and released automatically", function()
     t.falsy(ProfileService:IsLoaded(player), "the in-memory profile is dropped")
 end)
 
+t.test("joining loads a profile without anyone asking -- the first domino", function()
+    -- Regression guard. Every downstream system hangs off ProfileLoaded: PlotService claims a
+    -- Sanctum on it, LeaderboardService builds leaderstats, StateReplicator starts pushing. Nothing
+    -- else in the game calls LoadAsync, so without a PlayerAdded hook a joining player would stand
+    -- in an empty world with a blank HUD -- while every module's own tests still passed.
+    local ProfileService = boot()
+    local loaded = {}
+    ProfileService.ProfileLoaded:Connect(function(player) table.insert(loaded, player.Name) end)
+
+    local ash = Mock.addPlayer("Ash", 501)
+    Mock.advance(1)
+    t.truthy(ProfileService:IsLoaded(ash), "the join alone loaded the profile")
+    t.deepEq(loaded, { "Ash" }, "and announced it exactly once")
+end)
+
+t.test("a player already in game when Start runs is admitted too", function()
+    -- A fresh server can fill before the first Heartbeat, so the connection alone is not enough.
+    local wrapper = loadModule("ServerScriptService/Core/Services/DataStoreWrapper")
+    local profiles = loadModule("ServerScriptService/Core/Services/ProfileService")
+    local early = Mock.addPlayer("Early", 777)
+    profiles:Init({ Get = function() return wrapper end })
+    profiles:Start()
+    Mock.advance(1)
+    t.truthy(profiles:IsLoaded(early), "the join beat the script and was still picked up")
+end)
+
+t.test("a player whose lock is held elsewhere is kicked, not given a blank profile", function()
+    local ProfileService = boot()
+    seedStored(501, {
+        Lock = { JobId = "some-other-live-server", Stamp = os.time() },
+        Data = StateSchema.newProfile(),
+    })
+    local ash = Mock.addPlayer("Ash", 501)
+    Mock.advance(GameConfig.Session.LockRetries * GameConfig.Session.LockRetryDelay + 5)
+    -- Letting them play on a blank profile would end with the next save overwriting a real one.
+    t.falsy(ProfileService:IsLoaded(ash))
+    t.truthy(ash:GetAttribute("__Kicked") ~= nil, "they were kicked with a reason")
+end)
+
 t.test("every entry point tolerates a player it has never seen", function()
     local ProfileService = boot()
-    local stranger = Mock.addPlayer("Stranger", 999)
+    -- Deliberately NOT parented to Players, so PlayerAdded never fires: this is the stale-reference
+    -- case, a handler still holding a player who has already gone.
+    local stranger = Instance.new("Player")
+    stranger.Name = "Stranger"
+    stranger.UserId = 999
     t.eq(ProfileService:Get(stranger), nil)
     t.falsy(ProfileService:IsLoaded(stranger))
     t.falsy(ProfileService:Save(stranger))
