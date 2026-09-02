@@ -15,6 +15,8 @@ local Economy = require(Modules:WaitForChild("Economy"))
 local GameConfig = require(Modules:WaitForChild("GameConfig"))
 local StateSchema = require(Modules:WaitForChild("StateSchema"))
 
+local PlotMirror = require(script.Parent.PlotMirror)
+
 type PlotState = StateSchema.PlotState
 type Occupant = { UserId: number, Player: any, Slot: number, JoinedAt: number, Contribution: number, Vote: boolean? }
 type Plot = any -- PlotRuntime's object; typed there, and naming it here would be a require cycle
@@ -97,45 +99,8 @@ local function removeOccupant(plot: Plot, occupant: Occupant): ()
 	end
 end
 
---[[ Writes the live shared PlotState into EVERY occupant's Profile (§1.5). Co-op means both players
-     carry the same result home, so there is no host copy and no guest copy. CLONED, not aliased: a
-     leaver's Profile must stop tracking a Sanctum they are no longer in. ]]
-local function mirror(plot: Plot): ()
-	if profiles == nil then return end
-	for _, occupant in pairs(plot.Sanctum.Occupants) do
-		local profile = profiles:Get(occupant.Player)
-		if type(profile) == "table" then
-			(profile :: any).Plot = StateSchema.clonePlotState(plot.Sanctum.State)
-		end
-	end
-end
-
-local function savedPlotOf(player: any): PlotState?
-	local profile = if profiles ~= nil then profiles:Get(player) else nil
-	local saved = if type(profile) == "table" then (profile :: any).Plot else nil
-	return if type(saved) == "table" then saved :: PlotState else nil
-end
-
---[[ Brings the claimer's saved PlotState into the Sanctum. A RECLAIM inside the grace window
-     max-merges rather than replacing: the two should already be identical (the save ran on release),
-     and merging means a save that silently failed cannot cost the pair their progress. ]]
-local function adopt(plot: Plot, player: any, reclaiming: boolean): ()
-	local saved = savedPlotOf(player)
-	local state: PlotState = plot.Sanctum.State
-	if saved ~= nil then
-		state = if reclaiming then StateSchema.mergePlotStates(state, saved) else StateSchema.clonePlotState(saved)
-	end
-	--[[ COLD START. newPlotState owns nothing, so without this seed a fresh Sanctum earns zero and
-	     the first purchase never becomes affordable -- DropperData's balance model documents the one
-	     free ember_vent as a contract with this service. Granted only when the pair owns NOTHING at
-	     all, so it can never top up a real save. ]]
-	if Economy.totalDroppersOwned(state) == 0 then
-		local starter = DropperData.get(STARTER_DROPPER) or DropperData.List[1]
-		if starter ~= nil then state.Droppers[starter.Id] = 1 end
-	end
-	plot.Sanctum.State = state
-end
-
+-- The Profile <-> PlotState bridge lives in PlotMirror; aliased so call sites read unchanged.
+local mirror, savedPlotOf, adopt = PlotMirror.mirror, PlotMirror.savedPlotOf, PlotMirror.adopt
 local function beginGrace(plot: Plot): ()
 	plot.GraceToken += 1
 	local token = plot.GraceToken
@@ -152,11 +117,27 @@ end
 
 function PlotSession.bind(service: any, list: { Plot }, profileService: any, linkController: any): ()
 	owner, plots, profiles, links = service, list, profileService, linkController
+	PlotMirror.bind(profileService)
 end
 
 -- Teardown for Stop / re-Init. The respawn watches belong to each plot and die with it in Destroy.
 function PlotSession.reset(): ()
 	table.clear(byUserId)
+end
+
+--[[ THE COLD-START INVARIANT: an OCCUPIED Sanctum always owns at least one Wellspring. Without it
+     income is exactly zero, and with zero income no purchase ever becomes affordable -- the pair are
+     stuck forever. DropperData's balance model states the assumption explicitly (one free ember_vent,
+     first purchase at ~34s) and names PlotService as the component that seeds it.
+     It is restored HERE, at the single choke point every state change passes through, rather than at
+     the four call sites that can empty a Sanctum: a fresh claim, a link merge, an Attunement and a
+     Transcendence reset. Granted only when the pair owns NOTHING at all, so it can never top up a
+     real save, and never for an empty plot, which must stay blank until somebody claims it. ]]
+function PlotSession.ensureSeed(plot: Plot): ()
+	local state: PlotState = plot.Sanctum.State
+	if next(plot.Sanctum.Occupants) == nil or Economy.totalDroppersOwned(state) > 0 then return end
+	local starter = DropperData.get(STARTER_DROPPER) or DropperData.List[1]
+	if starter ~= nil then state.Droppers[starter.Id] = 1 end
 end
 
 function PlotSession.plotFor(player: any): Plot?
@@ -252,9 +233,11 @@ function PlotSession.requestLink(player: any, plot: Plot): (boolean, string)
 	if userId == nil then return false, Reason.NoPlayer end
 	local current = byUserId[userId]
 	if current == plot then return false, Reason.AlreadyHere end
-	-- §1.5: one Sanctum at a time. Linking out of an occupied plot would strand the partner in a
-	-- state that is about to be merged somewhere else.
-	if current ~= nil then return false, Reason.AlreadyLinked end
+	--[[ §1.5 is "one Sanctum at a time", NOT "never linked". Every player auto-claims a plot when
+	     their Profile loads, so refusing anyone who has one would make linking -- the entire
+	     two-player hook -- unreachable. A SOLO player may link out and their progress travels with
+	     them through the merge; what is refused is stranding a PARTNER behind. ]]
+	if current ~= nil and occupantCount(current) > 1 then return false, Reason.AlreadyLinked end
 	local recipients = owner:GetOccupants(plot.Sanctum)
 	if #recipients == 0 then return false, Reason.SanctumEmpty end
 	if #recipients >= SLOTS then return false, Reason.SanctumFull end
@@ -277,7 +260,19 @@ end
      been taken by an offer that was accepted first. ]]
 function PlotSession.linkAccepted(plot: Plot, joiner: any): ()
 	local userId = userIdOf(joiner)
-	if userId == nil or byUserId[userId] ~= nil or occupantCount(plot) >= SLOTS then return end
+	if userId == nil or occupantCount(plot) >= SLOTS then return end
+	local current = byUserId[userId]
+	if current == plot then return end
+	if current ~= nil then
+		-- Re-checked at ACCEPT time: a partner may have linked into the joiner's own Sanctum during
+		-- the confirmation window, and leaving now would strand them.
+		if occupantCount(current) > 1 then return end
+		-- release() mirrors the live state into their Profile first, so the merge below picks up
+		-- what they earned while the offer was pending. Reserved is cleared because a deliberate
+		-- move is not a disconnect: their old plot is genuinely free.
+		PlotSession.release(joiner)
+		current.Reserved = {}
+	end
 	local saved = savedPlotOf(joiner)
 	if saved ~= nil then
 		--[[ MAX-MERGE (§1.5): per-field max, union of sets, so nobody can lose anything they owned

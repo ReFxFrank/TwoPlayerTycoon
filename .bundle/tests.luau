@@ -5997,6 +5997,68 @@ return PlotLinkController
 
 --#endregion
 end
+MODULE_ORDER[#MODULE_ORDER + 1] = { Path = "ServerScriptService/Core/Services/PlotMirror", Class = "ModuleScript", File = "src/server/Services/PlotMirror.luau" }
+MODULE_DEFS["ServerScriptService/Core/Services/PlotMirror"] = function(script, require, ...)
+--#region src/server/Services/PlotMirror.luau
+--!strict
+--[[
+    PlotMirror
+    The bridge between a Sanctum's live PlotState and the per-player Profiles that persist it:
+    mirroring the shared state out to every occupant, reading a player's saved state back, and
+    adopting it when they claim a plot.
+
+    Split out of PlotSession to keep that file inside the 300-line budget. It is the only place that
+    decides which direction state flows between a Sanctum and a Profile, which is worth having in
+    one file regardless.
+    Owner: server  |  Consumers: PlotSession
+]]
+
+local Modules = game:GetService("ReplicatedStorage"):WaitForChild("Modules")
+local StateSchema = require(Modules:WaitForChild("StateSchema"))
+
+type PlotState = StateSchema.PlotState
+
+local PlotMirror = {}
+local profiles: any = nil
+
+function PlotMirror.bind(profileService: any): ()
+	profiles = profileService
+end
+
+--[[ Writes the live shared PlotState into EVERY occupant's Profile (§1.5). Co-op means both players
+     carry the same result home, so there is no host copy and no guest copy. CLONED, not aliased: a
+     leaver's Profile must stop tracking a Sanctum they are no longer in. ]]
+function PlotMirror.mirror(plot: any): ()
+	if profiles == nil then return end
+	for _, occupant in pairs(plot.Sanctum.Occupants) do
+		local profile = profiles:Get(occupant.Player)
+		if type(profile) == "table" then
+			(profile :: any).Plot = StateSchema.clonePlotState(plot.Sanctum.State)
+		end
+	end
+end
+
+function PlotMirror.savedPlotOf(player: any): PlotState?
+	local profile = if profiles ~= nil then profiles:Get(player) else nil
+	local saved = if type(profile) == "table" then (profile :: any).Plot else nil
+	return if type(saved) == "table" then saved :: PlotState else nil
+end
+
+--[[ Brings the claimer's saved PlotState in. A RECLAIM inside the grace window max-merges rather
+     than replacing: the two should already match (release saves), so merging means a save that
+     silently failed cannot cost the pair their progress. ]]
+function PlotMirror.adopt(plot: any, player: any, reclaiming: boolean): ()
+	local saved = PlotMirror.savedPlotOf(player)
+	if saved ~= nil then
+		plot.Sanctum.State = if reclaiming then StateSchema.mergePlotStates(plot.Sanctum.State, saved)
+			else StateSchema.clonePlotState(saved)
+	end
+end
+
+return PlotMirror
+
+--#endregion
+end
 MODULE_ORDER[#MODULE_ORDER + 1] = { Path = "ServerScriptService/Core/Services/PlotRuntime", Class = "ModuleScript", File = "src/server/Services/PlotRuntime.luau" }
 MODULE_DEFS["ServerScriptService/Core/Services/PlotRuntime"] = function(script, require, ...)
 --#region src/server/Services/PlotRuntime.luau
@@ -6279,8 +6341,6 @@ local function plotOf(sanctum: any): Plot?
 	return if plot ~= nil and plot.Sanctum == sanctum then plot else nil
 end
 
---[[ Public API ]]
-
 function Service:GetSanctum(id: any): Sanctum?
 	local plot = if type(id) == "number" then byId[id] else nil
 	return if plot ~= nil then plot.Sanctum else nil
@@ -6333,6 +6393,7 @@ end
 function Service:RebuildSanctum(sanctum: any): ()
 	local plot = plotOf(sanctum)
 	if plot == nil then return end
+	PlotSession.ensureSeed(plot) -- the cold-start invariant, restored before anything reads the state
 	plot:Rebuild()
 	-- PurchaseService is registered AFTER this service, so it is resolved lazily; TryGet, never Get,
 	-- because Get errors by design and this runs on paths that must not throw.
@@ -6535,6 +6596,8 @@ local Economy = require(Modules:WaitForChild("Economy"))
 local GameConfig = require(Modules:WaitForChild("GameConfig"))
 local StateSchema = require(Modules:WaitForChild("StateSchema"))
 
+local PlotMirror = require(script.Parent.PlotMirror)
+
 type PlotState = StateSchema.PlotState
 type Occupant = { UserId: number, Player: any, Slot: number, JoinedAt: number, Contribution: number, Vote: boolean? }
 type Plot = any -- PlotRuntime's object; typed there, and naming it here would be a require cycle
@@ -6617,45 +6680,8 @@ local function removeOccupant(plot: Plot, occupant: Occupant): ()
 	end
 end
 
---[[ Writes the live shared PlotState into EVERY occupant's Profile (§1.5). Co-op means both players
-     carry the same result home, so there is no host copy and no guest copy. CLONED, not aliased: a
-     leaver's Profile must stop tracking a Sanctum they are no longer in. ]]
-local function mirror(plot: Plot): ()
-	if profiles == nil then return end
-	for _, occupant in pairs(plot.Sanctum.Occupants) do
-		local profile = profiles:Get(occupant.Player)
-		if type(profile) == "table" then
-			(profile :: any).Plot = StateSchema.clonePlotState(plot.Sanctum.State)
-		end
-	end
-end
-
-local function savedPlotOf(player: any): PlotState?
-	local profile = if profiles ~= nil then profiles:Get(player) else nil
-	local saved = if type(profile) == "table" then (profile :: any).Plot else nil
-	return if type(saved) == "table" then saved :: PlotState else nil
-end
-
---[[ Brings the claimer's saved PlotState into the Sanctum. A RECLAIM inside the grace window
-     max-merges rather than replacing: the two should already be identical (the save ran on release),
-     and merging means a save that silently failed cannot cost the pair their progress. ]]
-local function adopt(plot: Plot, player: any, reclaiming: boolean): ()
-	local saved = savedPlotOf(player)
-	local state: PlotState = plot.Sanctum.State
-	if saved ~= nil then
-		state = if reclaiming then StateSchema.mergePlotStates(state, saved) else StateSchema.clonePlotState(saved)
-	end
-	--[[ COLD START. newPlotState owns nothing, so without this seed a fresh Sanctum earns zero and
-	     the first purchase never becomes affordable -- DropperData's balance model documents the one
-	     free ember_vent as a contract with this service. Granted only when the pair owns NOTHING at
-	     all, so it can never top up a real save. ]]
-	if Economy.totalDroppersOwned(state) == 0 then
-		local starter = DropperData.get(STARTER_DROPPER) or DropperData.List[1]
-		if starter ~= nil then state.Droppers[starter.Id] = 1 end
-	end
-	plot.Sanctum.State = state
-end
-
+-- The Profile <-> PlotState bridge lives in PlotMirror; aliased so call sites read unchanged.
+local mirror, savedPlotOf, adopt = PlotMirror.mirror, PlotMirror.savedPlotOf, PlotMirror.adopt
 local function beginGrace(plot: Plot): ()
 	plot.GraceToken += 1
 	local token = plot.GraceToken
@@ -6672,11 +6698,27 @@ end
 
 function PlotSession.bind(service: any, list: { Plot }, profileService: any, linkController: any): ()
 	owner, plots, profiles, links = service, list, profileService, linkController
+	PlotMirror.bind(profileService)
 end
 
 -- Teardown for Stop / re-Init. The respawn watches belong to each plot and die with it in Destroy.
 function PlotSession.reset(): ()
 	table.clear(byUserId)
+end
+
+--[[ THE COLD-START INVARIANT: an OCCUPIED Sanctum always owns at least one Wellspring. Without it
+     income is exactly zero, and with zero income no purchase ever becomes affordable -- the pair are
+     stuck forever. DropperData's balance model states the assumption explicitly (one free ember_vent,
+     first purchase at ~34s) and names PlotService as the component that seeds it.
+     It is restored HERE, at the single choke point every state change passes through, rather than at
+     the four call sites that can empty a Sanctum: a fresh claim, a link merge, an Attunement and a
+     Transcendence reset. Granted only when the pair owns NOTHING at all, so it can never top up a
+     real save, and never for an empty plot, which must stay blank until somebody claims it. ]]
+function PlotSession.ensureSeed(plot: Plot): ()
+	local state: PlotState = plot.Sanctum.State
+	if next(plot.Sanctum.Occupants) == nil or Economy.totalDroppersOwned(state) > 0 then return end
+	local starter = DropperData.get(STARTER_DROPPER) or DropperData.List[1]
+	if starter ~= nil then state.Droppers[starter.Id] = 1 end
 end
 
 function PlotSession.plotFor(player: any): Plot?
@@ -6772,9 +6814,11 @@ function PlotSession.requestLink(player: any, plot: Plot): (boolean, string)
 	if userId == nil then return false, Reason.NoPlayer end
 	local current = byUserId[userId]
 	if current == plot then return false, Reason.AlreadyHere end
-	-- §1.5: one Sanctum at a time. Linking out of an occupied plot would strand the partner in a
-	-- state that is about to be merged somewhere else.
-	if current ~= nil then return false, Reason.AlreadyLinked end
+	--[[ §1.5 is "one Sanctum at a time", NOT "never linked". Every player auto-claims a plot when
+	     their Profile loads, so refusing anyone who has one would make linking -- the entire
+	     two-player hook -- unreachable. A SOLO player may link out and their progress travels with
+	     them through the merge; what is refused is stranding a PARTNER behind. ]]
+	if current ~= nil and occupantCount(current) > 1 then return false, Reason.AlreadyLinked end
 	local recipients = owner:GetOccupants(plot.Sanctum)
 	if #recipients == 0 then return false, Reason.SanctumEmpty end
 	if #recipients >= SLOTS then return false, Reason.SanctumFull end
@@ -6797,7 +6841,19 @@ end
      been taken by an offer that was accepted first. ]]
 function PlotSession.linkAccepted(plot: Plot, joiner: any): ()
 	local userId = userIdOf(joiner)
-	if userId == nil or byUserId[userId] ~= nil or occupantCount(plot) >= SLOTS then return end
+	if userId == nil or occupantCount(plot) >= SLOTS then return end
+	local current = byUserId[userId]
+	if current == plot then return end
+	if current ~= nil then
+		-- Re-checked at ACCEPT time: a partner may have linked into the joiner's own Sanctum during
+		-- the confirmation window, and leaving now would strand them.
+		if occupantCount(current) > 1 then return end
+		-- release() mirrors the live state into their Profile first, so the merge below picks up
+		-- what they earned while the offer was pending. Reserved is cleared because a deliberate
+		-- move is not a disconnect: their old plot is genuinely free.
+		PlotSession.release(joiner)
+		current.Reserved = {}
+	end
 	local saved = savedPlotOf(joiner)
 	if saved ~= nil then
 		--[[ MAX-MERGE (§1.5): per-field max, union of sets, so nobody can lose anything they owned
@@ -13716,6 +13772,454 @@ t.test("build tolerates junk arguments", function()
     t.noThrow(function() PlotBuilder.build(-1, parent) end)
     t.noThrow(function() PlotBuilder.destroy(nil) end)
     t.noThrow(function() PlotBuilder.destroy(Instance.new("Part")) end)
+end)
+
+--#endregion
+end }
+SPECS[#SPECS + 1] = { Name = "plotservice.spec", Run = function(t, Mock, loadModule, runScript)
+--#region tests/specs/plotservice.spec.luau
+--[[
+    plotservice.spec
+    PlotService owns the Sanctum lifecycle: who is in which plot, what happens when a partner links
+    in or walks out, and the single Heartbeat that drives every plot's income. It is booted here
+    through the REAL ServiceRegistry with the real ProfileService, EconomyService and RemoteService,
+    because most of what can go wrong is an interaction between them.
+]]
+
+local GameConfig = loadModule("ReplicatedStorage/Modules/GameConfig")
+local StateSchema = loadModule("ReplicatedStorage/Modules/StateSchema")
+local DropperData = loadModule("ReplicatedStorage/Modules/DropperData")
+local SectionData = loadModule("ReplicatedStorage/Modules/SectionData")
+
+local firstDropper = DropperData.List[1]
+
+local function boot()
+    local Registry = loadModule("ServerScriptService/Core/ServiceRegistry")
+    local registry = Registry.new()
+    local services = {}
+    for _, name in ipairs({ "RateLimiter", "RemoteService", "DataStoreWrapper", "ProfileService",
+        "EconomyService", "PlotService" }) do
+        services[name] = loadModule("ServerScriptService/Core/Services/" .. name)
+        registry:Register(name, services[name])
+    end
+    registry:InitAll()
+    registry:StartAll()
+    return services, registry
+end
+
+--- Seeds a saved profile straight into the DataStore, the way a returning player's really arrives.
+--- It must be written BEFORE LoadAsync, which fires ProfileLoaded itself -- and that signal is what
+--- PlotService claims on, so a profile mutated afterwards would arrive too late to be adopted.
+local function seedSave(userId, mutate)
+    local profile = StateSchema.newProfile()
+    mutate(profile)
+    game:GetService("DataStoreService"):GetDataStore(GameConfig.Save.DataStoreName)
+        :SetAsync(GameConfig.Save.KeyPrefix .. tostring(userId), { Data = profile })
+end
+
+--- Joins a player the way the real server does.
+local function join(services, name, userId, seed)
+    if seed then seedSave(userId, seed) end
+    local player = Mock.addPlayer(name, userId)
+    local profile = services.ProfileService:LoadAsync(player)
+    Mock.advance(0)
+    return player, profile
+end
+
+local function sanctumOf(services, player)
+    return services.PlotService:GetSanctumForPlayer(player)
+end
+
+-------------------------------------------------------------------------------
+-- Construction and claiming
+-------------------------------------------------------------------------------
+t.test("Init builds every sanctum the config asks for, once", function()
+    boot()
+    local folder
+    for _, child in ipairs(workspace:GetChildren()) do
+        if #child:GetChildren() >= GameConfig.Plot.SanctumCount then folder = child end
+    end
+    t.truthy(folder, "a folder of sanctums exists in the workspace")
+    t.eq(#folder:GetChildren(), GameConfig.Plot.SanctumCount)
+end)
+
+t.test("a joining player claims a sanctum and is its anchor", function()
+    local services = boot()
+    local ash = join(services, "Ash", 1)
+    local sanctum = sanctumOf(services, ash)
+    t.truthy(sanctum, "the player was placed in a plot")
+    t.eq(sanctum.AnchorUserId, ash.UserId, "the first occupant anchors the plot")
+    t.eq(#services.PlotService:GetOccupants(sanctum), 1)
+    t.eq(sanctum.Occupants[ash.UserId].Slot, 1)
+end)
+
+t.test("a fresh sanctum is granted the free starting wellspring", function()
+    local services = boot()
+    local ash = join(services, "Ash", 1)
+    local sanctum = sanctumOf(services, ash)
+    -- The cold-start pacing in DropperData assumes this: without it a new player has no income at
+    -- all and can never afford their first purchase.
+    t.eq(sanctum.State.Droppers[firstDropper.Id], 1)
+end)
+
+t.test("a returning player's saved plot is loaded, not overwritten", function()
+    local services = boot()
+    local ash = join(services, "Ash", 1, function(profile)
+        profile.Plot.Essence = 5000
+        profile.Plot.Stage = 3
+        profile.Plot.Droppers[firstDropper.Id] = 7
+        profile.Plot.Sections[SectionData.List[2].Id] = true
+    end)
+    local sanctum = sanctumOf(services, ash)
+    t.eq(sanctum.State.Essence, 5000)
+    t.eq(sanctum.State.Stage, 3)
+    t.eq(sanctum.State.Droppers[firstDropper.Id], 7, "an existing wellspring count is not reset to 1")
+    t.truthy(sanctum.State.Sections[SectionData.List[2].Id])
+end)
+
+t.test("two players get their own sanctums by default -- linking is opt-in", function()
+    local services = boot()
+    local ash = join(services, "Ash", 1)
+    local bree = join(services, "Bree", 2)
+    local a, b = sanctumOf(services, ash), sanctumOf(services, bree)
+    t.truthy(a and b)
+    t.neq(a.Id, b.Id, "nobody is dropped into a stranger's plot without asking")
+end)
+
+t.test("a full server turns the next joiner away rather than double-booking", function()
+    local services = boot()
+    for index = 1, GameConfig.Plot.SanctumCount do
+        join(services, "P" .. index, 100 + index)
+    end
+    local late = Mock.addPlayer("Late", 999)
+    local profile = services.ProfileService:LoadAsync(late)
+    services.ProfileService.ProfileLoaded:Fire(late, profile)
+    Mock.advance(0)
+    t.eq(sanctumOf(services, late), nil)
+    t.gt(#Mock.outboxFor("Notify", late), 0, "and is told why")
+end)
+
+-------------------------------------------------------------------------------
+-- Income
+-------------------------------------------------------------------------------
+t.test("essence accrues from the single heartbeat", function()
+    local services = boot()
+    local ash = join(services, "Ash", 1)
+    local sanctum = sanctumOf(services, ash)
+    t.eq(sanctum.State.Essence, 0)
+    Mock.advance(60)
+    t.gt(sanctum.State.Essence, 0, "the free wellspring produced income")
+    t.gt(sanctum.State.LifetimeEssence, 0)
+end)
+
+t.test("an empty sanctum earns nothing", function()
+    local services = boot()
+    local ash = join(services, "Ash", 1)
+    local occupied = sanctumOf(services, ash)
+    Mock.advance(30)
+    services.PlotService:ForEachSanctum(function(sanctum)
+        if sanctum.Id ~= occupied.Id then
+            t.eq(sanctum.State.Essence, 0, "an unoccupied plot must not simulate")
+        end
+    end)
+end)
+
+t.test("one bad sanctum cannot stop the whole server's income", function()
+    local services = boot()
+    local ash = join(services, "Ash", 1)
+    local sanctum = sanctumOf(services, ash)
+    -- Corrupt a DIFFERENT plot's state, the way a bad save or a bug might.
+    services.PlotService:ForEachSanctum(function(other)
+        if other.Id ~= sanctum.Id then other.State = "corrupt" end
+    end)
+    t.noThrow(function() Mock.advance(30) end, "the shared Heartbeat must survive one bad plot")
+    t.gt(sanctum.State.Essence, 0, "and the healthy plot kept earning")
+end)
+
+-------------------------------------------------------------------------------
+-- Linking
+-------------------------------------------------------------------------------
+t.test("linking offers, then max-merges on accept", function()
+    local services = boot()
+    local ash = join(services, "Ash", 1, function(profile)
+        profile.Plot.Essence = 900
+        profile.Plot.Droppers[firstDropper.Id] = 9
+        profile.Plot.Stage = 2
+    end)
+    local bree = join(services, "Bree", 2, function(profile)
+        profile.Plot.Essence = 100
+        profile.Plot.Droppers[DropperData.List[2].Id] = 4
+        profile.Plot.Stage = 4
+    end)
+    local host = sanctumOf(services, ash)
+
+    Mock.clearOutbox()
+    local ok = services.PlotService:RequestLink(bree, host)
+    t.truthy(ok, "the offer was made")
+    t.gt(#Mock.outboxFor("LinkOffer"), 0, "and the occupant was asked")
+
+    services.PlotService:ResolveLink(ash, host, true)
+    Mock.advance(0)
+
+    t.eq(#services.PlotService:GetOccupants(host), 2, "both players are in the plot")
+    t.eq(sanctumOf(services, bree).Id, host.Id)
+    -- Max-merge (DECISIONS #3): nobody loses anything they owned by being sociable.
+    t.eq(host.State.Essence, 900, "the larger wallet survives")
+    t.eq(host.State.Stage, 4, "the further stage survives")
+    t.eq(host.State.Droppers[firstDropper.Id], 9)
+    t.eq(host.State.Droppers[DropperData.List[2].Id], 4, "the joiner's wellsprings came with them")
+end)
+
+t.test("declining a link changes nothing", function()
+    local services = boot()
+    local ash = join(services, "Ash", 1)
+    local bree = join(services, "Bree", 2)
+    local host = sanctumOf(services, ash)
+    local guestPlot = sanctumOf(services, bree)
+
+    services.PlotService:RequestLink(bree, host)
+    services.PlotService:ResolveLink(ash, host, false)
+    Mock.advance(0)
+    t.eq(#services.PlotService:GetOccupants(host), 1)
+    t.eq(sanctumOf(services, bree).Id, guestPlot.Id, "the joiner stayed home")
+end)
+
+t.test("a link offer expires on its own", function()
+    local services = boot()
+    local ash = join(services, "Ash", 1)
+    local bree = join(services, "Bree", 2)
+    local host = sanctumOf(services, ash)
+    services.PlotService:RequestLink(bree, host)
+    Mock.advance(GameConfig.Plot.LinkConfirmSeconds + 5)
+    services.PlotService:ResolveLink(ash, host, true)
+    Mock.advance(0)
+    t.eq(#services.PlotService:GetOccupants(host), 1, "an expired offer cannot be accepted late")
+end)
+
+t.test("a player already in a sanctum cannot be linked into a second one", function()
+    local services = boot()
+    local ash = join(services, "Ash", 1)
+    local bree = join(services, "Bree", 2)
+    local host = sanctumOf(services, ash)
+    services.PlotService:RequestLink(bree, host)
+    services.PlotService:ResolveLink(ash, host, true)
+    Mock.advance(0)
+
+    local cass = join(services, "Cass", 3)
+    local cassPlot = sanctumOf(services, cass)
+    -- The plot is full; a third occupant must be refused.
+    local ok = services.PlotService:RequestLink(cass, host)
+    services.PlotService:ResolveLink(ash, host, true)
+    Mock.advance(0)
+    t.eq(#services.PlotService:GetOccupants(host), GameConfig.Plot.SlotsPerSanctum)
+    t.eq(sanctumOf(services, cass).Id, cassPlot.Id, "the third player stayed in their own plot")
+end)
+
+t.test("both occupants' prestige lifts the shared income", function()
+    local services = boot()
+    local ash = join(services, "Ash", 1, function(profile) profile.Prestige.Rebirths = 6 end)
+    local bree = join(services, "Bree", 2, function(profile) profile.Prestige.Rebirths = 6 end)
+    local host = sanctumOf(services, ash)
+
+    Mock.advance(60)
+    local solo = host.State.Essence
+    host.State.Essence = 0
+
+    services.PlotService:RequestLink(bree, host)
+    services.PlotService:ResolveLink(ash, host, true)
+    Mock.advance(0)
+    Mock.advance(60)
+    t.gt(host.State.Essence, solo, "a partner's prestige is felt immediately in the shared wallet")
+end)
+
+-------------------------------------------------------------------------------
+-- Leaving
+-------------------------------------------------------------------------------
+t.test("a partner leaving does not pause the remaining player's income", function()
+    local services = boot()
+    local ash = join(services, "Ash", 1)
+    local bree = join(services, "Bree", 2)
+    local host = sanctumOf(services, ash)
+    services.PlotService:RequestLink(bree, host)
+    services.PlotService:ResolveLink(ash, host, true)
+    Mock.advance(0)
+
+    Mock.removePlayer(bree)
+    Mock.advance(0)
+    t.eq(#services.PlotService:GetOccupants(host), 1)
+
+    local before = host.State.Essence
+    Mock.advance(60)
+    -- DECISIONS #6: pausing would punish the player who stayed for something they did not do.
+    t.gt(host.State.Essence, before, "the sanctum keeps running for whoever is left")
+end)
+
+t.test("the shared plot is mirrored to every occupant's save", function()
+    local services = boot()
+    local ash, ashProfile = join(services, "Ash", 1)
+    local bree, breeProfile = join(services, "Bree", 2)
+    local host = sanctumOf(services, ash)
+    services.PlotService:RequestLink(bree, host)
+    services.PlotService:ResolveLink(ash, host, true)
+    Mock.advance(0)
+    Mock.advance(120)
+
+    services.PlotService:SaveAll(false)
+    Mock.advance(0)
+    -- Both players genuinely co-own the result, so both carry it home.
+    t.gt(ashProfile.Plot.Essence, 0)
+    t.eq(breeProfile.Plot.Essence, ashProfile.Plot.Essence)
+    t.eq(breeProfile.Plot.Stage, ashProfile.Plot.Stage)
+end)
+
+t.test("prestige is never mirrored between partners", function()
+    local services = boot()
+    local ash, ashProfile = join(services, "Ash", 1, function(p) p.Prestige.Rebirths = 5 end)
+    local bree, breeProfile = join(services, "Bree", 2)
+    local host = sanctumOf(services, ash)
+    services.PlotService:RequestLink(bree, host)
+    services.PlotService:ResolveLink(ash, host, true)
+    Mock.advance(30)
+    services.PlotService:SaveAll(false)
+    Mock.advance(0)
+    t.eq(ashProfile.Prestige.Rebirths, 5)
+    t.eq(breeProfile.Prestige.Rebirths, 0, "prestige is the one thing you can only earn yourself")
+end)
+
+t.test("the last occupant leaving frees the sanctum after the grace period", function()
+    local services = boot()
+    local ash = join(services, "Ash", 1)
+    local sanctum = sanctumOf(services, ash)
+    Mock.advance(120)
+    t.gt(sanctum.State.Essence, 0)
+
+    Mock.removePlayer(ash)
+    Mock.advance(1)
+    t.eq(#services.PlotService:GetOccupants(sanctum), 0)
+    -- Inside the grace window a disconnect-and-rejoin must not cost the plot.
+    t.gt(sanctum.State.Essence, 0, "the plot is held, not wiped, during the grace period")
+
+    Mock.advance(GameConfig.Plot.ReleaseGraceSeconds + 5)
+    t.eq(sanctum.State.Essence, 0, "and is reset once the grace period lapses")
+    t.eq(sanctum.State.Stage, 1)
+end)
+
+t.test("a rejoin inside the grace window keeps the plot", function()
+    local services = boot()
+    local ash = join(services, "Ash", 1)
+    local sanctum = sanctumOf(services, ash)
+    Mock.advance(120)
+    local earned = sanctum.State.Essence
+
+    Mock.removePlayer(ash)
+    Mock.advance(GameConfig.Plot.ReleaseGraceSeconds / 2)
+    local again = join(services, "Ash", 1)
+    local reclaimed = sanctumOf(services, again)
+    t.truthy(reclaimed)
+    t.gt(reclaimed.State.Essence, earned * 0.5,
+        "a dropped connection must not cost an hour of progress")
+end)
+
+t.test("releasing an unknown player is harmless", function()
+    local services = boot()
+    local stranger = Mock.addPlayer("Stranger", 999)
+    t.noThrow(function() services.PlotService:ReleaseOccupant(stranger) end)
+    t.noThrow(function() services.PlotService:ReleaseOccupant(nil) end)
+    t.noThrow(function() services.PlotService:GetSanctumForPlayer(nil) end)
+    t.noThrow(function() services.PlotService:MarkDirty(nil) end)
+    t.noThrow(function() services.PlotService:RequestLink(nil, nil) end)
+    t.noThrow(function() services.PlotService:ResolveLink(nil, nil, true) end)
+end)
+
+t.test("a forged LinkResponse cannot join a plot that never offered", function()
+    local services = boot()
+    local ash = join(services, "Ash", 1)
+    local bree = join(services, "Bree", 2)
+    local host = sanctumOf(services, ash)
+    -- No RequestLink was ever made. The remote names a plot, never an outcome.
+    Mock.fireServer("LinkResponse", bree, { PlotId = host.Id, Accept = true })
+    Mock.advance(0)
+    t.eq(#services.PlotService:GetOccupants(host), 1, "acceptance requires a pending offer")
+
+    for _, payload in ipairs({ { PlotId = 9999, Accept = true }, { PlotId = -1, Accept = true } }) do
+        t.noThrow(function() Mock.fireServer("LinkResponse", bree, payload) end)
+    end
+end)
+
+t.test("a solo player CAN link out -- this is the whole two-player hook", function()
+    -- Regression guard. Every player auto-claims a Sanctum the moment their Profile loads, so a
+    -- "you already have a plot" gate on linking makes co-op play unreachable: the feature the game
+    -- is named for would refuse every request in production while every unit test still passed.
+    local services = boot()
+    local ash = join(services, "Ash", 1)
+    local bree = join(services, "Bree", 2)
+    local host = sanctumOf(services, ash)
+    t.truthy(sanctumOf(services, bree), "the joiner starts with a plot of their own, as everyone does")
+
+    local ok, reason = services.PlotService:RequestLink(bree, host)
+    t.truthy(ok, "a solo player must be able to ask: " .. tostring(reason))
+    services.PlotService:ResolveLink(ash, host, true)
+    Mock.advance(0)
+    t.eq(#services.PlotService:GetOccupants(host), 2)
+end)
+
+t.test("linking out frees the joiner's old sanctum for someone else", function()
+    local services = boot()
+    local ash = join(services, "Ash", 1)
+    local bree = join(services, "Bree", 2)
+    local host = sanctumOf(services, ash)
+    local vacated = sanctumOf(services, bree)
+
+    services.PlotService:RequestLink(bree, host)
+    services.PlotService:ResolveLink(ash, host, true)
+    Mock.advance(0)
+    t.eq(#services.PlotService:GetOccupants(vacated), 0, "their old plot is empty")
+
+    -- A deliberate move is not a disconnect, so the plot must not stay reserved for them.
+    local cass = join(services, "Cass", 3)
+    t.truthy(sanctumOf(services, cass), "a new player can take it")
+end)
+
+t.test("a player with a partner cannot link out and strand them", function()
+    local services = boot()
+    local ash = join(services, "Ash", 1)
+    local bree = join(services, "Bree", 2)
+    local cass = join(services, "Cass", 3)
+    local pairPlot = sanctumOf(services, ash)
+    local third = sanctumOf(services, cass)
+
+    services.PlotService:RequestLink(bree, pairPlot)
+    services.PlotService:ResolveLink(ash, pairPlot, true)
+    Mock.advance(0)
+    t.eq(#services.PlotService:GetOccupants(pairPlot), 2)
+
+    -- Bree now has a partner. Linking away would leave Ash in a state about to be merged elsewhere.
+    local ok = services.PlotService:RequestLink(bree, third)
+    t.falsy(ok, "leaving a partner behind by linking is refused")
+    t.eq(#services.PlotService:GetOccupants(pairPlot), 2)
+end)
+
+t.test("the accept-time recheck catches a partner arriving during the confirmation window", function()
+    local services = boot()
+    local ash = join(services, "Ash", 1)
+    local bree = join(services, "Bree", 2)
+    local cass = join(services, "Cass", 3)
+    local host = sanctumOf(services, ash)
+    local breePlot = sanctumOf(services, bree)
+
+    -- Bree asks to join Ash while still alone...
+    t.truthy(services.PlotService:RequestLink(bree, host))
+    -- ...then Cass links into Bree's plot before Ash answers.
+    services.PlotService:RequestLink(cass, breePlot)
+    services.PlotService:ResolveLink(bree, breePlot, true)
+    Mock.advance(0)
+    t.eq(#services.PlotService:GetOccupants(breePlot), 2)
+
+    -- Ash accepts now. Every gate is re-checked against live state, so Bree must not be moved.
+    services.PlotService:ResolveLink(ash, host, true)
+    Mock.advance(0)
+    t.eq(#services.PlotService:GetOccupants(host), 1, "Cass would have been stranded")
+    t.eq(sanctumOf(services, bree).Id, breePlot.Id)
 end)
 
 --#endregion

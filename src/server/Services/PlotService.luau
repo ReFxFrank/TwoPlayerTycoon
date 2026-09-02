@@ -65,8 +65,6 @@ local function plotOf(sanctum: any): Plot?
 	return if plot ~= nil and plot.Sanctum == sanctum then plot else nil
 end
 
---[[ Public API ]]
-
 function Service:GetSanctum(id: any): Sanctum?
 	local plot = if type(id) == "number" then byId[id] else nil
 	return if plot ~= nil then plot.Sanctum else nil
@@ -119,6 +117,7 @@ end
 function Service:RebuildSanctum(sanctum: any): ()
 	local plot = plotOf(sanctum)
 	if plot == nil then return end
+	PlotSession.ensureSeed(plot) -- the cold-start invariant, restored before anything reads the state
 	plot:Rebuild()
 	-- PurchaseService is registered AFTER this service, so it is resolved lazily; TryGet, never Get,
 	-- because Get errors by design and this runs on paths that must not throw.
