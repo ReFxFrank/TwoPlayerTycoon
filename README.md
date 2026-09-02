@@ -14,12 +14,17 @@ reference game was used for genre structure only.
 
 ## Quick start
 
+**Just want to play it?** Open `SanctumOfEmbers.rbxlx` in Roblox Studio and press Play. It is a
+built place file committed alongside the source, so nothing needs installing.
+
+**Working on it?**
+
 ```bash
 rokit install                    # rojo, stylua, selene, lune
 rojo serve                       # then connect from Roblox Studio and Play
 ```
 
-Or build a place file directly:
+Rebuild the place file after changing anything under `src/`:
 
 ```bash
 rojo build -o SanctumOfEmbers.rbxlx
@@ -31,7 +36,8 @@ Run the tests (needs Node 18+ and the [Luau CLI](https://github.com/luau-lang/lu
 ./tests/run.sh
 ```
 
-The whole game server runs headlessly — see [docs/TESTING.md](docs/TESTING.md).
+That syntax-checks every file, enforces the house rules, and runs 285 tests — the whole game server
+executes headlessly against a mock Roblox environment. See [docs/TESTING.md](docs/TESTING.md).
 
 ---
 
@@ -107,7 +113,22 @@ profile, so a transient outage can never overwrite real data with a blank one.
 
 ## Status
 
-Built to the v1 brief. Out of scope by design: trading between Sanctums, real developer-product
-purchases (the code is structured for them — permanent progression is already separate from
-resettable state — but nothing is wired), deep mobile UI polish, and custom art beyond blocky
-placeholders.
+Complete against the v1 brief, and verified rather than asserted. `tests/specs/integration.spec.luau`
+boots the real `Bootstrap.server.luau`, joins two players through `PlayerAdded`, links them, buys
+from in-world pads by triggering the actual ProximityPrompts, attunes through all six stages, picks
+an affinity, transcends on a consensus vote, and reloads everything after a simulated server
+restart — then fires hostile payloads at every remote and checks that essence, stage and prestige
+did not move.
+
+Two bugs that only an end-to-end test could find were fixed on the way:
+
+- **Linking was unreachable.** Every player auto-claims a Sanctum on join, and the link gate refused
+  anyone who already had one — so the two-player hook would have refused every request in
+  production while every module's own tests passed.
+- **Joining never loaded a profile.** Nothing called `ProfileService:LoadAsync`, so the whole chain
+  that hangs off `ProfileLoaded` — claiming a plot, leaderstats, replication — never started.
+
+Out of scope by design: trading between Sanctums, real developer-product purchases (the code is
+structured for them — permanent progression is already separate from resettable state — but nothing
+is wired), deep mobile UI polish, and custom art beyond blocky placeholders. Audio is fully wired
+but silent: drop asset ids into the one table at the top of `SoundController` and it plays.
