@@ -4,6 +4,9 @@ Every entry here is a fork in the road where more than one answer was defensible
 document is not to argue that the chosen answer is the only one — it is to record what was traded
 away, so a future change can be made deliberately.
 
+**Status:** every decision below has been reviewed and confirmed by the project owner. Where a
+choice was put to them explicitly, the alternatives they were offered are listed with it.
+
 ---
 
 ## 1. Theme: Elemental Creatures
@@ -46,6 +49,11 @@ individual effort — you can still see who carried.
 socially (contribution is visible) rather than mechanically, because an anti-freeloader rule would
 also punish a partner who joined late or went AFK for a minute.
 
+**Server size:** 12 players, six Sanctums on a 240-stud grid. Small enough that a plot always feels
+like yours and that six simultaneous mote simulations stay cheap. *Alternatives considered: 24
+players / twelve Sanctums (busier, doubles simulation load, would need the mote cap revisited); 8
+players / four Sanctums (cheapest, but a full server turns partners away, which hurts the hook).*
+
 ---
 
 ## 3. Linked plots with max-merge, not independent half-plots
@@ -64,7 +72,8 @@ Upgrades[id]     = max(a[id], b[id])   for every id
 Sections         = union
 ```
 
-Max-merge is the important part. The obvious alternatives both have a victim:
+Max-merge is the important part. *Both alternatives were put to the project owner and rejected;
+each has a victim:*
 
 - *Joiner adopts the host's state* — a player with more progress loses it by being sociable.
 - *Joiner keeps their own, host's plot is ignored* — then it is not a shared plot at all.
@@ -155,7 +164,11 @@ gets a `Debris:AddItem` lifetime as a leak backstop.
 
 A shared plot with a unilateral reset button is a griefing tool. Requiring consensus turns the
 biggest decision in the game into the one that most needs a conversation, which is the point of a
-two-player mode.
+two-player mode. A solo occupant's single yes is unanimous, so playing alone is never blocked.
+
+*Alternatives considered: either occupant can trigger it (simpler, no vote UI — but one player can
+erase an hour of the other's work with one prompt); only the original claimer decides (unambiguous
+authority, but the partner has no say in the biggest decision affecting a plot they built).*
 
 ---
 
@@ -186,6 +199,49 @@ Every profile carries `SchemaVersion`. `StateSchema.migrate` dispatches on it an
 `StateSchema.sanitizeProfile` repairs anything that arrives malformed — the version field is what
 makes the *next* change safe, and the sanitiser is what makes a corrupt or tampered save a
 non-event instead of a crash loop.
+
+---
+
+---
+
+## 13. Pacing: ~55 minutes to transcend-ready
+
+Verified by simulation rather than guessed: first purchase at 34s, Stage 2 at 4.3 min, Stage 6 at
+52 min, transcend-ready at 55 min — dropping to ~15 min for two four-rebirth players. Long enough
+that reaching Primordial feels earned, short enough to reach in one sitting.
+
+*Alternatives considered: ~25 minutes (better for an audience that decides in ten minutes, but the
+mid-game thins out and the six stages start to blur); ~2 hours (makes rebirth multipliers matter
+more and suits a return-daily audience, riskier for first-visit retention).*
+
+The numbers in `src/shared/*Data.luau` are the tuning. Changing pacing means changing them, not
+adding a global multiplier.
+
+---
+
+## 14. The data-reset button is Studio-only
+
+The settings menu has a hold-to-confirm "reset my save" action. It is gated twice:
+`GameConfig.Debug.AllowDataReset` compiles the feature in at all, and
+`GameConfig.Debug.DataResetStudioOnly` keeps it out of players' reach on a live server.
+`ProfileService` enforces this authoritatively; `SettingsController` hides the button under the same
+condition. Both checks exist because the client hiding a button is a courtesy, not a control.
+
+*Alternatives considered: ship it to players (some tycoons do — accept that a few will destroy their
+save and ask for it back); remove it entirely (smallest attack surface, but test data then has to be
+cleared by hand through the DataStore).*
+
+---
+
+## 15. Audio is wired but silent
+
+`SoundController`, the Music/SFX toggles and every play call are complete. Every Roblox asset id
+lives in one table at the top of the file, empty and marked `TODO`. A missing id makes the call a
+silent no-op rather than an error, so the game is fully playable before any audio exists and becomes
+audible the moment ids are filled in.
+
+Inventing plausible-looking asset ids was rejected: an id that cannot be verified is either silent
+anyway or, worse, the wrong sound shipped confidently.
 
 ---
 

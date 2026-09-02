@@ -70,7 +70,13 @@ local GameConfig = {
 	Debug = {
 		Enabled = false, -- verbose server logging
 		FastMode = false, -- income x FastIncomeMultiplier, costs / FastCostDivisor (Economy honours it)
-		AllowDataReset = true, -- gates the ResetData remote entirely
+		-- Two-part gate on the destructive "reset my save" action. AllowDataReset compiles the
+		-- feature in at all; DataResetStudioOnly keeps it out of players' reach on a live server
+		-- while leaving it available while developing. GameConfig stays pure, so the RunService
+		-- check itself lives in ProfileService (authoritative) and SettingsController (hides the
+		-- button) rather than here.
+		AllowDataReset = true,
+		DataResetStudioOnly = true,
 		FastIncomeMultiplier = 25, -- magnitude of the FastMode income boost
 		FastCostDivisor = 10, -- magnitude of the FastMode cost reduction
 	},
