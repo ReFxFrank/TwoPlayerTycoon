@@ -172,12 +172,17 @@ ENV.warn = function(...)
 end
 
 local realOs = os
+-- os.clock must ride the VIRTUAL clock, not the process clock. Roblox code legitimately uses it as
+-- a monotonic timer (RateLimiter's token buckets do), and a passthrough would leave that code
+-- frozen at ~0 no matter how far a test advanced time -- silently untestable.
 ENV.os = setmetatable({
     time = function() return EPOCH + math.floor(scheduler.now) end,
-    clock = function() return realOs.clock() end,
+    clock = function() return scheduler.now end,
     date = realOs.date,
     difftime = realOs.difftime,
 }, { __index = realOs })
+-- The test runner still needs real wall-clock time to report how long a run took.
+ENV.__realClock = realOs.clock
 
 -------------------------------------------------------------------------------
 -- Service registry

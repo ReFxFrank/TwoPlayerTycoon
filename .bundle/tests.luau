@@ -1391,12 +1391,17 @@ ENV.warn = function(...)
 end
 
 local realOs = os
+-- os.clock must ride the VIRTUAL clock, not the process clock. Roblox code legitimately uses it as
+-- a monotonic timer (RateLimiter's token buckets do), and a passthrough would leave that code
+-- frozen at ~0 no matter how far a test advanced time -- silently untestable.
 ENV.os = setmetatable({
     time = function() return EPOCH + math.floor(scheduler.now) end,
-    clock = function() return realOs.clock() end,
+    clock = function() return scheduler.now end,
     date = realOs.date,
     difftime = realOs.difftime,
 }, { __index = realOs })
+-- The test runner still needs real wall-clock time to report how long a run took.
+ENV.__realClock = realOs.clock
 
 -------------------------------------------------------------------------------
 -- Service registry
@@ -2127,7 +2132,9 @@ end
 function Testing.runAll(specs, Mock, loadModule, runScript)
     local passed, failed = 0, 0
     local failures = {}
-    local started = os.clock()
+    -- os.clock is the mock's virtual clock; the runner wants real elapsed time.
+    local wallClock = __realClock or os.clock
+    local started = wallClock()
 
     for _, spec in ipairs(specs) do
         local context = newContext()
@@ -2155,7 +2162,7 @@ function Testing.runAll(specs, Mock, loadModule, runScript)
         end
     end
 
-    print(("\n%s\n%d passed, %d failed in %.2fs"):format(("-"):rep(60), passed, failed, os.clock() - started))
+    print(("\n%s\n%d passed, %d failed in %.2fs"):format(("-"):rep(60), passed, failed, wallClock() - started))
     if failed > 0 then
         print("\nFailures:")
         for _, failure in ipairs(failures) do
@@ -2720,7 +2727,13 @@ type RateLimiterService = {
 	Init: (self: RateLimiterService, registry: any) -> (),
 	Start: (self: RateLimiterService) -> (),
 	Stop: (self: RateLimiterService) -> (),
-	Consume: (self: RateLimiterService, player: Player, key: string, tokens: number, interval: number) -> boolean,
+	Consume: (
+		self: RateLimiterService,
+		player: Player,
+		key: string,
+		tokens: number,
+		interval: number
+	) -> boolean,
 	Reset: (self: RateLimiterService, player: Player) -> (),
 	Stats: (self: RateLimiterService, player: Player) -> { [string]: number },
 }
@@ -4538,6 +4551,204 @@ return RebirthData
 
 --#endregion
 end
+MODULE_ORDER[#MODULE_ORDER + 1] = { Path = "ReplicatedStorage/Modules/RemoteSchema", Class = "ModuleScript", File = "src/shared/RemoteSchema.luau" }
+MODULE_DEFS["ReplicatedStorage/Modules/RemoteSchema"] = function(script, require, ...)
+--#region src/shared/RemoteSchema.luau
+--!strict
+--[[
+    RemoteSchema
+    The wire contract: every RemoteEvent the game owns, declared exactly once so RemoteService (which
+    creates them) and ClientBootstrap (which looks them up) can never disagree about a name, a
+    direction, a rate limit or a payload shape. Client -> server entries carry a token-bucket budget
+    and a total validator; server -> client entries carry neither, because the server is trusted.
+    Owner: shared  |  Consumers: RemoteService, RateLimiter, ClientBootstrap, every controller, tests
+]]
+--[[ WHY THE SURFACE IS THIS SMALL (§1.7). Purchases run through server-listened ProximityPrompts,
+     so there is no client -> server message that names an amount, a price or a plot to charge. What
+     is left is intent only: a vote, a choice between four literal ids, two booleans and a refresh.
+     Every validator below is TOTAL -- it returns false instead of erroring on any input, including
+     userdata and tables with hostile metatables -- because an error thrown inside a remote handler
+     is a free denial of service. Every validator also REJECTS EXTRA KEYS: a payload padded with
+     junk is an attempt to smuggle a field past a future handler that reads it. ]]
+
+local Validate = require(script.Parent.Validate)
+local GameConfig = require(script.Parent.GameConfig)
+local AffinityData = require(script.Parent.AffinityData)
+
+type RemoteDef = {
+	Name: string,
+	Direction: "ServerToClient" | "ClientToServer",
+	RateLimit: { Tokens: number, Interval: number }?, -- ClientToServer only
+	Validate: ((payload: any) -> (boolean, string?))?, -- ClientToServer only
+}
+
+local RemoteSchema = {}
+RemoteSchema.FolderName = "SanctumRemotes"
+
+local S2C: "ServerToClient" = "ServerToClient"
+local C2S: "ClientToServer" = "ClientToServer"
+
+-- Wraps a checker so it can never throw: a metatable whose __index errors, a userdata payload or a
+-- deeply nested table all collapse to a clean rejection instead of unwinding the handler.
+local function total(check: (payload: any) -> (boolean, string?)): (payload: any) -> (boolean, string?)
+	return function(payload: any): (boolean, string?)
+		local ok, accepted, reason = pcall(check, payload)
+		if not ok then
+			return false, "validator error"
+		end
+		if accepted == true then
+			return true, nil
+		end
+		return false, if type(reason) == "string" then reason else "rejected"
+	end
+end
+
+-- Shape first (exact fields, exact kinds, no extras), then any value-level rule.
+local function shaped(shape: { [string]: string }, extra: ((payload: any) -> (boolean, string?))?)
+	return total(function(payload: any): (boolean, string?)
+		local ok, reason = Validate.payload(payload, shape)
+		if not ok then
+			return false, reason
+		end
+		if extra ~= nil then
+			return extra(payload)
+		end
+		return true, nil
+	end)
+end
+
+-- Plot ids are indices into the server's sanctum array. Bounding them here means a forged id can
+-- never reach a table lookup, and a float ("PlotId = 1.5") can never alias slot 1.
+local function isPlotId(value: any): boolean
+	return type(value) == "number"
+		and value == value
+		and value % 1 == 0
+		and value >= 1
+		and value <= GameConfig.Plot.SanctumCount
+end
+
+RemoteSchema.Remotes = {
+	--[[ Server -> client. No RateLimit and no Validate: these are produced by trusted code, and a
+	     validator on this side would only cost CPU on the hot replication path. ]]
+	StateSync = { Name = "StateSync", Direction = S2C }, -- §7 snapshot; the highest-frequency remote
+	Notify = { Name = "Notify", Direction = S2C }, -- { Kind = "info"|"success"|"warn"|"error", Text }
+	Fx = { Name = "Fx", Direction = S2C }, -- { Kind = "attune"|"transcend"|"purchase"|"link", PlotId, Data? }
+	LinkOffer = { Name = "LinkOffer", Direction = S2C }, -- { PlotId, FromUserId, FromName, ExpiresAt }
+	RebirthVoteState = { Name = "RebirthVoteState", Direction = S2C }, -- { PlotId, Votes, ExpiresAt, Names }
+
+	--[[ Client -> server. Budgets are sized at "a human mashing the button", not "a script": each
+	     one is a few times the fastest honest rate, so a real player never notices and a spammer is
+	     throttled before the handler runs. ]]
+
+	-- A resync button and the reconnect path both fire this; 4 per 5s absorbs an impatient
+	-- double-tap while capping the cost of forcing a full snapshot rebuild.
+	RequestSnapshot = {
+		Name = "RequestSnapshot",
+		Direction = C2S,
+		RateLimit = { Tokens = 4, Interval = 5 },
+		-- an empty shape accepts only nil or {}; anything carried here is an attempt to smuggle
+		-- arguments into a handler that takes none
+		Validate = shaped({}),
+	},
+
+	-- The consensus vote (§1.8). Accept is the WHOLE payload: the sanctum is derived from the
+	-- player's occupancy server-side, so nobody can vote in someone else's transcendence.
+	RebirthVote = {
+		Name = "RebirthVote",
+		Direction = C2S,
+		RateLimit = { Tokens = 5, Interval = 10 },
+		Validate = shaped({ Accept = "boolean" }),
+	},
+
+	-- Permanent for the run, so it is checked against the catalogue rather than a pattern: only the
+	-- four literal ids are accepted, and "id" already bounds length and character set.
+	ChooseAffinity = {
+		Name = "ChooseAffinity",
+		Direction = C2S,
+		RateLimit = { Tokens = 4, Interval = 10 },
+		Validate = shaped({ Affinity = "id" }, function(payload: any): (boolean, string?)
+			if not AffinityData.isValid((payload :: any).Affinity) then
+				return false, "unknown affinity"
+			end
+			return true, nil
+		end),
+	},
+
+	-- Cosmetic, but still validated: Key is a closed set because it is used to index the saved
+	-- Settings table, and an arbitrary string there would write a field the sanitiser then drops.
+	SetSetting = {
+		Name = "SetSetting",
+		Direction = C2S,
+		RateLimit = { Tokens = 10, Interval = 10 },
+		Validate = shaped({ Key = "string", Value = "boolean" }, function(payload: any): (boolean, string?)
+			local key = (payload :: any).Key
+			if key ~= "Music" and key ~= "Sfx" then
+				return false, "unknown setting"
+			end
+			return true, nil
+		end),
+	},
+
+	-- Answer to a LinkOffer. PlotId is bounded so a decline for a sanctum the player was never
+	-- offered cannot index past the array; the server still re-checks that an offer is pending.
+	LinkResponse = {
+		Name = "LinkResponse",
+		Direction = C2S,
+		RateLimit = { Tokens = 5, Interval = 10 },
+		Validate = shaped({ PlotId = "number", Accept = "boolean" }, function(payload: any): (boolean, string?)
+			if not isPlotId((payload :: any).PlotId) then
+				return false, "plot id out of range"
+			end
+			return true, nil
+		end),
+	},
+
+	-- Destructive and irreversible, so it is the tightest budget in the game and is refused outright
+	-- unless the build opted in. Confirm must be literally true: a truthy 1 or "yes" is rejected, so
+	-- a mistyped client cannot wipe a profile.
+	ResetData = {
+		Name = "ResetData",
+		Direction = C2S,
+		RateLimit = { Tokens = 1, Interval = 30 },
+		Validate = shaped({ Confirm = "boolean" }, function(payload: any): (boolean, string?)
+			if GameConfig.Debug.AllowDataReset ~= true then
+				return false, "data reset disabled"
+			end
+			if (payload :: any).Confirm ~= true then
+				return false, "confirmation required"
+			end
+			return true, nil
+		end),
+	},
+} :: { [string]: RemoteDef }
+
+-- Deterministic creation order for RemoteService (and for the specs): server -> client first, so a
+-- client that is already listening cannot miss an early push while the C2S events are still being
+-- created, then alphabetical inside each direction.
+RemoteSchema.List = {} :: { RemoteDef }
+for _, def in pairs(RemoteSchema.Remotes) do
+	table.insert(RemoteSchema.List, def)
+end
+table.sort(RemoteSchema.List, function(a: RemoteDef, b: RemoteDef): boolean
+	if a.Direction ~= b.Direction then
+		return a.Direction == S2C
+	end
+	return a.Name < b.Name
+end)
+
+function RemoteSchema.get(name: string): RemoteDef?
+	-- typed guard: `Remotes[name]` with a non-string would be a silent nil, and callers use the nil
+	-- as "this remote does not exist" -- which is exactly what an unknown name should look like
+	if type(name) ~= "string" then
+		return nil
+	end
+	return RemoteSchema.Remotes[name]
+end
+
+return RemoteSchema
+
+--#endregion
+end
 MODULE_ORDER[#MODULE_ORDER + 1] = { Path = "ReplicatedStorage/Modules/SectionData", Class = "ModuleScript", File = "src/shared/SectionData.luau" }
 MODULE_DEFS["ReplicatedStorage/Modules/SectionData"] = function(script, require, ...)
 --#region src/shared/SectionData.luau
@@ -5962,6 +6173,372 @@ Mock.installModules(MODULE_ORDER, MODULE_DEFS)
 local loadModule = Mock.loadModule
 local runScript = Mock.runScript
 local SPECS = {}
+SPECS[#SPECS + 1] = { Name = "clientstore.spec", Run = function(t, Mock, loadModule, runScript)
+--#region tests/specs/clientstore.spec.luau
+--[[
+    clientstore.spec
+    Every HUD element observes a path on this store, so a missed or spurious notification is either
+    a stale number on screen or a per-frame UI rebuild. Both are worth a test.
+]]
+
+local ClientStore = loadModule("ReplicatedStorage/Modules/ClientStore")
+
+t.test("a fresh store returns a usable default snapshot, never nil", function()
+    local store = ClientStore.new()
+    local snapshot = store:Get()
+    t.truthy(type(snapshot) == "table", "Get() is total")
+    t.eq(snapshot.Essence, 0)
+    t.eq(snapshot.Full, false)
+    t.eq(snapshot.Plot.Stage, 1, "the default has the right SHAPE so no controller needs a nil check")
+    t.deepEq(snapshot.Plot.Sections, {}, "but claims nothing is unlocked yet")
+    t.eq(store:GetPath("Nothing.Here.At.All"), nil, "unknown paths are nil, not an error")
+end)
+
+t.test("Set replaces the snapshot and fires Changed with old and new", function()
+    local store = ClientStore.new()
+    local seen = {}
+    store.Changed:Connect(function(new, old)
+        table.insert(seen, { New = new.Essence, Old = old and old.Essence })
+    end)
+    store:Set({ Full = true, Essence = 100, Plot = { Stage = 2 } })
+    store:Set({ Full = true, Essence = 250, Plot = { Stage = 2 } })
+    Mock.advance(0)
+
+    t.eq(#seen, 2)
+    t.eq(seen[2].New, 250)
+    t.eq(seen[2].Old, 100, "the previous snapshot is passed through for diffing")
+    t.eq(store:Get().Essence, 250)
+end)
+
+t.test("GetPath walks dotted paths and stops safely at a missing segment", function()
+    local store = ClientStore.new()
+    store:Set({ Essence = 5, Plot = { Stage = 3, Droppers = { ember_vent = 2 } } })
+    t.eq(store:GetPath("Essence"), 5)
+    t.eq(store:GetPath("Plot.Stage"), 3)
+    t.eq(store:GetPath("Plot.Droppers.ember_vent"), 2)
+    t.eq(store:GetPath("Plot.Missing.Deep"), nil)
+    t.eq(store:GetPath("Essence.Nope"), nil, "indexing through a scalar is nil, not an error")
+    t.noThrow(function() return store:GetPath("") end)
+    t.noThrow(function() return store:GetPath(nil) end)
+end)
+
+t.test("Observe fires immediately with the current value", function()
+    local store = ClientStore.new()
+    store:Set({ Essence = 42 })
+    local seen = {}
+    store:Observe("Essence", function(value) table.insert(seen, value) end)
+    Mock.advance(0)
+    t.deepEq(seen, { 42 }, "an observer sees the current value without waiting for a change")
+end)
+
+t.test("Observe only re-fires when the observed value actually changes", function()
+    local store = ClientStore.new()
+    store:Set({ Essence = 1, Plot = { Stage = 1 } })
+    local stageUpdates = {}
+    store:Observe("Plot.Stage", function(value) table.insert(stageUpdates, value) end)
+    Mock.advance(0)
+
+    -- Essence ticks every replication frame; a stage observer must ignore all of it.
+    for essence = 2, 20 do
+        store:Set({ Essence = essence, Plot = { Stage = 1 } })
+    end
+    Mock.advance(0)
+    t.deepEq(stageUpdates, { 1 }, "19 essence updates produced no stage rebuilds")
+
+    store:Set({ Essence = 21, Plot = { Stage = 2 } })
+    Mock.advance(0)
+    t.deepEq(stageUpdates, { 1, 2 })
+end)
+
+t.test("Observe compares tables by value, not by identity", function()
+    local store = ClientStore.new()
+    store:Set({ Plot = { Droppers = { ember_vent = 1 } } })
+    local updates = 0
+    store:Observe("Plot.Droppers", function() updates += 1 end)
+    Mock.advance(0)
+    t.eq(updates, 1)
+
+    -- A fresh table with identical contents arrives every snapshot; that is not a change.
+    store:Set({ Plot = { Droppers = { ember_vent = 1 } } })
+    Mock.advance(0)
+    t.eq(updates, 1, "an equal-but-distinct table must not retrigger the observer")
+
+    store:Set({ Plot = { Droppers = { ember_vent = 2 } } })
+    Mock.advance(0)
+    t.eq(updates, 2)
+end)
+
+t.test("Observe returns a connection that stops delivery", function()
+    local store = ClientStore.new()
+    store:Set({ Essence = 1 })
+    local updates = 0
+    local connection = store:Observe("Essence", function() updates += 1 end)
+    Mock.advance(0)
+    connection:Disconnect()
+    store:Set({ Essence = 2 })
+    Mock.advance(0)
+    t.eq(updates, 1)
+end)
+
+t.test("a partial (essence-only) snapshot does not erase the last full one", function()
+    -- StateReplicator sends Full=false ticks between full snapshots. If those wiped Plot, the HUD
+    -- would flicker back to defaults twice a second.
+    local store = ClientStore.new()
+    store:Set({ Full = true, Essence = 100, Plot = { Stage = 4 }, Occupants = { { Name = "Ash" } } })
+    store:Set({ Full = false, Essence = 140 })
+    Mock.advance(0)
+    t.eq(store:GetPath("Essence"), 140, "the fast field updates")
+    t.eq(store:GetPath("Plot.Stage"), 4, "the last full payload survives a partial tick")
+    t.eq(store:GetPath("Occupants.1.Name"), "Ash")
+end)
+
+t.test("a malformed snapshot cannot break the store", function()
+    local store = ClientStore.new()
+    for _, junk in ipairs({ 5, "text", true }) do
+        t.noThrow(function() store:Set(junk) end)
+        t.truthy(type(store:Get()) == "table", "Get() stays total after junk input")
+    end
+    t.noThrow(function() store:Set(nil) end)
+    t.truthy(type(store:Get()) == "table")
+end)
+
+--#endregion
+end }
+SPECS[#SPECS + 1] = { Name = "data.spec", Run = function(t, Mock, loadModule, runScript)
+--#region tests/specs/data.spec.luau
+--[[
+    data.spec
+    Cross-references every shared data table. Content lives in six separate modules, so nothing but
+    a test stops one of them drifting from the others — a dropper gated behind a wing that no longer
+    exists would only show up in-game as an unbuyable pad.
+]]
+
+local DropperData = loadModule("ReplicatedStorage/Modules/DropperData")
+local UpgradeData = loadModule("ReplicatedStorage/Modules/UpgradeData")
+local SectionData = loadModule("ReplicatedStorage/Modules/SectionData")
+local EvolutionData = loadModule("ReplicatedStorage/Modules/EvolutionData")
+local AffinityData = loadModule("ReplicatedStorage/Modules/AffinityData")
+local RebirthData = loadModule("ReplicatedStorage/Modules/RebirthData")
+local GameConfig = loadModule("ReplicatedStorage/Modules/GameConfig")
+
+local function idSet(list)
+    local set = {}
+    for _, entry in ipairs(list) do set[entry.Id] = entry end
+    return set
+end
+
+t.test("every data list has matching List and ById views", function()
+    for label, data in pairs({ Dropper = DropperData, Upgrade = UpgradeData, Section = SectionData, Affinity = AffinityData }) do
+        t.truthy(#data.List > 0, label .. "Data.List is populated")
+        for _, entry in ipairs(data.List) do
+            t.eq(data.ById[entry.Id], entry, ("%s %s is reachable via ById"):format(label, entry.Id))
+            t.eq(data.get(entry.Id), entry, ("%s.get(%q) works"):format(label, entry.Id))
+        end
+        t.eq(data.get("does_not_exist"), nil, label .. ".get returns nil for unknown ids")
+    end
+end)
+
+t.test("ids are unique, lowercase and stable", function()
+    for label, data in pairs({ Dropper = DropperData, Upgrade = UpgradeData, Section = SectionData, Affinity = AffinityData }) do
+        local seen = {}
+        for _, entry in ipairs(data.List) do
+            t.falsy(seen[entry.Id], ("duplicate %s id %q"):format(label, tostring(entry.Id)))
+            seen[entry.Id] = true
+            t.truthy(entry.Id:match("^[a-z0-9_]+$"), ("%s id %q must be lowercase snake_case"):format(label, tostring(entry.Id)))
+            t.truthy(#entry.Name > 0, label .. " " .. entry.Id .. " needs a display name")
+            t.truthy(#entry.Description > 0, label .. " " .. entry.Id .. " needs a description")
+        end
+    end
+end)
+
+t.test("droppers reference real sections and reachable stages", function()
+    local sections = idSet(SectionData.List)
+    for _, dropper in ipairs(DropperData.List) do
+        t.truthy(sections[dropper.RequiredSection],
+            ("dropper %s requires unknown section %q"):format(dropper.Id, tostring(dropper.RequiredSection)))
+        t.truthy(dropper.RequiredStage >= 1 and dropper.RequiredStage <= EvolutionData.MaxStage,
+            ("dropper %s has out-of-range RequiredStage"):format(dropper.Id))
+        t.gt(dropper.BaseCost, 0, dropper.Id .. " BaseCost")
+        t.gt(dropper.BaseValue, 0, dropper.Id .. " BaseValue")
+        t.gt(dropper.Interval, 0, dropper.Id .. " Interval")
+        t.gt(dropper.MaxOwned, 0, dropper.Id .. " MaxOwned")
+        t.truthy(dropper.CostGrowth > 1 and dropper.CostGrowth < 2,
+            ("dropper %s CostGrowth %s should sit between 1 and 2"):format(dropper.Id, tostring(dropper.CostGrowth)))
+    end
+end)
+
+t.test("upgrades reference real sections and cover every effect kind", function()
+    local sections = idSet(SectionData.List)
+    local kinds = {}
+    for _, upgrade in ipairs(UpgradeData.List) do
+        t.truthy(sections[upgrade.RequiredSection],
+            ("upgrade %s requires unknown section %q"):format(upgrade.Id, tostring(upgrade.RequiredSection)))
+        t.gt(upgrade.MaxLevel, 0, upgrade.Id .. " MaxLevel")
+        t.gt(upgrade.BaseCost, 0, upgrade.Id .. " BaseCost")
+        kinds[upgrade.Kind] = true
+    end
+    for _, kind in ipairs({ "RailSpeed", "FontYield", "SpawnRate", "MoteCapacity", "GlobalIncome" }) do
+        t.truthy(kinds[kind], "no upgrade provides the " .. kind .. " effect")
+    end
+end)
+
+t.test("sections form a valid unlock chain rooted at the free base wing", function()
+    local sections = idSet(SectionData.List)
+    t.truthy(sections[SectionData.Base], "SectionData.Base names a real section")
+    t.eq(sections[SectionData.Base].Cost, 0, "the base wing is free")
+    for _, section in ipairs(SectionData.List) do
+        if section.RequiredSection then
+            t.truthy(sections[section.RequiredSection],
+                ("section %s requires unknown section %q"):format(section.Id, tostring(section.RequiredSection)))
+            t.neq(section.RequiredSection, section.Id, "a section cannot require itself")
+        end
+        if section.Id ~= SectionData.Base then
+            t.gt(section.Cost, 0, section.Id .. " should cost something")
+        end
+    end
+end)
+
+t.test("sections do not overlap in world space", function()
+    for indexA, a in ipairs(SectionData.List) do
+        for indexB, b in ipairs(SectionData.List) do
+            if indexA < indexB then
+                local gapX = math.abs(a.Offset.X - b.Offset.X) - (a.Size.X + b.Size.X) / 2
+                local gapZ = math.abs(a.Offset.Z - b.Offset.Z) - (a.Size.Z + b.Size.Z) / 2
+                t.truthy(gapX > -0.001 or gapZ > -0.001,
+                    ("sections %s and %s overlap"):format(a.Id, b.Id))
+            end
+        end
+    end
+end)
+
+t.test("evolution stages are ordered, monotonic and only unlock ids that exist", function()
+    local droppers, upgrades, sections = idSet(DropperData.List), idSet(UpgradeData.List), idSet(SectionData.List)
+    t.eq(#EvolutionData.Stages, 6, "six stages, per the design brief")
+    t.eq(EvolutionData.MaxStage, #EvolutionData.Stages)
+    t.eq(EvolutionData.Stages[1].RequiredEssence, 0, "stage 1 is where every sanctum starts")
+
+    local previous
+    for index, stage in ipairs(EvolutionData.Stages) do
+        t.eq(stage.Index, index, "stage Index matches its position")
+        t.eq(EvolutionData.get(index), stage)
+        if previous then
+            t.gt(stage.RequiredEssence, previous.RequiredEssence, "attunement cost rises with stage " .. index)
+            t.gt(stage.IncomeMultiplier, previous.IncomeMultiplier, "income multiplier rises with stage " .. index)
+            t.truthy(stage.RequiredLifetimeEssence >= previous.RequiredLifetimeEssence,
+                "lifetime requirement never falls at stage " .. index)
+        end
+        for _, id in ipairs(stage.UnlockedDroppers) do
+            t.truthy(droppers[id], ("stage %d unlocks unknown dropper %q"):format(index, id))
+            t.truthy(droppers[id].RequiredStage <= index,
+                ("stage %d unlocks %s but that dropper is gated at stage %d"):format(index, id, droppers[id].RequiredStage))
+        end
+        for _, id in ipairs(stage.UnlockedUpgrades) do
+            t.truthy(upgrades[id], ("stage %d unlocks unknown upgrade %q"):format(index, id))
+        end
+        for _, id in ipairs(stage.UnlockedSections) do
+            t.truthy(sections[id], ("stage %d unlocks unknown section %q"):format(index, id))
+        end
+        previous = stage
+    end
+    t.eq(EvolutionData.next(EvolutionData.MaxStage), nil, "there is nothing past the final stage")
+    t.eq(EvolutionData.next(1), EvolutionData.Stages[2])
+end)
+
+t.test("every dropper and upgrade becomes reachable at some stage", function()
+    local unlockedDroppers, unlockedUpgrades, unlockedSections = {}, {}, {}
+    for _, stage in ipairs(EvolutionData.Stages) do
+        for _, id in ipairs(stage.UnlockedDroppers) do unlockedDroppers[id] = true end
+        for _, id in ipairs(stage.UnlockedUpgrades) do unlockedUpgrades[id] = true end
+        for _, id in ipairs(stage.UnlockedSections) do unlockedSections[id] = true end
+    end
+    for _, dropper in ipairs(DropperData.List) do
+        t.truthy(unlockedDroppers[dropper.Id], ("dropper %s is never unlocked by any stage"):format(dropper.Id))
+    end
+    for _, upgrade in ipairs(UpgradeData.List) do
+        t.truthy(unlockedUpgrades[upgrade.Id], ("upgrade %s is never unlocked by any stage"):format(upgrade.Id))
+    end
+    for _, section in ipairs(SectionData.List) do
+        t.truthy(unlockedSections[section.Id], ("section %s is never unlocked by any stage"):format(section.Id))
+    end
+end)
+
+t.test("affinity unlock stage is inside the stage range", function()
+    t.truthy(EvolutionData.AffinityUnlockStage >= 1 and EvolutionData.AffinityUnlockStage <= EvolutionData.MaxStage)
+    t.eq(#AffinityData.List, 4, "four elemental lines")
+    for _, affinity in ipairs(AffinityData.List) do
+        t.truthy(AffinityData.isValid(affinity.Id))
+        for _, field in ipairs({ "IncomeMultiplier", "SpawnRateMultiplier", "MoteValueMultiplier", "RailSpeedMultiplier" }) do
+            t.gt(affinity[field], 0, ("%s.%s must be positive"):format(affinity.Id, field))
+        end
+    end
+    t.falsy(AffinityData.isValid("plasma"), "unknown affinities are rejected")
+    t.falsy(AffinityData.isValid(nil))
+    t.falsy(AffinityData.isValid(42))
+end)
+
+t.test("affinities are balanced on raw income", function()
+    -- Only these three axes compound into Essence per second. RailSpeed and WalkSpeed are texture:
+    -- they change how the Sanctum feels (motes in flight, traversal) without changing the rate.
+    local min, max = math.huge, -math.huge
+    for _, affinity in ipairs(AffinityData.List) do
+        local income = affinity.IncomeMultiplier * affinity.SpawnRateMultiplier * affinity.MoteValueMultiplier
+        min = math.min(min, income)
+        max = math.max(max, income)
+    end
+    t.lt(max / min, 1.05, "the best and worst income affinity are within 5% of each other")
+end)
+
+t.test("no affinity strictly dominates another", function()
+    -- The real balance property: for every pair there must be an axis where each one wins, so the
+    -- choice is a trade-off rather than a right answer.
+    local AXES = { "IncomeMultiplier", "SpawnRateMultiplier", "MoteValueMultiplier",
+        "RailSpeedMultiplier", "WalkSpeedBonus" }
+    for _, a in ipairs(AffinityData.List) do
+        for _, b in ipairs(AffinityData.List) do
+            if a.Id ~= b.Id then
+                local aWinsSomewhere = false
+                for _, axis in ipairs(AXES) do
+                    if a[axis] > b[axis] then
+                        aWinsSomewhere = true
+                        break
+                    end
+                end
+                t.truthy(aWinsSomewhere, ("%s is strictly dominated by %s"):format(a.Id, b.Id))
+            end
+        end
+    end
+end)
+
+t.test("rebirth badges are ordered and awarded correctly", function()
+    t.eq(RebirthData.RequiredStage, EvolutionData.MaxStage, "transcendence is gated on the final stage")
+    t.truthy(#RebirthData.Badges >= 5, "at least five milestone badges")
+    local previous = -1
+    for _, badge in ipairs(RebirthData.Badges) do
+        t.gt(badge.Rebirths, previous, "badges are listed in ascending order")
+        previous = badge.Rebirths
+    end
+    t.deepEq(RebirthData.badgesFor(0), {}, "nothing is awarded before the first transcendence")
+    local first = RebirthData.Badges[1]
+    t.truthy(RebirthData.badgesFor(first.Rebirths)[first.Id], "the first badge is awarded at its threshold")
+    t.eq(RebirthData.highestBadge(0), nil)
+    t.eq(RebirthData.highestBadge(10000), RebirthData.Badges[#RebirthData.Badges], "the top badge caps out")
+end)
+
+t.test("GameConfig exposes the tunables the rest of the game reads", function()
+    t.eq(GameConfig.Plot.SlotsPerSanctum, 2, "two-player plots")
+    t.gt(GameConfig.Plot.SanctumCount, 0)
+    t.gt(GameConfig.Mote.MaxLivePerSanctum, 0)
+    t.gt(GameConfig.Save.AutosaveSeconds, 0)
+    t.gt(GameConfig.Session.LockStaleSeconds, GameConfig.Save.AutosaveSeconds,
+        "a stale-lock timeout shorter than the autosave interval would steal live sessions")
+    t.gt(GameConfig.Rebirth.VoteWindowSeconds, 0)
+    t.truthy(GameConfig.Mote.MinTravelSeconds < GameConfig.Mote.BaseTravelSeconds)
+    t.falsy(GameConfig.Debug.Enabled, "debug mode must ship off")
+    t.falsy(GameConfig.Debug.FastMode, "fast mode must ship off")
+end)
+
+--#endregion
+end }
 SPECS[#SPECS + 1] = { Name = "datastore.spec", Run = function(t, Mock, loadModule, runScript)
 --#region tests/specs/datastore.spec.luau
 --[[
@@ -6183,6 +6760,1598 @@ t.test("GetStats returns a copy that cannot corrupt the live counters", function
     local stats = Wrapper:GetStats()
     stats.Attempts = 99999
     t.neq(Wrapper:GetStats().Attempts, 99999)
+end)
+
+--#endregion
+end }
+SPECS[#SPECS + 1] = { Name = "economy.spec", Run = function(t, Mock, loadModule, runScript)
+--#region tests/specs/economy.spec.luau
+--[[
+    economy.spec
+    Economy is the pure rules engine both the server (to authorise) and the client (to grey out a
+    button) read from. A disagreement between them is a duplicated bug, so these tests pin the
+    contract: closed-set reason codes, monotonic cost curves, and total functions on hostile input.
+
+    PlotStates are built inline rather than via StateSchema so a failure here points at Economy.
+]]
+
+local Economy = loadModule("ReplicatedStorage/Modules/Economy")
+local DropperData = loadModule("ReplicatedStorage/Modules/DropperData")
+local UpgradeData = loadModule("ReplicatedStorage/Modules/UpgradeData")
+local SectionData = loadModule("ReplicatedStorage/Modules/SectionData")
+local EvolutionData = loadModule("ReplicatedStorage/Modules/EvolutionData")
+local AffinityData = loadModule("ReplicatedStorage/Modules/AffinityData")
+local RebirthData = loadModule("ReplicatedStorage/Modules/RebirthData")
+
+local R = Economy.Reason
+
+local function plot(overrides)
+    local base = {
+        Essence = 0,
+        Stage = 1,
+        Affinity = nil,
+        Droppers = {},
+        Upgrades = {},
+        Sections = { [SectionData.Base] = true },
+        LifetimeEssence = 0,
+    }
+    for key, value in pairs(overrides or {}) do base[key] = value end
+    return base
+end
+
+--- A plot at `stage` with every wing and dropper that stage allows, for gate tests.
+local function plotAtStage(stage, essence)
+    local sections, droppers = {}, {}
+    for _, section in ipairs(SectionData.List) do
+        if section.RequiredStage <= stage then sections[section.Id] = true end
+    end
+    for _, dropper in ipairs(DropperData.List) do
+        if dropper.RequiredStage <= stage then droppers[dropper.Id] = 1 end
+    end
+    return plot({ Stage = stage, Essence = essence or 0, Sections = sections, Droppers = droppers,
+        LifetimeEssence = essence or 0 })
+end
+
+local firstDropper = DropperData.List[1]
+
+-------------------------------------------------------------------------------
+-- Multipliers
+-------------------------------------------------------------------------------
+t.test("prestige multiplier grows linearly and ignores junk", function()
+    t.eq(Economy.getPrestigeMultiplier(0), 1)
+    t.near(Economy.getPrestigeMultiplier(4), 1 + 4 * RebirthData.MultiplierPerRebirth, 1e-9)
+    t.eq(Economy.getPrestigeMultiplier(-5), 1, "negative rebirths cannot shrink income")
+    t.eq(Economy.getPrestigeMultiplier(0 / 0), 1)
+    t.eq(Economy.getPrestigeMultiplier(nil), 1)
+    t.eq(Economy.getPrestigeMultiplier("10"), 1)
+end)
+
+t.test("a partner's prestige adds to the shared sanctum multiplier", function()
+    local solo = Economy.getSanctumPrestigeMultiplier({ 4 })
+    local pair = Economy.getSanctumPrestigeMultiplier({ 4, 4 })
+    t.gt(pair, solo, "two veterans out-earn one — this is the co-op hook")
+    t.near(pair, 1 + 2 * (4 * RebirthData.MultiplierPerRebirth), 1e-9)
+    t.eq(Economy.getSanctumPrestigeMultiplier({}), 1, "an empty sanctum is neutral, not zero")
+    t.eq(Economy.getSanctumPrestigeMultiplier(nil), 1)
+    t.noThrow(function() return Economy.getSanctumPrestigeMultiplier({ 0 / 0, "x", -3 }) end)
+end)
+
+t.test("getMultipliers reflects stage, affinity and upgrades", function()
+    local base = Economy.getMultipliers(plot(), {})
+    t.eq(base.Stage, EvolutionData.Stages[1].IncomeMultiplier)
+    t.eq(base.Affinity, 1, "no affinity chosen yet is neutral")
+    t.eq(base.Debug, 1, "debug multiplier is off in shipping config")
+
+    local late = Economy.getMultipliers(plot({ Stage = 5, Affinity = "ember" }), {})
+    t.gt(late.Stage, base.Stage)
+    t.eq(late.Affinity, AffinityData.ById.ember.IncomeMultiplier)
+    t.gt(Economy.totalMultiplier(late), Economy.totalMultiplier(base))
+end)
+
+t.test("totalMultiplier degrades gracefully on a partial or corrupt table", function()
+    t.eq(Economy.totalMultiplier({}), 1, "missing fields read as neutral, never zero")
+    t.eq(Economy.totalMultiplier(nil), 1)
+    t.gt(Economy.totalMultiplier({ Stage = 2 }), 1)
+    local runaway = Economy.totalMultiplier({ Prestige = math.huge, Stage = math.huge })
+    t.truthy(runaway == runaway and runaway ~= math.huge, "a runaway multiplier is clamped finite")
+end)
+
+t.test("upgradeLevel and upgradeEffect only count known upgrades", function()
+    local upgrade = UpgradeData.List[1]
+    local state = plot({ Upgrades = { [upgrade.Id] = 3, not_a_real_upgrade = 999 } })
+    t.eq(Economy.upgradeLevel(state, upgrade.Id), 3)
+    t.eq(Economy.upgradeLevel(state, "not_a_real_upgrade"), 0, "unknown ids contribute nothing")
+    t.eq(Economy.upgradeLevel(state, nil), 0)
+    t.near(Economy.upgradeEffect(state, upgrade.Kind), upgrade.PerLevel * 3, 1e-9)
+    t.eq(Economy.upgradeEffect(state, "NotAKind"), 0)
+end)
+
+-------------------------------------------------------------------------------
+-- Cost curves
+-------------------------------------------------------------------------------
+t.test("dropper cost grows geometrically and is always a positive integer", function()
+    local previous = 0
+    for owned = 0, 12 do
+        local cost = Economy.getDropperCost(firstDropper, owned)
+        t.gt(cost, previous, "cost strictly rises with the number owned")
+        t.eq(cost, math.floor(cost), "costs are whole numbers")
+        previous = cost
+    end
+    t.eq(Economy.getDropperCost(firstDropper, 0), math.floor(firstDropper.BaseCost))
+end)
+
+t.test("cost helpers never return NaN, inf or a negative for junk input", function()
+    for _, owned in ipairs({ -5, 0 / 0, math.huge, 1e308 }) do
+        local cost = Economy.getDropperCost(firstDropper, owned)
+        t.truthy(cost == cost, "not NaN")
+        t.truthy(cost >= 0 and cost < math.huge, ("cost stayed finite and non-negative: %s"):format(tostring(cost)))
+    end
+    t.noThrow(function() return Economy.getDropperCost(nil, 0) end)
+    t.noThrow(function() return Economy.getUpgradeCost(nil, 0) end)
+    t.noThrow(function() return Economy.getSectionCost(nil) end)
+    t.eq(Economy.getSectionCost(SectionData.ById[SectionData.Base]), 0)
+end)
+
+t.test("upgrade cost rises per level", function()
+    local upgrade = UpgradeData.List[1]
+    t.gt(Economy.getUpgradeCost(upgrade, 1), Economy.getUpgradeCost(upgrade, 0))
+    t.gt(Economy.getUpgradeCost(upgrade, 5), Economy.getUpgradeCost(upgrade, 1))
+end)
+
+-------------------------------------------------------------------------------
+-- Rates
+-------------------------------------------------------------------------------
+t.test("mote value scales with multipliers and stays finite", function()
+    local state = plot()
+    local neutral = Economy.getMoteValue(firstDropper, state, Economy.getMultipliers(state, {}))
+    t.gt(neutral, 0)
+
+    local boostedState = plot({ Stage = 5 })
+    local boosted = Economy.getMoteValue(firstDropper, boostedState,
+        Economy.getMultipliers(boostedState, { 10, 10 }))
+    t.gt(boosted, neutral, "stage and prestige raise mote value")
+    t.truthy(boosted < math.huge)
+    t.noThrow(function() return Economy.getMoteValue(nil, state, nil) end)
+end)
+
+t.test("dropper interval and rail time are clamped to sane floors", function()
+    local state = plot()
+    local multipliers = Economy.getMultipliers(state, {})
+    t.gt(Economy.getDropperInterval(firstDropper, state, multipliers), 0.14)
+    t.noThrow(function() return Economy.getDropperInterval(nil, state, multipliers) end)
+
+    local GameConfig = loadModule("ReplicatedStorage/Modules/GameConfig")
+    local slow = Economy.getRailTravelTime(state, multipliers)
+    t.truthy(slow <= GameConfig.Mote.BaseTravelSeconds + 1e-9)
+    t.truthy(slow >= GameConfig.Mote.MinTravelSeconds - 1e-9)
+
+    -- Max out every rail-speed upgrade: travel time must fall but never reach zero.
+    local upgrades = {}
+    for _, upgrade in ipairs(UpgradeData.List) do upgrades[upgrade.Id] = upgrade.MaxLevel end
+    local fastState = plot({ Upgrades = upgrades, Affinity = "zephyr" })
+    local fast = Economy.getRailTravelTime(fastState, Economy.getMultipliers(fastState, {}))
+    t.truthy(fast >= GameConfig.Mote.MinTravelSeconds - 1e-9, "rails never become instant")
+    t.truthy(fast <= slow)
+end)
+
+t.test("mote capacity and walkspeed respond to upgrades and stage", function()
+    local GameConfig = loadModule("ReplicatedStorage/Modules/GameConfig")
+    t.eq(Economy.getMoteCapacity(plot()), GameConfig.Mote.MaxLivePerSanctum)
+    local upgrades = {}
+    for _, upgrade in ipairs(UpgradeData.List) do upgrades[upgrade.Id] = upgrade.MaxLevel end
+    t.gt(Economy.getMoteCapacity(plot({ Upgrades = upgrades })), Economy.getMoteCapacity(plot()))
+
+    t.eq(Economy.getWalkSpeed(plot()), EvolutionData.Stages[1].WalkSpeed)
+    t.gt(Economy.getWalkSpeed(plot({ Stage = 6, Affinity = "zephyr" })), Economy.getWalkSpeed(plot()))
+end)
+
+t.test("income estimate rises with droppers and is zero for an empty sanctum", function()
+    local empty = plot()
+    t.eq(Economy.estimateIncomePerSecond(empty, Economy.getMultipliers(empty, {})), 0)
+
+    local one = plot({ Droppers = { [firstDropper.Id] = 1 } })
+    local two = plot({ Droppers = { [firstDropper.Id] = 2 } })
+    local rateOne = Economy.estimateIncomePerSecond(one, Economy.getMultipliers(one, {}))
+    local rateTwo = Economy.estimateIncomePerSecond(two, Economy.getMultipliers(two, {}))
+    t.gt(rateOne, 0)
+    t.near(rateTwo / rateOne, 2, 0.01, "income is linear in dropper count")
+
+    -- Unknown ids in a tampered save must not contribute income.
+    local tampered = plot({ Droppers = { [firstDropper.Id] = 1, hacked_dropper = 1e9 } })
+    t.near(Economy.estimateIncomePerSecond(tampered, Economy.getMultipliers(tampered, {})), rateOne, 1e-6)
+end)
+
+-------------------------------------------------------------------------------
+-- Gates: every reason is a closed-set code
+-------------------------------------------------------------------------------
+local function assertClosedSet(reason)
+    for _, known in pairs(R) do
+        if reason == known then return end
+    end
+    t.fail(("reason %q is not in Economy.Reason"):format(tostring(reason)))
+end
+
+t.test("dropperStatus reports the correct blocking reason", function()
+    local lateDropper
+    for _, dropper in ipairs(DropperData.List) do
+        if dropper.RequiredStage > 1 then lateDropper = dropper break end
+    end
+    t.truthy(lateDropper, "the data should gate at least one dropper behind a later stage")
+
+    local ok, reason = Economy.dropperStatus(plot(), lateDropper)
+    t.falsy(ok)
+    t.eq(reason, R.LockedStage)
+
+    local broke = plotAtStage(lateDropper.RequiredStage, 0)
+    broke.Droppers = {}
+    ok, reason = Economy.dropperStatus(broke, lateDropper)
+    t.falsy(ok)
+    t.eq(reason, R.Insufficient, "unlocked but unaffordable")
+
+    local rich = plotAtStage(lateDropper.RequiredStage, 1e12)
+    rich.Droppers = {}
+    ok, reason = Economy.dropperStatus(rich, lateDropper)
+    t.truthy(ok)
+    t.eq(reason, R.Ok)
+
+    local capped = plotAtStage(lateDropper.RequiredStage, 1e12)
+    capped.Droppers[lateDropper.Id] = lateDropper.MaxOwned
+    ok, reason = Economy.dropperStatus(capped, lateDropper)
+    t.falsy(ok)
+    t.eq(reason, R.MaxOwned)
+
+    ok, reason = Economy.dropperStatus(rich, nil)
+    t.falsy(ok, "a nil def is never purchasable")
+    assertClosedSet(reason)
+end)
+
+t.test("upgradeStatus and sectionStatus use the same closed reason set", function()
+    local upgrade = UpgradeData.List[1]
+    local rich = plotAtStage(EvolutionData.MaxStage, 1e15)
+    local ok, reason = Economy.upgradeStatus(rich, upgrade)
+    t.truthy(ok)
+    t.eq(reason, R.Ok)
+
+    rich.Upgrades[upgrade.Id] = upgrade.MaxLevel
+    ok, reason = Economy.upgradeStatus(rich, upgrade)
+    t.falsy(ok)
+    t.eq(reason, R.MaxLevel)
+
+    local owned = plotAtStage(EvolutionData.MaxStage, 1e15)
+    ok, reason = Economy.sectionStatus(owned, SectionData.ById[SectionData.Base])
+    t.falsy(ok)
+    t.eq(reason, R.AlreadyOwned, "the base wing is unlocked from the start")
+
+    for _, status in ipairs({ { Economy.upgradeStatus(plot(), nil) }, { Economy.sectionStatus(plot(), nil) } }) do
+        t.falsy(status[1])
+        assertClosedSet(status[2])
+    end
+end)
+
+t.test("attuneStatus walks the whole stage ladder", function()
+    local ok, reason = Economy.attuneStatus(plot())
+    t.falsy(ok, "a fresh sanctum cannot afford stage 2")
+    assertClosedSet(reason)
+
+    for index = 1, EvolutionData.MaxStage - 1 do
+        local nextStage = EvolutionData.Stages[index + 1]
+        local ready = plotAtStage(index, nextStage.RequiredEssence)
+        ready.LifetimeEssence = math.max(nextStage.RequiredLifetimeEssence, nextStage.RequiredEssence)
+        -- plotAtStage grants one of each unlocked dropper; top up if the stage wants more.
+        local needed = nextStage.RequiredDroppers
+        local firstId = DropperData.List[1].Id
+        ready.Droppers[firstId] = math.max(ready.Droppers[firstId] or 0, needed)
+        local canAttune, why = Economy.attuneStatus(ready)
+        t.truthy(canAttune, ("stage %d -> %d should be reachable (blocked by %s)"):format(index, index + 1, tostring(why)))
+    end
+
+    local maxed = plotAtStage(EvolutionData.MaxStage, 1e18)
+    ok, reason = Economy.attuneStatus(maxed)
+    t.falsy(ok)
+    t.eq(reason, R.MaxStage)
+end)
+
+t.test("transcendStatus requires the final stage", function()
+    local ok, reason = Economy.transcendStatus(plotAtStage(1, 1e18))
+    t.falsy(ok)
+    t.eq(reason, R.NeedStage)
+
+    local ready = plotAtStage(RebirthData.RequiredStage, 1e18)
+    ready.LifetimeEssence = math.max(RebirthData.RequiredLifetimeEssence, 1e18)
+    ok, reason = Economy.transcendStatus(ready)
+    t.truthy(ok, "blocked by " .. tostring(reason))
+end)
+
+t.test("canAfford is exact at the boundary and rejects junk costs", function()
+    t.truthy(Economy.canAfford(plot({ Essence = 100 }), 100), "exactly enough is enough")
+    t.falsy(Economy.canAfford(plot({ Essence = 99.999 }), 100))
+    t.falsy(Economy.canAfford(plot({ Essence = 100 }), 0 / 0), "a NaN cost is never affordable")
+    t.falsy(Economy.canAfford(plot({ Essence = 100 }), math.huge))
+    t.falsy(Economy.canAfford(plot({ Essence = 0 / 0 }), 1), "a corrupt wallet buys nothing")
+    t.noThrow(function() return Economy.canAfford(nil, 1) end)
+end)
+
+t.test("every gate function survives a completely corrupt plot state", function()
+    local hostile = { Essence = 0 / 0, Stage = -3, Droppers = "not a table",
+        Upgrades = { [1] = 2 }, Sections = 5, LifetimeEssence = math.huge }
+    for _, call in ipairs({
+        function() return Economy.attuneStatus(hostile) end,
+        function() return Economy.transcendStatus(hostile) end,
+        function() return Economy.dropperStatus(hostile, firstDropper) end,
+        function() return Economy.upgradeStatus(hostile, UpgradeData.List[1]) end,
+        function() return Economy.sectionStatus(hostile, SectionData.List[2]) end,
+        function() return Economy.totalDroppersOwned(hostile) end,
+        function() return Economy.getMultipliers(hostile, { "x" }) end,
+        function() return Economy.estimateIncomePerSecond(hostile, {}) end,
+        function() return Economy.getMoteCapacity(hostile) end,
+        function() return Economy.getWalkSpeed(hostile) end,
+    }) do
+        t.noThrow(call, "Economy must be total: a corrupt save cannot crash the server loop")
+    end
+    for _, state in ipairs({ {}, { Essence = 5 } }) do
+        t.noThrow(function() return Economy.attuneStatus(state) end)
+    end
+end)
+
+t.test("totalDroppersOwned counts only real droppers", function()
+    t.eq(Economy.totalDroppersOwned(plot()), 0)
+    t.eq(Economy.totalDroppersOwned(plot({ Droppers = { [firstDropper.Id] = 3 } })), 3)
+    t.eq(Economy.totalDroppersOwned(plot({ Droppers = { [firstDropper.Id] = 3, fake = 100 } })), 3)
+    t.eq(Economy.totalDroppersOwned(plot({ Droppers = { [firstDropper.Id] = -5 } })), 0,
+        "a negative count cannot subtract from the total")
+end)
+
+--#endregion
+end }
+SPECS[#SPECS + 1] = { Name = "harness.spec", Run = function(t, Mock, loadModule, runScript)
+--#region tests/specs/harness.spec.luau
+--[[
+    harness.spec
+    Tests the mock itself. If these fail, every other spec's result is meaningless.
+]]
+
+t.test("datatypes: Vector3 arithmetic and typeof", function()
+    local a = Vector3.new(1, 2, 3)
+    local b = Vector3.new(4, 5, 6)
+    t.eq(typeof(a), "Vector3", "typeof recognises mock datatypes")
+    t.eq((a + b).X, 5)
+    t.eq((a * 2).Z, 6)
+    t.near(Vector3.new(3, 4, 0).Magnitude, 5, 1e-9)
+    t.near(a:Dot(b), 32, 1e-9)
+    t.eq(a:Cross(b).X, 2 * 6 - 3 * 5)
+end)
+
+t.test("datatypes: CFrame composition, lookAt and Lerp", function()
+    local base = CFrame.new(10, 0, 0)
+    local moved = base * CFrame.new(0, 5, 0)
+    t.near(moved.Position.Y, 5, 1e-9)
+    t.near(moved.Position.X, 10, 1e-9)
+
+    local look = CFrame.lookAt(Vector3.new(0, 0, 0), Vector3.new(0, 0, -10))
+    t.near(look.LookVector.Z, -1, 1e-6, "lookAt points down -Z")
+
+    local mid = CFrame.new(0, 0, 0):Lerp(CFrame.new(10, 20, 30), 0.5)
+    t.near(mid.Position.X, 5, 1e-6)
+    t.near(mid.Position.Z, 15, 1e-6)
+
+    local inverse = base:Inverse()
+    t.near((base * inverse).Position.Magnitude, 0, 1e-6, "cf * cf:Inverse() is the identity")
+end)
+
+t.test("datatypes: Color3 and Enum identity", function()
+    t.near(Color3.fromRGB(255, 0, 0).R, 1, 1e-9)
+    t.eq(Enum.Material.Neon, Enum.Material.Neon, "enum items are reference-stable")
+    t.neq(Enum.Material.Neon, Enum.Material.Plastic)
+    t.eq(Enum.Material.Neon.Name, "Neon")
+end)
+
+t.test("instances: parenting, lookup and IsA", function()
+    local folder = Instance.new("Folder")
+    folder.Name = "Root"
+    folder.Parent = workspace
+    local part = Instance.new("Part", folder)
+    part.Name = "Block"
+
+    t.eq(folder:FindFirstChild("Block"), part)
+    t.eq(folder.Block, part, "child lookup by property access")
+    t.truthy(part:IsA("BasePart"), "Part IsA BasePart")
+    t.truthy(part:IsA("Instance"))
+    t.falsy(part:IsA("Model"))
+    t.eq(#folder:GetChildren(), 1)
+    t.eq(part:GetFullName(), "Workspace.Root.Block")
+
+    part:Destroy()
+    t.eq(folder:FindFirstChild("Block"), nil, "Destroy unparents")
+end)
+
+t.test("instances: attributes and signals", function()
+    local part = Instance.new("Part", workspace)
+    local seen = {}
+    part:GetAttributeChangedSignal("Cost"):Connect(function()
+        table.insert(seen, part:GetAttribute("Cost"))
+    end)
+    part:SetAttribute("Cost", 25)
+    part:SetAttribute("Cost", 50)
+    t.deepEq(seen, { 25, 50 })
+
+    local fired = 0
+    local connection = part.ChildAdded:Connect(function() fired += 1 end)
+    Instance.new("Part", part)
+    connection:Disconnect()
+    Instance.new("Part", part)
+    t.eq(fired, 1, "Disconnect stops delivery")
+end)
+
+t.test("clock: task.delay, task.spawn and Heartbeat only run when time advances", function()
+    local RunService = game:GetService("RunService")
+    local order = {}
+    task.delay(2, function() table.insert(order, "delayed-2") end)
+    task.delay(1, function() table.insert(order, "delayed-1") end)
+    task.spawn(function() table.insert(order, "spawned") end)
+
+    local heartbeats = 0
+    RunService.Heartbeat:Connect(function(dt)
+        heartbeats += 1
+        t.gt(dt, -1)
+    end)
+
+    t.deepEq(order, { "spawned" }, "task.spawn runs immediately, delays do not")
+    Mock.advance(1.5)
+    t.deepEq(order, { "spawned", "delayed-1" })
+    Mock.advance(1)
+    t.deepEq(order, { "spawned", "delayed-1", "delayed-2" })
+    t.gt(heartbeats, 60, "Heartbeat fires ~30x per simulated second")
+end)
+
+t.test("clock: task.wait yields inside a coroutine and fast-forwards on the main thread", function()
+    local resumed = false
+    task.spawn(function()
+        task.wait(3)
+        resumed = true
+    end)
+    t.falsy(resumed, "the coroutine is parked until the clock reaches its deadline")
+    Mock.advance(2)
+    t.falsy(resumed)
+    Mock.advance(1.5)
+    t.truthy(resumed)
+
+    local before = Mock.now()
+    task.wait(5) -- main thread: fast-forwards
+    t.near(Mock.now() - before, 5, 0.2)
+end)
+
+t.test("players: add, character and removal", function()
+    local Players = game:GetService("Players")
+    local joined, left = {}, {}
+    Players.PlayerAdded:Connect(function(p) table.insert(joined, p.Name) end)
+    Players.PlayerRemoving:Connect(function(p) table.insert(left, p.Name) end)
+
+    local player = Mock.addPlayer("Ash", 501)
+    t.eq(player.UserId, 501)
+    t.truthy(player.Character, "LoadCharacter ran")
+    t.truthy(player.Character:FindFirstChildOfClass("Humanoid"))
+    t.eq(#Players:GetPlayers(), 1)
+    t.eq(Players:GetPlayerFromCharacter(player.Character), player)
+
+    Mock.removePlayer(player)
+    t.deepEq(joined, { "Ash" })
+    t.deepEq(left, { "Ash" })
+    t.eq(#Players:GetPlayers(), 0)
+end)
+
+t.test("remotes: FireClient records to the outbox and reaches the local player only", function()
+    local ReplicatedStorage = game:GetService("ReplicatedStorage")
+    local remote = Instance.new("RemoteEvent", ReplicatedStorage)
+    remote.Name = "TestRemote"
+
+    local alice = Mock.addPlayer("Alice", 1)
+    local bob = Mock.addPlayer("Bob", 2)
+
+    local received = {}
+    Mock.setLocalPlayer(alice)
+    remote.OnClientEvent:Connect(function(payload) table.insert(received, payload) end)
+
+    remote:FireClient(bob, "for-bob")
+    t.eq(#received, 0, "a message addressed to Bob does not reach Alice's client")
+    remote:FireClient(alice, "for-alice")
+    t.deepEq(received, { "for-alice" })
+
+    t.eq(#Mock.outboxFor("TestRemote"), 2, "both sends were recorded")
+    t.eq(Mock.lastOutbox("TestRemote", alice).Args[1], "for-alice")
+
+    local serverSaw = {}
+    remote.OnServerEvent:Connect(function(player, payload)
+        table.insert(serverSaw, { player.Name, payload })
+    end)
+    Mock.fireServer("TestRemote", bob, { Accept = true })
+    t.eq(serverSaw[1][1], "Bob")
+    t.eq(serverSaw[1][2].Accept, true)
+end)
+
+t.test("proximity prompts: triggering reaches both the prompt and the service", function()
+    local prompt = Instance.new("ProximityPrompt", workspace)
+    local player = Mock.addPlayer("Cass", 9)
+    local direct, viaService = 0, 0
+    prompt.Triggered:Connect(function(p)
+        t.eq(p, player)
+        direct += 1
+    end)
+    game:GetService("ProximityPromptService").PromptTriggered:Connect(function() viaService += 1 end)
+    Mock.triggerPrompt(prompt, player)
+    t.eq(direct, 1)
+    t.eq(viaService, 1)
+end)
+
+t.test("datastore: round-trips through JSON and detaches stored values", function()
+    local store = game:GetService("DataStoreService"):GetDataStore("Test")
+    local payload = { Essence = 1250.5, Droppers = { ember_vent = 3 }, Sections = { wing_core = true } }
+    store:SetAsync("k", payload)
+
+    payload.Essence = 0 -- mutating the caller's table must not change stored data
+    local loaded = store:GetAsync("k")
+    t.eq(loaded.Essence, 1250.5)
+    t.eq(loaded.Droppers.ember_vent, 3)
+    t.neq(loaded, payload)
+
+    local updated = store:UpdateAsync("k", function(current)
+        current.Essence += 100
+        return current
+    end)
+    t.eq(updated.Essence, 1350.5)
+    t.eq(store:GetAsync("k").Essence, 1350.5)
+
+    t.eq(store:GetAsync("missing"), nil)
+end)
+
+t.test("datastore: injected faults surface as errors and can be exhausted", function()
+    local store = game:GetService("DataStoreService"):GetDataStore("Faulty")
+    Mock.DataStore.failNext(2)
+    t.throws(function() store:GetAsync("k") end, "first call fails")
+    t.throws(function() store:GetAsync("k") end, "second call fails")
+    t.noThrow(function() store:GetAsync("k") end, "third call succeeds")
+
+    Mock.DataStore.failAlways(true)
+    t.throws(function() store:SetAsync("k", 1) end)
+    Mock.DataStore.failAlways(false)
+    t.noThrow(function() store:SetAsync("k", 1) end)
+end)
+
+t.test("datastore: non-serialisable values are rejected like Roblox rejects them", function()
+    local store = game:GetService("DataStoreService"):GetDataStore("Strict")
+    t.throws(function() store:SetAsync("nan", { value = 0 / 0 }) end, "NaN is not encodable")
+    t.throws(function() store:SetAsync("fn", { value = print }) end, "functions are not encodable")
+end)
+
+t.test("reset isolates tests; restartServer keeps datastore contents", function()
+    local store = game:GetService("DataStoreService"):GetDataStore("Persist")
+    store:SetAsync("player_1", { Rebirths = 4 })
+    Mock.restartServer()
+    local after = game:GetService("DataStoreService"):GetDataStore("Persist"):GetAsync("player_1")
+    t.eq(after.Rebirths, 4, "a simulated restart keeps saved data")
+    t.eq(#game:GetService("Players"):GetPlayers(), 0, "but drops all runtime state")
+end)
+
+t.test("modules: shared modules load through require(script.Parent.X)", function()
+    local TableUtil = loadModule("ReplicatedStorage/Modules/TableUtil")
+    t.truthy(type(TableUtil) == "table", "TableUtil loaded")
+    local Format = loadModule("ReplicatedStorage/Modules/Format")
+    t.truthy(type(Format.abbreviate) == "function", "Format loaded")
+    -- Requiring twice returns the cached table, exactly as Roblox does.
+    t.eq(loadModule("ReplicatedStorage/Modules/TableUtil"), TableUtil)
+end)
+
+--#endregion
+end }
+SPECS[#SPECS + 1] = { Name = "infra.spec", Run = function(t, Mock, loadModule, runScript)
+--#region tests/specs/infra.spec.luau
+--[[
+    infra.spec
+    ServiceRegistry and RateLimiter carry no game knowledge, which makes them easy to get subtly
+    wrong: a registry that hides a boot failure, or a limiter that leaks one table per player per
+    remote for the lifetime of the server.
+]]
+
+local ServiceRegistry = loadModule("ServerScriptService/Core/ServiceRegistry")
+local RateLimiter = loadModule("ServerScriptService/Core/Services/RateLimiter")
+
+local function stubService(name, log)
+    return {
+        Name = name,
+        Init = function(self, registry)
+            self.Registry = registry
+            table.insert(log, "init:" .. name)
+        end,
+        Start = function() table.insert(log, "start:" .. name) end,
+        Stop = function() table.insert(log, "stop:" .. name) end,
+    }
+end
+
+-------------------------------------------------------------------------------
+-- ServiceRegistry
+-------------------------------------------------------------------------------
+t.test("services init in registration order and start after every Init", function()
+    local log = {}
+    local registry = ServiceRegistry.new()
+    registry:Register("A", stubService("A", log))
+    registry:Register("B", stubService("B", log))
+    registry:Register("C", stubService("C", log))
+
+    registry:InitAll()
+    t.deepEq(log, { "init:A", "init:B", "init:C" })
+    registry:StartAll()
+    t.deepEq(log, { "init:A", "init:B", "init:C", "start:A", "start:B", "start:C" },
+        "every service is constructed before any of them starts talking to its peers")
+end)
+
+t.test("StopAll runs in reverse order", function()
+    local log = {}
+    local registry = ServiceRegistry.new()
+    registry:Register("A", stubService("A", log))
+    registry:Register("B", stubService("B", log))
+    registry:InitAll()
+    registry:StartAll()
+    log = {}
+    -- Teardown mirrors construction: a service must not lose a dependency it is still unwinding.
+    local reverseLog = {}
+    local registry2 = ServiceRegistry.new()
+    registry2:Register("A", stubService("A", reverseLog))
+    registry2:Register("B", stubService("B", reverseLog))
+    registry2:InitAll()
+    registry2:StartAll()
+    for index = #reverseLog, 1, -1 do reverseLog[index] = nil end
+    registry2:StopAll()
+    t.deepEq(reverseLog, { "stop:B", "stop:A" })
+end)
+
+t.test("Get resolves peers and Init receives the registry", function()
+    local log = {}
+    local registry = ServiceRegistry.new()
+    local a = stubService("A", log)
+    registry:Register("A", a)
+    registry:InitAll()
+    t.eq(registry:Get("A"), a)
+    t.eq(a.Registry, registry, "Init is handed the registry so services resolve peers there")
+end)
+
+t.test("Get on a missing service names what IS registered", function()
+    local registry = ServiceRegistry.new()
+    registry:Register("PlotService", stubService("PlotService", {}))
+    local ok, err = pcall(function() return registry:Get("PlotServic") end)
+    t.falsy(ok, "a typo must fail loudly at boot, not as a nil index three services later")
+    t.truthy(tostring(err):find("PlotServic"), "the error names what was asked for")
+    t.truthy(tostring(err):find("PlotService"), "and lists what is available: " .. tostring(err))
+end)
+
+t.test("TryGet returns nil instead of erroring", function()
+    local registry = ServiceRegistry.new()
+    t.eq(registry:TryGet("Nope"), nil)
+    t.noThrow(function() return registry:TryGet(nil) end)
+end)
+
+t.test("double registration is refused", function()
+    local registry = ServiceRegistry.new()
+    registry:Register("A", stubService("A", {}))
+    t.throws(function() registry:Register("A", stubService("A", {})) end,
+        "silently replacing a service would leave half the game holding the old table")
+end)
+
+t.test("a service that throws during Init does not silently half-boot the server", function()
+    local log = {}
+    local registry = ServiceRegistry.new()
+    registry:Register("Good", stubService("Good", log))
+    registry:Register("Bad", {
+        Name = "Bad",
+        Init = function() error("dependency missing") end,
+    })
+    registry:Register("AlsoGood", stubService("AlsoGood", log))
+
+    t.throws(function() registry:InitAll() end, "boot must fail, not limp on")
+    -- Every service is still attempted, so one log line names every broken service rather than
+    -- making the developer fix them one restart at a time.
+    t.truthy(table.find(log, "init:Good") ~= nil)
+    t.truthy(table.find(log, "init:AlsoGood") ~= nil, "later services were still attempted")
+end)
+
+t.test("services without Init/Start/Stop are tolerated", function()
+    local registry = ServiceRegistry.new()
+    registry:Register("Plain", { Name = "Plain" })
+    t.noThrow(function() registry:InitAll() end)
+    t.noThrow(function() registry:StartAll() end)
+    t.noThrow(function() registry:StopAll() end)
+end)
+
+t.test("booting twice is refused rather than silently re-running connections", function()
+    local log = {}
+    local registry = ServiceRegistry.new()
+    registry:Register("A", stubService("A", log))
+    registry:InitAll()
+    registry:StartAll()
+    -- Erroring beats a silent no-op: a second InitAll is a bug in Bootstrap, and Init is not
+    -- idempotent for most services (it allocates state and resolves peers).
+    t.throws(function() registry:InitAll() end)
+    t.throws(function() registry:StartAll() end)
+    t.deepEq(log, { "init:A", "start:A" }, "nothing ran twice")
+end)
+
+-------------------------------------------------------------------------------
+-- RateLimiter
+-------------------------------------------------------------------------------
+t.test("a bucket allows its budget then denies", function()
+    RateLimiter:Init({})
+    local player = Mock.addPlayer("Ash", 1)
+    for index = 1, 5 do
+        t.truthy(RateLimiter:Consume(player, "RebirthVote", 5, 10),
+            ("call %d of 5 should be allowed"):format(index))
+    end
+    t.falsy(RateLimiter:Consume(player, "RebirthVote", 5, 10), "the sixth call in the window is denied")
+end)
+
+t.test("tokens refill continuously, not in a lump at the window edge", function()
+    RateLimiter:Init({})
+    local player = Mock.addPlayer("Ash", 1)
+    for _ = 1, 5 do RateLimiter:Consume(player, "k", 5, 10) end
+    t.falsy(RateLimiter:Consume(player, "k", 5, 10))
+
+    Mock.advance(2.1) -- 5 tokens per 10s => ~1 token back
+    t.truthy(RateLimiter:Consume(player, "k", 5, 10), "a partial wait earns a partial refill")
+    t.falsy(RateLimiter:Consume(player, "k", 5, 10), "but only one")
+
+    Mock.advance(12)
+    for index = 1, 5 do
+        t.truthy(RateLimiter:Consume(player, "k", 5, 10), ("refilled call %d"):format(index))
+    end
+    t.falsy(RateLimiter:Consume(player, "k", 5, 10), "the bucket does not overfill past its budget")
+end)
+
+t.test("buckets are independent per key and per player", function()
+    RateLimiter:Init({})
+    local ash = Mock.addPlayer("Ash", 1)
+    local bree = Mock.addPlayer("Bree", 2)
+    for _ = 1, 3 do RateLimiter:Consume(ash, "Vote", 3, 10) end
+    t.falsy(RateLimiter:Consume(ash, "Vote", 3, 10), "Ash exhausted Vote")
+    t.truthy(RateLimiter:Consume(ash, "Settings", 3, 10), "a different key is unaffected")
+    t.truthy(RateLimiter:Consume(bree, "Vote", 3, 10), "another player is unaffected")
+end)
+
+t.test("a non-string key is a hard deny", function()
+    RateLimiter:Init({})
+    local player = Mock.addPlayer("Ash", 1)
+    for _, key in ipairs({ 42, true, {} }) do
+        t.falsy(RateLimiter:Consume(player, key, 10, 10), "a forged key is refused, not bucketed")
+    end
+    t.falsy(RateLimiter:Consume(nil, "k", 10, 10), "no player, no allowance")
+end)
+
+t.test("junk budgets cannot open the gate", function()
+    RateLimiter:Init({})
+    local player = Mock.addPlayer("Ash", 1)
+    t.noThrow(function() return RateLimiter:Consume(player, "k", 0 / 0, 10) end)
+    t.noThrow(function() return RateLimiter:Consume(player, "k", 5, 0) end)
+    t.noThrow(function() return RateLimiter:Consume(player, "k", -1, 10) end)
+    t.noThrow(function() return RateLimiter:Consume(player, "k", math.huge, math.huge) end)
+end)
+
+t.test("Stats reports remaining tokens", function()
+    RateLimiter:Init({})
+    local player = Mock.addPlayer("Ash", 1)
+    RateLimiter:Consume(player, "k", 4, 10)
+    local stats = RateLimiter:Stats(player)
+    t.truthy(type(stats) == "table")
+    t.truthy(stats.k ~= nil and stats.k < 4, "one token has been spent")
+    t.noThrow(function() return RateLimiter:Stats(nil) end)
+end)
+
+t.test("a departing player's buckets are released automatically", function()
+    RateLimiter:Init({})
+    RateLimiter:Start()
+    local player = Mock.addPlayer("Ash", 1)
+    RateLimiter:Consume(player, "k", 3, 10)
+    t.truthy(next(RateLimiter:Stats(player)) ~= nil, "the bucket exists while they are here")
+
+    Mock.removePlayer(player)
+    -- Without this hook the server accumulates one table per (player, remote) forever.
+    t.deepEq(RateLimiter:Stats(player), {}, "PlayerRemoving cleared the buckets")
+end)
+
+t.test("Reset clears one player without touching another", function()
+    RateLimiter:Init({})
+    local ash = Mock.addPlayer("Ash", 1)
+    local bree = Mock.addPlayer("Bree", 2)
+    for _ = 1, 3 do
+        RateLimiter:Consume(ash, "k", 3, 10)
+        RateLimiter:Consume(bree, "k", 3, 10)
+    end
+    RateLimiter:Reset(ash)
+    t.truthy(RateLimiter:Consume(ash, "k", 3, 10), "Ash starts fresh")
+    t.falsy(RateLimiter:Consume(bree, "k", 3, 10), "Bree is still throttled")
+end)
+
+--#endregion
+end }
+SPECS[#SPECS + 1] = { Name = "layout.spec", Run = function(t, Mock, loadModule, runScript)
+--#region tests/specs/layout.spec.luau
+--[[
+    layout.spec
+    PlotLayout is pure geometry, which makes it exactly the kind of module that silently drifts:
+    nothing crashes when two purchase pads occupy the same stud, the sanctum just becomes unusable.
+    These tests pin the spatial invariants PlotBuilder and MoteSystem rely on.
+]]
+
+local PlotLayout = loadModule("ReplicatedStorage/Modules/PlotLayout")
+local SectionData = loadModule("ReplicatedStorage/Modules/SectionData")
+local GameConfig = loadModule("ReplicatedStorage/Modules/GameConfig")
+
+local function distance(a, b) return (a - b).Magnitude end
+
+t.test("sanctums are spaced far enough apart not to overlap", function()
+    local previous
+    for index = 1, GameConfig.Plot.SanctumCount do
+        local origin = PlotLayout.sanctumOrigin(index)
+        t.eq(typeof(origin), "CFrame", "sanctumOrigin returns a CFrame")
+        if previous then
+            local gap = distance(origin.Position, previous.Position)
+            t.gt(gap, math.max(PlotLayout.SanctumSize.X, PlotLayout.SanctumSize.Z),
+                ("sanctums %d and %d are closer than one sanctum wide"):format(index - 1, index))
+        end
+        previous = origin
+    end
+end)
+
+t.test("every section sits inside its sanctum footprint", function()
+    local origin = PlotLayout.sanctumOrigin(1)
+    local halfX = PlotLayout.SanctumSize.X / 2
+    local halfZ = PlotLayout.SanctumSize.Z / 2
+    for _, section in ipairs(SectionData.List) do
+        local cf = PlotLayout.sectionCFrame(origin, section)
+        local offset = cf.Position - origin.Position
+        t.truthy(math.abs(offset.X) + section.Size.X / 2 <= halfX + 0.001,
+            ("section %s overhangs the sanctum on X"):format(section.Id))
+        t.truthy(math.abs(offset.Z) + section.Size.Z / 2 <= halfZ + 0.001,
+            ("section %s overhangs the sanctum on Z"):format(section.Id))
+    end
+end)
+
+t.test("purchase pads never share a position", function()
+    local origin = PlotLayout.sanctumOrigin(2)
+    local seen = {}
+    for _, section in ipairs(SectionData.List) do
+        for order = 1, 8 do
+            local position = PlotLayout.padCFrame(origin, section, order).Position
+            local key = ("%.2f/%.2f/%.2f"):format(position.X, position.Y, position.Z)
+            t.falsy(seen[key], ("pad %s#%d collides with %s"):format(section.Id, order, tostring(seen[key])))
+            seen[key] = ("%s#%d"):format(section.Id, order)
+        end
+    end
+end)
+
+t.test("pads within a section are evenly spaced and do not stack", function()
+    local origin = PlotLayout.sanctumOrigin(1)
+    local section = SectionData.List[1]
+    local previous
+    for order = 1, 6 do
+        local position = PlotLayout.padCFrame(origin, section, order).Position
+        if previous then
+            t.gt(distance(position, previous), 4, "consecutive pads are at least 4 studs apart")
+        end
+        previous = position
+    end
+end)
+
+t.test("rail paths start at the wellspring and converge on the font", function()
+    local origin = PlotLayout.sanctumOrigin(1)
+    local font = PlotLayout.fontCFrame(origin).Position
+    for _, section in ipairs(SectionData.List) do
+        for order = 1, 4 do
+            local path = PlotLayout.railPath(origin, section, order)
+            t.truthy(#path >= 4, ("rail path %s#%d needs at least 4 waypoints, got %d"):format(
+                section.Id, order, #path))
+            for index, waypoint in ipairs(path) do
+                t.eq(typeof(waypoint), "CFrame", ("waypoint %d is a CFrame"):format(index))
+            end
+            local finish = path[#path].Position
+            t.lt(distance(finish, font), 6,
+                ("rail path %s#%d ends %.1f studs from the font"):format(section.Id, order, distance(finish, font)))
+            -- A path that starts where it ends would make motes teleport straight into the font.
+            t.gt(distance(path[1].Position, finish), 5,
+                ("rail path %s#%d is degenerate"):format(section.Id, order))
+        end
+    end
+end)
+
+t.test("rail paths from different pads are distinct", function()
+    local origin = PlotLayout.sanctumOrigin(1)
+    local section = SectionData.List[1]
+    local first = PlotLayout.railPath(origin, section, 1)
+    local second = PlotLayout.railPath(origin, section, 2)
+    t.gt(distance(first[1].Position, second[1].Position), 1,
+        "two wellsprings on the same wing must not drop motes into the same spot")
+end)
+
+t.test("rail path segments have no zero-length hops", function()
+    -- MoteSystem interpolates between consecutive waypoints; a zero-length segment divides by zero.
+    local origin = PlotLayout.sanctumOrigin(3)
+    for _, section in ipairs(SectionData.List) do
+        local path = PlotLayout.railPath(origin, section, 1)
+        for index = 2, #path do
+            t.gt(distance(path[index].Position, path[index - 1].Position), 0.01,
+                ("segment %d of %s is zero length"):format(index, section.Id))
+        end
+    end
+end)
+
+t.test("conflux, font, spawns and link pads are placed and distinct", function()
+    local origin = PlotLayout.sanctumOrigin(1)
+    local conflux = PlotLayout.confluxCFrame(origin).Position
+    local font = PlotLayout.fontCFrame(origin).Position
+    t.gt(distance(conflux, origin.Position), -1)
+    t.lt(distance(conflux, origin.Position), PlotLayout.SanctumSize.Magnitude)
+
+    local spawns, links = {}, {}
+    for slot = 1, GameConfig.Plot.SlotsPerSanctum do
+        spawns[slot] = PlotLayout.spawnSlotCFrame(origin, slot).Position
+        links[slot] = PlotLayout.linkPadCFrame(origin, slot).Position
+    end
+    t.gt(distance(spawns[1], spawns[2]), 4, "the two players do not spawn inside each other")
+    t.gt(distance(links[1], links[2]), 4, "the two link pads are separate")
+    for slot = 1, GameConfig.Plot.SlotsPerSanctum do
+        t.gt(distance(spawns[slot], font), 3, "nobody spawns inside the collector")
+        t.gt(distance(spawns[slot], conflux), 3, "nobody spawns inside the conflux")
+    end
+end)
+
+t.test("layout is translation-invariant across sanctums", function()
+    -- Sanctum N must be sanctum 1 rigidly translated, or per-plot bugs become position dependent.
+    local section = SectionData.List[1]
+    local originA, originB = PlotLayout.sanctumOrigin(1), PlotLayout.sanctumOrigin(4)
+    local delta = originB.Position - originA.Position
+    local padA = PlotLayout.padCFrame(originA, section, 1).Position
+    local padB = PlotLayout.padCFrame(originB, section, 1).Position
+    t.near((padB - padA - delta).Magnitude, 0, 1e-4)
+
+    local fontA = PlotLayout.fontCFrame(originA).Position
+    local fontB = PlotLayout.fontCFrame(originB).Position
+    t.near((fontB - fontA - delta).Magnitude, 0, 1e-4)
+end)
+
+t.test("geometry helpers tolerate junk without erroring", function()
+    local origin = PlotLayout.sanctumOrigin(1)
+    t.noThrow(function() return PlotLayout.sanctumOrigin(0) end)
+    t.noThrow(function() return PlotLayout.sanctumOrigin(-3) end)
+    t.noThrow(function() return PlotLayout.sanctumOrigin(0 / 0) end)
+    t.noThrow(function() return PlotLayout.padCFrame(origin, SectionData.List[1], 0 / 0) end)
+    t.noThrow(function() return PlotLayout.spawnSlotCFrame(origin, 99) end)
+end)
+
+--#endregion
+end }
+SPECS[#SPECS + 1] = { Name = "stateschema.spec", Run = function(t, Mock, loadModule, runScript)
+--#region tests/specs/stateschema.spec.luau
+--[[
+    stateschema.spec
+    Two hostile inputs reach this module: a DataStore value (which may be corrupt, truncated, from an
+    older build, or hand-edited) and a partner's PlotState arriving through a link. Everything here
+    exists to prove neither can produce an illegal Profile or an error.
+]]
+
+local StateSchema = loadModule("ReplicatedStorage/Modules/StateSchema")
+local Snapshot = loadModule("ReplicatedStorage/Modules/Snapshot")
+local DropperData = loadModule("ReplicatedStorage/Modules/DropperData")
+local UpgradeData = loadModule("ReplicatedStorage/Modules/UpgradeData")
+local SectionData = loadModule("ReplicatedStorage/Modules/SectionData")
+local EvolutionData = loadModule("ReplicatedStorage/Modules/EvolutionData")
+local RebirthData = loadModule("ReplicatedStorage/Modules/RebirthData")
+local Economy = loadModule("ReplicatedStorage/Modules/Economy")
+
+local firstDropper = DropperData.List[1]
+local secondDropper = DropperData.List[2]
+local firstUpgrade = UpgradeData.List[1]
+
+local function assertLegalProfile(profile)
+    t.truthy(type(profile) == "table", "a Profile is always a table")
+    t.eq(profile.SchemaVersion, StateSchema.VERSION)
+    for _, key in ipairs({ "Plot", "Prestige", "Settings", "Stats" }) do
+        t.truthy(type(profile[key]) == "table", key .. " is present")
+    end
+    local plot = profile.Plot
+    t.truthy(plot.Essence == plot.Essence and plot.Essence >= 0 and plot.Essence < math.huge,
+        "Essence is a finite non-negative number")
+    t.truthy(plot.Stage >= 1 and plot.Stage <= EvolutionData.MaxStage and plot.Stage % 1 == 0,
+        "Stage is a whole number inside the ladder")
+    for _, field in ipairs({ "Droppers", "Upgrades", "Sections" }) do
+        t.truthy(type(plot[field]) == "table", field .. " is a table")
+    end
+    for id, count in pairs(plot.Droppers) do
+        t.truthy(DropperData.get(id) ~= nil, ("unknown dropper %q survived sanitising"):format(tostring(id)))
+        t.truthy(type(count) == "number" and count > 0 and count % 1 == 0, "counts are positive integers")
+    end
+    for id in pairs(plot.Upgrades) do
+        t.truthy(UpgradeData.get(id) ~= nil, ("unknown upgrade %q survived"):format(tostring(id)))
+    end
+    for id in pairs(plot.Sections) do
+        t.truthy(SectionData.get(id) ~= nil, ("unknown section %q survived"):format(tostring(id)))
+    end
+    if plot.Affinity ~= nil then
+        t.truthy(type(plot.Affinity) == "string")
+    end
+    t.truthy(profile.Prestige.Rebirths >= 0)
+    t.truthy(type(profile.Settings.Music) == "boolean")
+    t.truthy(type(profile.Settings.Sfx) == "boolean")
+end
+
+-------------------------------------------------------------------------------
+-- Construction
+-------------------------------------------------------------------------------
+t.test("a new profile is legal, empty and versioned", function()
+    local profile = StateSchema.newProfile()
+    assertLegalProfile(profile)
+    t.eq(profile.Plot.Essence, 0)
+    t.eq(profile.Plot.Stage, 1)
+    t.eq(profile.Plot.Affinity, nil)
+    t.eq(profile.Prestige.Rebirths, 0)
+    t.eq(profile.Prestige.Multiplier, 1)
+    t.truthy(profile.Settings.Music, "settings default ON: a missing setting must not mute a player")
+    t.truthy(profile.Settings.Sfx)
+end)
+
+t.test("two new profiles do not share nested tables", function()
+    local a, b = StateSchema.newProfile(), StateSchema.newProfile()
+    a.Plot.Droppers[firstDropper.Id] = 5
+    t.eq(b.Plot.Droppers[firstDropper.Id], nil, "a shared table would link every player's save")
+    t.neq(a.Plot, b.Plot)
+end)
+
+t.test("clonePlotState detaches and repairs in one step", function()
+    local original = StateSchema.newPlotState()
+    original.Droppers[firstDropper.Id] = 3
+    original.Droppers.ghost_dropper = 99
+    local copy = StateSchema.clonePlotState(original)
+    copy.Droppers[firstDropper.Id] = 99
+    t.eq(original.Droppers[firstDropper.Id], 3, "the original is untouched")
+    t.eq(copy.Droppers.ghost_dropper, nil, "cloning also drops the unknown id")
+end)
+
+-------------------------------------------------------------------------------
+-- Sanitising
+-------------------------------------------------------------------------------
+t.test("sanitizeProfile turns any garbage into a legal profile without erroring", function()
+    local cyclic = { Plot = {} }
+    cyclic.Plot.self = cyclic
+    local hostile = {
+        nil, 42, "a string", true, {}, { 1, 2, 3 }, cyclic,
+        { SchemaVersion = "one", Plot = "not a table" },
+        { Plot = { Essence = 0 / 0, Stage = math.huge, Droppers = 5, Upgrades = true, Sections = "x" } },
+        { Plot = { Essence = -1e30, Stage = -7, LifetimeEssence = 0 / 0 } },
+        { Prestige = { Rebirths = 1e300, Multiplier = 0 / 0, Badges = "none" } },
+        { Settings = { Music = "yes", Sfx = 1 } },
+        { Stats = { TotalEssenceEarned = math.huge, Playtime = -5, JoinCount = "many" } },
+    }
+    for index = 1, 13 do
+        local profile
+        t.noThrow(function() profile = StateSchema.sanitizeProfile(hostile[index]) end,
+            ("sanitizeProfile errored on hostile input %d"):format(index))
+        assertLegalProfile(profile)
+    end
+end)
+
+t.test("sanitizing keeps legitimate progress intact", function()
+    local raw = {
+        SchemaVersion = 1,
+        Plot = {
+            Essence = 12345.5, Stage = 4, Affinity = "tide",
+            Droppers = { [firstDropper.Id] = 7, [secondDropper.Id] = 2 },
+            Upgrades = { [firstUpgrade.Id] = 3 },
+            Sections = { [SectionData.Base] = true, [SectionData.List[2].Id] = true },
+            LifetimeEssence = 999999,
+        },
+        Prestige = { Rebirths = 6, Multiplier = 2.5, Badges = {}, TotalTranscended = 5e9 },
+        Settings = { Music = false, Sfx = true },
+        Stats = { TotalEssenceEarned = 1e10, Playtime = 3600, JoinCount = 12, FirstJoin = 1, LastSave = 2 },
+    }
+    local clean = StateSchema.sanitizeProfile(raw)
+    assertLegalProfile(clean)
+    t.eq(clean.Plot.Essence, 12345.5)
+    t.eq(clean.Plot.Stage, 4)
+    t.eq(clean.Plot.Affinity, "tide")
+    t.eq(clean.Plot.Droppers[firstDropper.Id], 7)
+    t.eq(clean.Plot.Upgrades[firstUpgrade.Id], 3)
+    t.truthy(clean.Plot.Sections[SectionData.List[2].Id])
+    t.eq(clean.Prestige.Rebirths, 6)
+    t.eq(clean.Settings.Music, false, "an explicitly disabled setting is not reset to the default")
+    t.eq(clean.Stats.JoinCount, 12)
+end)
+
+t.test("a hand-edited save cannot smuggle in progress it did not earn", function()
+    local cheated = StateSchema.sanitizeProfile({
+        Plot = {
+            Essence = 1e300,
+            Stage = 99,
+            Affinity = "plasma",
+            Droppers = { god_mode = 1e300, [firstDropper.Id] = 1e300 },
+            Upgrades = { [firstUpgrade.Id] = 1e300, fake_upgrade = 50 },
+            Sections = { every_wing = true, [SectionData.List[3].Id] = true },
+        },
+        Prestige = { Rebirths = 1e9, Multiplier = 1e30 },
+    })
+    assertLegalProfile(cheated)
+    t.eq(cheated.Plot.Stage, EvolutionData.MaxStage, "stage clamps to the top of the ladder")
+    t.eq(cheated.Plot.Affinity, nil, "an unknown affinity is dropped, not kept")
+    t.eq(cheated.Plot.Droppers.god_mode, nil)
+    t.eq(cheated.Plot.Droppers[firstDropper.Id], firstDropper.MaxOwned,
+        "a dropper count clamps to that def's own ceiling")
+    t.eq(cheated.Plot.Upgrades[firstUpgrade.Id], firstUpgrade.MaxLevel)
+    t.eq(cheated.Plot.Upgrades.fake_upgrade, nil)
+    t.eq(cheated.Plot.Sections.every_wing, nil)
+    t.lt(cheated.Plot.Essence, math.huge)
+    t.truthy(cheated.Prestige.Rebirths <= RebirthData.MaxTrackedRebirths,
+        "rebirths clamp so the multiplier cannot run away")
+
+    -- The clamped values must still be legal inputs to the live economy.
+    t.noThrow(function() return Economy.estimateIncomePerSecond(cheated.Plot,
+        Economy.getMultipliers(cheated.Plot, { cheated.Prestige.Rebirths })) end)
+end)
+
+t.test("badges are rebuilt from the rebirth count", function()
+    local profile = StateSchema.sanitizeProfile({ Prestige = { Rebirths = 10, Badges = { made_up = true } } })
+    t.eq(profile.Prestige.Badges.made_up, nil, "an unknown badge id is dropped")
+    local expected = RebirthData.badgesFor(10)
+    for id in pairs(expected) do
+        t.truthy(profile.Prestige.Badges[id], ("badge %s should be rebuilt from the count"):format(id))
+    end
+end)
+
+t.test("migrate stamps the current version and repairs on the way through", function()
+    local migrated = StateSchema.migrate({ SchemaVersion = 0, Plot = { Essence = 500 } })
+    t.eq(migrated.SchemaVersion, StateSchema.VERSION)
+    t.eq(migrated.Plot.Essence, 500, "a version bump must not discard real progress")
+    assertLegalProfile(migrated)
+
+    -- A save from a FUTURE build (a rolled-back server) must not crash the load.
+    local fromFuture = StateSchema.migrate({ SchemaVersion = 999, Plot = { Essence = 700 } })
+    assertLegalProfile(fromFuture)
+    t.noThrow(function() return StateSchema.migrate(nil) end)
+    t.noThrow(function() return StateSchema.migrate("garbage") end)
+end)
+
+-------------------------------------------------------------------------------
+-- Max-merge (the link rule)
+-------------------------------------------------------------------------------
+t.test("mergePlotStates takes the maximum of every field", function()
+    local a = StateSchema.newPlotState()
+    a.Essence, a.Stage, a.LifetimeEssence = 500, 3, 9000
+    a.Droppers = { [firstDropper.Id] = 5, [secondDropper.Id] = 1 }
+    a.Upgrades = { [firstUpgrade.Id] = 2 }
+    a.Sections = { [SectionData.Base] = true, [SectionData.List[2].Id] = true }
+    a.Affinity = "ember"
+
+    local b = StateSchema.newPlotState()
+    b.Essence, b.Stage, b.LifetimeEssence = 200, 4, 12000
+    b.Droppers = { [firstDropper.Id] = 2, [DropperData.List[3].Id] = 4 }
+    b.Upgrades = { [firstUpgrade.Id] = 6 }
+    b.Sections = { [SectionData.Base] = true, [SectionData.List[3].Id] = true }
+
+    local merged = StateSchema.mergePlotStates(a, b)
+    t.eq(merged.Essence, 500, "the larger wallet wins")
+    t.eq(merged.Stage, 4, "the further stage wins")
+    t.eq(merged.LifetimeEssence, 12000)
+    t.eq(merged.Droppers[firstDropper.Id], 5, "per-id maximum")
+    t.eq(merged.Droppers[secondDropper.Id], 1, "an id only one side owns is kept")
+    t.eq(merged.Droppers[DropperData.List[3].Id], 4)
+    t.eq(merged.Upgrades[firstUpgrade.Id], 6)
+    t.truthy(merged.Sections[SectionData.List[2].Id], "sections union")
+    t.truthy(merged.Sections[SectionData.List[3].Id])
+end)
+
+t.test("merging is commutative and never loses anything either side owned", function()
+    local a = StateSchema.newPlotState()
+    a.Essence, a.Stage = 900, 2
+    a.Droppers = { [firstDropper.Id] = 9 }
+    local b = StateSchema.newPlotState()
+    b.Essence, b.Stage = 100, 5
+    b.Droppers = { [secondDropper.Id] = 3 }
+
+    local ab, ba = StateSchema.mergePlotStates(a, b), StateSchema.mergePlotStates(b, a)
+    t.deepEq(ab, ba, "link order must not change the outcome")
+    for _, merged in ipairs({ ab, ba }) do
+        t.truthy(merged.Essence >= a.Essence and merged.Essence >= b.Essence)
+        t.truthy(merged.Stage >= a.Stage and merged.Stage >= b.Stage)
+        t.eq(merged.Droppers[firstDropper.Id], 9)
+        t.eq(merged.Droppers[secondDropper.Id], 3)
+    end
+end)
+
+t.test("merging is idempotent and total", function()
+    local a = StateSchema.newPlotState()
+    a.Essence = 4242
+    a.Droppers = { [firstDropper.Id] = 2 }
+    t.deepEq(StateSchema.mergePlotStates(a, a), StateSchema.clonePlotState(a),
+        "merging a state with itself changes nothing")
+
+    for _, junk in ipairs({ 5, "text", true, { Essence = 0 / 0, Droppers = 7 } }) do
+        t.noThrow(function() return StateSchema.mergePlotStates(a, junk) end)
+        t.noThrow(function() return StateSchema.mergePlotStates(junk, a) end)
+    end
+    local fromNil = StateSchema.mergePlotStates(nil, nil)
+    t.eq(fromNil.Essence, 0)
+    t.eq(fromNil.Stage, 1)
+end)
+
+t.test("merging does not mutate either input", function()
+    local a, b = StateSchema.newPlotState(), StateSchema.newPlotState()
+    a.Essence, b.Essence = 10, 20
+    a.Droppers[firstDropper.Id] = 1
+    StateSchema.mergePlotStates(a, b)
+    t.eq(a.Essence, 10)
+    t.eq(b.Essence, 20)
+    t.eq(b.Droppers[firstDropper.Id], nil, "the merge must not leak a's droppers into b")
+end)
+
+-------------------------------------------------------------------------------
+-- Snapshot
+-------------------------------------------------------------------------------
+local function sanctum(overrides)
+    local state = StateSchema.newPlotState()
+    state.Essence, state.Stage = 5000, 3
+    state.Droppers[firstDropper.Id] = 4
+    local base = {
+        Id = 2,
+        State = state,
+        Occupants = {
+            [11] = { UserId = 11, Slot = 1, Contribution = 3000, Name = "Ash" },
+            [22] = { UserId = 22, Slot = 2, Contribution = 2000, Name = "Bree" },
+        },
+    }
+    for key, value in pairs(overrides or {}) do base[key] = value end
+    return base
+end
+
+local function profilesFor()
+    local ash = StateSchema.newProfile()
+    ash.Prestige.Rebirths, ash.Prestige.Multiplier = 4, Economy.getPrestigeMultiplier(4)
+    ash.Settings.Music = false
+    ash.Stats.TotalEssenceEarned = 5e8
+    local bree = StateSchema.newProfile()
+    bree.Prestige.Rebirths, bree.Prestige.Multiplier = 1, Economy.getPrestigeMultiplier(1)
+    return { [11] = ash, [22] = bree }
+end
+
+t.test("a full snapshot carries everything the HUD needs", function()
+    local payload = Snapshot.forClient(sanctum(), { UserId = 11 },
+        { Full = true, Tick = 7, MoteCount = 12, Profiles = profilesFor() })
+
+    t.eq(payload.Full, true)
+    t.eq(payload.Tick, 7)
+    t.eq(payload.Essence, 5000)
+    t.eq(payload.Plot.Id, 2)
+    t.eq(payload.Plot.Stage, 3)
+    t.eq(payload.Plot.MoteCount, 12)
+    t.gt(payload.Plot.MoteCapacity, 0)
+    t.gt(payload.Plot.IncomePerSecond, 0)
+    t.gt(payload.Plot.Multiplier, 1, "two veterans lift the shared multiplier above 1")
+
+    t.eq(#payload.Occupants, 2)
+    t.eq(payload.Occupants[1].Slot, 1, "occupants are ordered by slot, so the panel cannot flicker")
+    t.eq(payload.Occupants[1].Name, "Ash")
+    t.truthy(payload.Occupants[1].IsYou)
+    t.falsy(payload.Occupants[2].IsYou)
+    t.eq(payload.Occupants[2].Contribution, 2000)
+    t.eq(payload.Occupants[1].Rebirths, 4)
+
+    t.eq(payload.You.Rebirths, 4)
+    t.eq(payload.You.Slot, 1)
+    t.eq(payload.You.Settings.Music, false, "your own settings ride the snapshot")
+    t.eq(payload.You.TotalEssenceEarned, 5e8)
+
+    t.truthy(type(payload.Gates.Attune.Ok) == "boolean")
+    t.eq(payload.Gates.Attune.NextStage, 4)
+    t.eq(payload.Gates.Attune.Cost, EvolutionData.Stages[4].RequiredEssence)
+    t.truthy(payload.Gates.Affinity.Available, "affinity unlocks at stage 3")
+    t.eq(payload.Gates.Affinity.Chosen, nil)
+end)
+
+t.test("a fast tick carries essence only", function()
+    local payload = Snapshot.forClient(sanctum(), { UserId = 11 }, { Full = false, Tick = 9 })
+    t.eq(payload.Full, false)
+    t.eq(payload.Essence, 5000)
+    t.eq(payload.Tick, 9)
+    t.eq(payload.Plot, nil, "the expensive half is omitted from the twice-a-second tick")
+    t.eq(payload.Occupants, nil)
+    t.eq(payload.Gates, nil)
+end)
+
+t.test("the snapshot is a detached copy the server cannot mutate later", function()
+    local live = sanctum()
+    local payload = Snapshot.forClient(live, { UserId = 11 }, { Full = true, Profiles = profilesFor() })
+    live.State.Droppers[firstDropper.Id] = 99
+    t.eq(payload.Plot.Droppers[firstDropper.Id], 4,
+        "a queued payload must not change under the client between tick and send")
+end)
+
+t.test("snapshotting never throws, whatever the sanctum looks like", function()
+    for _, junk in ipairs({ 5, "text", true, {}, { State = "corrupt" },
+        { State = { Essence = 0 / 0 }, Occupants = "none" },
+        { Occupants = { { UserId = "not a number" } } } }) do
+        local payload
+        t.noThrow(function() payload = Snapshot.forClient(junk, nil, { Full = true }) end)
+        t.truthy(type(payload) == "table")
+    end
+    t.noThrow(function() return Snapshot.forClient(nil, nil, nil) end)
+end)
+
+t.test("an occupant with no profile still renders", function()
+    -- A partner whose profile is mid-load must not blank the whole partner panel.
+    local payload = Snapshot.forClient(sanctum(), { UserId = 11 }, { Full = true, Profiles = { [11] = StateSchema.newProfile() } })
+    t.eq(#payload.Occupants, 2)
+    t.eq(payload.Occupants[2].Rebirths, 0, "a missing profile reads as zero prestige, not nil")
+    t.eq(payload.Occupants[2].Multiplier, 1)
+end)
+
+--#endregion
+end }
+SPECS[#SPECS + 1] = { Name = "utils.spec", Run = function(t, Mock, loadModule, runScript)
+--#region tests/specs/utils.spec.luau
+--[[
+    utils.spec
+    The leaf utilities. Everything above them assumes these are total functions that never throw on
+    hostile input, so the tests lean hard on nil, NaN, cycles and wrong types.
+]]
+
+local Format = loadModule("ReplicatedStorage/Modules/Format")
+local Validate = loadModule("ReplicatedStorage/Modules/Validate")
+local TableUtil = loadModule("ReplicatedStorage/Modules/TableUtil")
+local Signal = loadModule("ReplicatedStorage/Modules/Signal")
+local GameConfig = loadModule("ReplicatedStorage/Modules/GameConfig")
+
+-------------------------------------------------------------------------------
+-- Format
+-------------------------------------------------------------------------------
+t.test("Format.abbreviate is exact below 1000 and suffixed above", function()
+    t.eq(Format.abbreviate(0), "0")
+    t.eq(Format.abbreviate(7), "7")
+    t.eq(Format.abbreviate(999), "999")
+    t.eq(Format.abbreviate(1000), "1K")
+    t.eq(Format.abbreviate(1500), "1.5K")
+    t.eq(Format.abbreviate(1234567), "1.23M")
+    t.eq(Format.abbreviate(1e9), "1B")
+    t.eq(Format.abbreviate(2.5e12), "2.5T")
+    t.eq(Format.abbreviate(-1500), "-1.5K")
+    t.eq(Format.abbreviate(12.5), "12.5")
+end)
+
+t.test("Format.abbreviate survives every non-finite and out-of-range input", function()
+    t.eq(Format.abbreviate(0 / 0), "0", "NaN")
+    -- Infinity must NOT render as "0": a pad labelled "Buy for 0" that cannot be bought is worse
+    -- than an obviously-wrong symbol.
+    t.neq(Format.abbreviate(math.huge), "0", "infinity is not zero")
+    t.truthy(#Format.abbreviate(math.huge) <= 3)
+    t.truthy(Format.abbreviate(-math.huge):find("-", 1, true), "-infinity keeps its sign")
+    t.eq(Format.comma(math.huge), Format.abbreviate(math.huge))
+    t.noThrow(function() return Format.abbreviate(nil) end)
+    t.noThrow(function() return Format.abbreviate("nonsense") end)
+    -- Past the last suffix it must still produce something short, never "inf" or a 40-digit run.
+    local huge = Format.abbreviate(1e40)
+    t.lt(#huge, 12, "very large numbers stay short: " .. huge)
+    t.falsy(huge:find("inf"), "no 'inf' leaks into the HUD")
+end)
+
+t.test("Format.abbreviate never renders a rounded-up 1000.00 prefix", function()
+    -- 999999 rounds to 1000.00K at two decimals; it must promote to the next suffix instead.
+    for _, value in ipairs({ 999999, 999999999, 999999999999 }) do
+        local text = Format.abbreviate(value)
+        t.falsy(text:find("^1000"), ("%d rendered as %s"):format(value, text))
+    end
+end)
+
+t.test("Format.comma, time, multiplier, percent and essence", function()
+    t.eq(Format.comma(0), "0")
+    t.eq(Format.comma(999), "999")
+    t.eq(Format.comma(1000), "1,000")
+    t.eq(Format.comma(1234567), "1,234,567")
+    t.eq(Format.comma(-1234), "-1,234")
+    t.eq(Format.comma(0 / 0), "0")
+    t.eq(Format.comma(nil), "0")
+
+    t.eq(Format.time(0), "0s")
+    t.eq(Format.time(12), "12s")
+    t.eq(Format.time(-5), "0s", "negative durations clamp rather than render backwards")
+    t.truthy(Format.time(200):find("m"), "minutes appear past 60s")
+    t.truthy(Format.time(3840):find("h"), "hours appear past 3600s")
+
+    t.eq(Format.multiplier(2.35), "x2.35")
+    t.eq(Format.percent(0.25), "25%")
+    t.truthy(Format.essence(1500):find("1.5K"), "essence formatting wraps abbreviate")
+    t.truthy(Format.essence(1500):find(GameConfig.Currency.Symbol, 1, true), "and carries the symbol")
+end)
+
+-------------------------------------------------------------------------------
+-- Validate
+-------------------------------------------------------------------------------
+t.test("Validate type guards reject the wrong types instead of erroring", function()
+    t.truthy(Validate.isNumber(1))
+    t.falsy(Validate.isNumber("1"))
+    t.truthy(Validate.isFiniteNumber(1.5))
+    t.falsy(Validate.isFiniteNumber(0 / 0))
+    t.falsy(Validate.isFiniteNumber(math.huge))
+    t.truthy(Validate.isString("a"))
+    t.falsy(Validate.isString(nil))
+    t.truthy(Validate.isBoolean(false))
+    t.falsy(Validate.isBoolean(0), "0 is not false")
+    t.truthy(Validate.isTable({}))
+    t.truthy(Validate.isArray({ 1, 2, 3 }))
+    t.falsy(Validate.isArray({ a = 1 }))
+    t.truthy(Validate.isArray({}), "an empty table counts as an empty array")
+end)
+
+t.test("Validate.isId accepts only safe identifier strings", function()
+    t.truthy(Validate.isId("ember_vent"))
+    t.truthy(Validate.isId("wing_core"))
+    t.falsy(Validate.isId(""))
+    t.falsy(Validate.isId("has spaces"))
+    t.falsy(Validate.isId("../../etc/passwd"))
+    t.falsy(Validate.isId(("x"):rep(65)), "over-long ids are rejected")
+    t.falsy(Validate.isId(123))
+    t.falsy(Validate.isId(nil))
+    t.falsy(Validate.isId({}))
+end)
+
+t.test("Validate.clampNumber falls back to the default for junk", function()
+    t.eq(Validate.clampNumber(5, 0, 10, 1), 5)
+    t.eq(Validate.clampNumber(-5, 0, 10, 1), 0)
+    t.eq(Validate.clampNumber(50, 0, 10, 1), 10)
+    -- Non-finite input collapses to the default rather than clamping to the bound. That matters
+    -- for save repair: a tampered `Essence = inf` must become 0, not "the maximum allowed".
+    t.eq(Validate.clampNumber(0 / 0, 0, 10, 1), 1, "NaN falls back")
+    t.eq(Validate.clampNumber(math.huge, 0, 10, 1), 1, "infinity falls back, it does not clamp up")
+    t.eq(Validate.clampNumber(-math.huge, 0, 10, 1), 1)
+    t.eq(Validate.clampNumber(5, 10, 0, 1), 5, "swapped bounds are tolerated")
+    t.eq(Validate.clampNumber("7", 0, 10, 1), 1, "strings are not coerced")
+    t.eq(Validate.clampNumber(nil, 0, 10, 1), 1)
+    t.eq(Validate.clampNumber({}, 0, 10, 1), 1)
+end)
+
+t.test("Validate.payload rejects missing, mistyped AND extra fields", function()
+    local shape = { Key = "string", Value = "boolean" }
+    t.truthy(Validate.payload({ Key = "Music", Value = true }, shape))
+    t.falsy(Validate.payload({ Key = "Music" }, shape), "missing field")
+    t.falsy(Validate.payload({ Key = "Music", Value = 1 }, shape), "wrong type")
+    t.falsy(Validate.payload({ Key = "Music", Value = true, Extra = 1 }, shape),
+        "an unexpected key is how an exploiter probes a handler")
+    t.falsy(Validate.payload(nil, shape))
+    t.falsy(Validate.payload("string", shape))
+    t.falsy(Validate.payload({ 1, 2, 3 }, shape))
+end)
+
+t.test("Validate.payload never errors, whatever it is handed", function()
+    local cyclic = {}
+    cyclic.self = cyclic
+    for _, hostile in ipairs({ 0 / 0, math.huge, print, coroutine.create(print), cyclic,
+        setmetatable({}, { __index = function() error("gotcha") end }) }) do
+        t.noThrow(function() return Validate.payload(hostile, { A = "number" }) end)
+    end
+    t.noThrow(function() return Validate.payload({ A = 1 }, nil) end)
+end)
+
+-------------------------------------------------------------------------------
+-- TableUtil
+-------------------------------------------------------------------------------
+t.test("TableUtil.deepCopy detaches nested tables and survives cycles", function()
+    local source = { a = 1, nested = { list = { 1, 2, 3 } } }
+    local copy = TableUtil.deepCopy(source)
+    copy.nested.list[1] = 99
+    t.eq(source.nested.list[1], 1, "the original is untouched")
+    t.deepEq(TableUtil.deepCopy({}), {})
+
+    local cyclic = { name = "root" }
+    cyclic.self = cyclic
+    local cyclicCopy = TableUtil.noThrow ~= nil and nil or TableUtil.deepCopy(cyclic)
+    t.eq(cyclicCopy.name, "root")
+    t.eq(cyclicCopy.self, cyclicCopy, "the cycle is preserved, not infinitely expanded")
+end)
+
+t.test("TableUtil.deepCopy keeps Roblox datatypes by reference", function()
+    local source = { colour = Color3.fromRGB(10, 20, 30), position = Vector3.new(1, 2, 3) }
+    local copy = TableUtil.deepCopy(source)
+    t.eq(copy.colour, source.colour)
+    t.eq(copy.position, source.position)
+end)
+
+t.test("TableUtil.merge overlays a patch without mutating the base", function()
+    local base = { a = 1, nested = { x = 1, y = 2 } }
+    local merged = TableUtil.merge(base, { b = 2, nested = { y = 9 } })
+    t.eq(merged.a, 1)
+    t.eq(merged.b, 2)
+    t.eq(merged.nested.y, 9)
+    t.eq(base.nested.y, 2, "the base is untouched")
+    t.deepEq(TableUtil.merge(nil, nil), {})
+end)
+
+t.test("TableUtil collection helpers", function()
+    t.eq(TableUtil.count({ a = 1, b = 2 }), 2)
+    t.eq(TableUtil.count(nil), 0)
+    t.truthy(TableUtil.isEmpty({}))
+    t.falsy(TableUtil.isEmpty({ a = 1 }))
+    t.deepEq(TableUtil.sortedKeys({ b = 1, a = 1, c = 1 }), { "a", "b", "c" })
+    t.deepEq(TableUtil.map({ 1, 2, 3 }, function(v) return v * 2 end), { 2, 4, 6 })
+    t.deepEq(TableUtil.filter({ 1, 2, 3, 4 }, function(v) return v % 2 == 0 end), { 2, 4 })
+    t.eq(TableUtil.reduce({ 1, 2, 3 }, function(acc, v) return acc + v end, 0), 6)
+    local found, index = TableUtil.find({ "a", "b", "c" }, function(v) return v == "b" end)
+    t.eq(found, "b")
+    t.eq(index, 2)
+    t.eq(TableUtil.find({ "a" }, function() return false end), nil)
+end)
+
+t.test("TableUtil.deepEquals compares by value and handles cycles", function()
+    t.truthy(TableUtil.deepEquals({ a = { 1, 2 } }, { a = { 1, 2 } }))
+    t.falsy(TableUtil.deepEquals({ a = { 1, 2 } }, { a = { 1, 3 } }))
+    t.falsy(TableUtil.deepEquals({ a = 1 }, { a = 1, b = 2 }), "extra keys count")
+    t.truthy(TableUtil.deepEquals(1, 1))
+    t.falsy(TableUtil.deepEquals(1, "1"))
+    local a, b = {}, {}
+    a.self, b.self = a, b
+    t.noThrow(function() return TableUtil.deepEquals(a, b) end, "cycles must not blow the stack")
+end)
+
+-------------------------------------------------------------------------------
+-- Signal
+-------------------------------------------------------------------------------
+t.test("Signal delivers to every handler and honours Disconnect", function()
+    local signal = Signal.new()
+    local received = {}
+    local first = signal:Connect(function(value) table.insert(received, "a" .. value) end)
+    signal:Connect(function(value) table.insert(received, "b" .. value) end)
+
+    signal:Fire(1)
+    Mock.advance(0)
+    t.eq(#received, 2)
+
+    first:Disconnect()
+    signal:Fire(2)
+    Mock.advance(0)
+    t.eq(#received, 3, "only the remaining handler ran")
+end)
+
+t.test("Signal.Once fires exactly once", function()
+    local signal = Signal.new()
+    local count = 0
+    signal:Once(function() count += 1 end)
+    signal:Fire()
+    signal:Fire()
+    Mock.advance(0)
+    t.eq(count, 1)
+end)
+
+t.test("one erroring handler cannot stop the others", function()
+    local signal = Signal.new()
+    local reached = false
+    signal:Connect(function() error("handler blew up") end)
+    signal:Connect(function() reached = true end)
+    t.noThrow(function() signal:Fire() end, "Fire itself must not propagate handler errors")
+    Mock.advance(0)
+    t.truthy(reached, "the second handler still ran")
+end)
+
+t.test("disconnecting during a Fire is safe", function()
+    local signal = Signal.new()
+    local calls = 0
+    local second
+    signal:Connect(function()
+        calls += 1
+        if second then second:Disconnect() end
+    end)
+    second = signal:Connect(function() calls += 1 end)
+    t.noThrow(function() signal:Fire() end)
+    Mock.advance(0)
+    t.gt(calls, 0)
+end)
+
+t.test("DisconnectAll and Destroy clear every handler", function()
+    local signal = Signal.new()
+    local calls = 0
+    signal:Connect(function() calls += 1 end)
+    signal:DisconnectAll()
+    signal:Fire()
+    Mock.advance(0)
+    t.eq(calls, 0)
+    t.noThrow(function() signal:Destroy() end)
 end)
 
 --#endregion

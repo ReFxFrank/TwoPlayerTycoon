@@ -132,7 +132,9 @@ end
 function Testing.runAll(specs, Mock, loadModule, runScript)
     local passed, failed = 0, 0
     local failures = {}
-    local started = os.clock()
+    -- os.clock is the mock's virtual clock; the runner wants real elapsed time.
+    local wallClock = __realClock or os.clock
+    local started = wallClock()
 
     for _, spec in ipairs(specs) do
         local context = newContext()
@@ -160,7 +162,7 @@ function Testing.runAll(specs, Mock, loadModule, runScript)
         end
     end
 
-    print(("\n%s\n%d passed, %d failed in %.2fs"):format(("-"):rep(60), passed, failed, os.clock() - started))
+    print(("\n%s\n%d passed, %d failed in %.2fs"):format(("-"):rep(60), passed, failed, wallClock() - started))
     if failed > 0 then
         print("\nFailures:")
         for _, failure in ipairs(failures) do
