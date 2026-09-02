@@ -19,8 +19,9 @@ local GameConfig = require(Modules:WaitForChild("GameConfig"))
 type Store = any
 
 type Counters = {
-	Attempts: number, -- individual DataStore calls issued (not operations)
-	Failures: number, -- attempts that threw, transient or fatal
+	Attempts: number, -- individual DataStore calls issued
+	FailedAttempts: number, -- calls that threw, transient or fatal
+	Failures: number, -- OPERATIONS that ran out of retries and returned false
 	Retries: number, -- backoff sleeps taken, i.e. attempts beyond the first
 	BudgetWaits: number, -- polls spent waiting for request budget to refill
 }
@@ -65,8 +66,12 @@ local REQUEST_UPDATE = Enum.DataStoreRequestType.UpdateAsync
 local Service = {}
 Service.Name = "DataStoreWrapper"
 
+-- Attempts and FailedAttempts count individual round trips; Failures counts OPERATIONS that ran
+-- out of retries and returned false. Failures is the number worth alerting on -- a server that
+-- retried 400 times and never lost a save is healthy, one with a single Failure is not.
 Service.Stats = {
 	Attempts = 0,
+	FailedAttempts = 0,
 	Failures = 0,
 	Retries = 0,
 	BudgetWaits = 0,
@@ -136,9 +141,10 @@ local function perform(requestType: any, call: () -> any): (boolean, any)
 		if ok then
 			return true, result
 		end
-		stats.Failures += 1
+		stats.FailedAttempts += 1
 		lastError = result
 		if not isTransient(result) then
+			stats.Failures += 1
 			return false, result
 		end
 		-- No sleep after the final attempt: the caller is already out of retries and, on a
@@ -149,6 +155,7 @@ local function perform(requestType: any, call: () -> any): (boolean, any)
 		end
 	end
 
+	stats.Failures += 1
 	return false, lastError
 end
 
@@ -262,6 +269,7 @@ function Service:GetStats(): Counters
 	local stats = Service.Stats
 	return {
 		Attempts = stats.Attempts,
+		FailedAttempts = stats.FailedAttempts,
 		Failures = stats.Failures,
 		Retries = stats.Retries,
 		BudgetWaits = stats.BudgetWaits,
@@ -273,6 +281,7 @@ end
 function Service:ResetStats(): ()
 	local stats = Service.Stats
 	stats.Attempts = 0
+	stats.FailedAttempts = 0
 	stats.Failures = 0
 	stats.Retries = 0
 	stats.BudgetWaits = 0

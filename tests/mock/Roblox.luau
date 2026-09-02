@@ -251,6 +251,11 @@ function Mock.DataStore.failNext(count) Services.dsControl.FailNext = count end
 function Mock.DataStore.failAlways(enabled) Services.dsControl.FailAlways = enabled and true or false end
 function Mock.DataStore.setLatency(seconds) Services.dsControl.Latency = seconds or 0 end
 function Mock.DataStore.setBudget(budget) Services.dsControl.Budget = budget end
+--- Sets the message injected faults throw. Callers classify errors by their text (transient vs
+--- fatal), so a test needs to control the wording to exercise both branches.
+function Mock.DataStore.setMessage(message)
+    Services.dsControl.Message = message or "DataStore request failed: mock fault"
+end
 function Mock.DataStore.calls() return Services.dsControl.Calls end
 function Mock.DataStore.raw(name, scope)
     local store = Services.dataStores[("%s/%s"):format(name, scope or "global")]
@@ -303,6 +308,7 @@ function Mock.reset()
     Services.dsControl.Latency = 0
     Services.dsControl.Budget = 100
     Services.dsControl.Calls = 0
+    Mock.DataStore.setMessage(nil)
     resetRuntime()
 end
 
