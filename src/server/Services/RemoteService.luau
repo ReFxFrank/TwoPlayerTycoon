@@ -1,12 +1,11 @@
 --!strict
 --[[
     RemoteService
-    The one door a client -> server message walks through. It builds the SanctumRemotes folder and
-    every RemoteEvent RemoteSchema declares, then funnels every inbound event into a single guarded
-    dispatcher: check the sender, spend a rate-limit token, validate the payload, and only then call
-    the registered handler -- inside a pcall, so one service erroring on one player's payload cannot
-    take the remote down for everybody else. Outbound sends are name- and direction-checked against
-    the same schema, so a typo is a boot-time error, not a message that silently never arrives.
+    The one door a client -> server message walks through: it builds the SanctumRemotes folder and
+    every RemoteEvent RemoteSchema declares, then funnels every inbound event into one guarded
+    dispatcher -- sender check, rate-limit token, payload validation, handler inside a pcall, so one
+    erroring handler cannot take a remote down for everybody. Outbound sends are name- and
+    direction-checked against the same schema, so a typo is a boot-time error rather than silence.
     Owner: server/Services  |  Consumers: every service that talks to a client, RateLimiter, tests
 ]]
 
@@ -16,33 +15,28 @@ local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Modules = ReplicatedStorage:WaitForChild("Modules")
 local RemoteSchema = require(Modules:WaitForChild("RemoteSchema"))
 
--- Spec section 3.1: a connection is anything with :Disconnect(). Structural, so this behaves
--- identically under RBXScriptConnection and under the headless mock.
+-- Spec section 3.1: anything with :Disconnect() is a connection -- structural, so the mock fits too.
 type Connection = { Disconnect: (self: any) -> () }
 type Handler = (player: Player, payload: any) -> ()
 
 -- A local mirror of RemoteSchema.RemoteDef rather than an import: the test bundler strips `export`
 -- from type aliases, so a cross-module type reference would not resolve inside the harness.
 type RemoteDef = {
-	Name: string,
-	Direction: string,
-	RateLimit: { Tokens: number, Interval: number }?,
+	Name: string, Direction: string, RateLimit: { Tokens: number, Interval: number }?,
 	Validate: ((payload: any) -> (boolean, string?))?,
 }
 
 local C2S = "ClientToServer"
 local S2C = "ServerToClient"
 
---[[ A rejected call is one an exploiter can repeat as fast as the network allows. Counting each is
-     cheap; PRINTING each is not -- an unthrottled warn turns a spam loop into a log flood, a denial
-     of service against the server's own output. The counter always increments; only the line is
-     rationed, to one per player per this many seconds. ]]
+--[[ A rejected call is one an exploiter repeats as fast as the network allows. Counting each is
+     cheap; PRINTING each is not -- unthrottled warns turn a spam loop into a log flood, itself a
+     denial of service. The counter always increments; only the warn is rationed, per player. ]]
 local WARN_INTERVAL = 10
 
 --[[ Rejection bucket for anything that is not a live player: a garbage first argument, or a stale
      Player whose PlayerRemoving has already run. Neither can be cleaned up later, so keying them by
-     real UserId would re-create entries nothing ever removes -- one slow leak per departed player.
-     One shared bucket is bounded by the closed set of remote names instead. ]]
+     real UserId would re-create entries nothing removes -- one slow leak per departed player. ]]
 local UNKNOWN_SENDER = 0
 
 local Service = {}
@@ -60,10 +54,9 @@ Service._connections = {} :: { Connection }
 Service._rejections = {} :: { [number]: { [string]: number } }
 Service._lastWarn = {} :: { [number]: number }
 
---[[ True only for a player the server can still reach. `Parent ~= Players` is the O(1) form of
-     "still in Players" -- engine and mock both unparent a Player after PlayerRemoving. The
-     typeof/IsA pair in front is what makes it total: Mock.fireServer will hand this a nil, a string
-     or a table, and indexing .Parent on those would throw inside the dispatcher. ]]
+--[[ True only for a player the server can still reach. `Parent ~= Players` is the O(1) "still in
+     Players" test (engine and mock both unparent on PlayerRemoving); the typeof/IsA pair in front
+     makes it total, since Mock.fireServer hands this nils and tables that .Parent would throw on. ]]
 local function isLivePlayer(player: any): boolean
 	return typeof(player) == "Instance" and player:IsA("Player") and player.Parent == Players
 end
@@ -92,9 +85,8 @@ end
 -- The guarded path every inbound message takes. It NEVER errors (an error unwinds the shared
 -- OnServerEvent thread) and NEVER replies (a reply leaks which gate closed).
 local function dispatch(self: any, def: RemoteDef, player: any, payload: any): ()
-	-- 1. Sender. The engine supplies this argument, but a stale reference still arrives: an event
-	-- queued just before a disconnect is delivered just after it, and passing that on would hand a
-	-- service a Player with no profile, no sanctum and no character to act on.
+	-- 1. Sender. The engine supplies this, but a stale reference still arrives -- an event queued
+	-- before a disconnect lands after it -- and that Player has no profile, sanctum or character.
 	if not isLivePlayer(player) then
 		noteRejection(self, UNKNOWN_SENDER, def.Name, "sender is not a live player")
 		return
@@ -103,7 +95,6 @@ local function dispatch(self: any, def: RemoteDef, player: any, payload: any): (
 	-- `t[nil] = v` throws -- exactly the crash this dispatcher exists to prevent.
 	local raw = player.UserId
 	local userId: number = if type(raw) == "number" then raw else UNKNOWN_SENDER
-
 	-- An inbound def missing either piece is a RemoteSchema bug. Fail closed rather than skipping
 	-- the missing check: a visibly dead feature beats an unthrottled or unvalidated front door.
 	local budget, validate = def.RateLimit, def.Validate
@@ -112,16 +103,14 @@ local function dispatch(self: any, def: RemoteDef, player: any, payload: any): (
 		return
 	end
 
-	-- 2. Rate limit BEFORE validation: validation is the more expensive of the two, so a flood is
-	-- dropped at the cheapest point on the path.
+	-- 2. Rate limit BEFORE validation: validation is the pricier check, so a flood dies cheaper here.
 	if not self._rateLimiter:Consume(player, def.Name, budget.Tokens, budget.Interval) then
 		noteRejection(self, userId, def.Name, "rate limited")
 		return
 	end
 
-	-- 3. Payload. RemoteSchema already wraps every validator so it cannot throw; the pcall is here
-	-- because RemoteService must not depend on another module keeping that promise -- an error
-	-- escaping a validator would abort this thread and skip the accounting below.
+	-- 3. Payload. RemoteSchema wraps every validator so it cannot throw; the pcall is here because
+	-- this module must not lean on that promise -- an escaping error would skip the accounting.
 	local ran, accepted, why = pcall(validate, payload)
 	if not ran then
 		noteRejection(self, userId, def.Name, "validator errored")
@@ -131,17 +120,15 @@ local function dispatch(self: any, def: RemoteDef, player: any, payload: any): (
 		return
 	end
 
-	-- 4. Nothing has claimed this remote. Counted rather than ignored: during boot that is normal
-	-- (RemoteService starts before its consumers), but forever is a dead feature worth seeing.
+	-- 4. Nothing has claimed this remote. Counted, not ignored: normal during boot, dead feature after.
 	local handler = self._handlers[def.Name]
 	if handler == nil then
 		noteRejection(self, userId, def.Name, "no handler registered")
 		return
 	end
 
-	-- 5. The handler is another service's code reached from the network edge. Isolate it. Not
-	-- throttled like the rejection warns: an erroring handler is a server bug worth seeing every
-	-- time, and step 2 already caps how often one player can provoke it.
+	-- 5. The handler is another service's code reached from the network edge. Isolate it. The warn is
+	-- not throttled -- an erroring handler is a server bug worth seeing, and step 2 already caps it.
 	local ok, err = pcall(handler, player, payload)
 	if not ok then
 		warn(string.format("[RemoteService] handler for %s errored: %s", def.Name, tostring(err)))
@@ -149,9 +136,8 @@ local function dispatch(self: any, def: RemoteDef, player: any, payload: any): (
 end
 
 --[[ Resolve an outbound remote, erroring on a name that is unknown or inbound. Outbound names are
-     server-authored constants, so a wrong one is a typo, and the ServiceRegistry:Get reasoning
-     applies: returning nil would make it a message that silently never reaches the client and is
-     noticed days later. Level 3 puts the blame on Fire*'s caller. ]]
+     server-authored constants, so a wrong one is a typo; returning nil (ServiceRegistry:Get's
+     reasoning) would make it a message that never arrives. Level 3 blames Fire*'s caller. ]]
 local function outbound(self: any, name: string, caller: string): any
 	local def: RemoteDef? = RemoteSchema.get(name)
 	if def == nil or def.Direction ~= S2C then
@@ -165,11 +151,9 @@ local function outbound(self: any, name: string, caller: string): any
 	return remote
 end
 
---[[ `parent`'s child of `className` named `name`, created only if it is not already there.
-     Reuse is the point: after a soft restart every connected client still holds references to these
-     instances, and rebuilding them would leave those clients listening to dead remotes with nothing
-     to signal the change. A squatter of the wrong class is destroyed instead -- it would make the
-     client's WaitForChild resolve to something unusable, presenting as a hung client. ]]
+--[[ `parent`'s child of `className` named `name`, created only if absent. Reuse is the point: after
+     a soft restart clients still hold references to these instances, and rebuilding would leave them
+     listening to dead ones. A wrong-class squatter is destroyed -- WaitForChild would resolve it. ]]
 local function ensureChild(parent: any, className: string, name: string): any
 	local existing = parent:FindFirstChild(name)
 	if existing ~= nil then
@@ -201,11 +185,9 @@ function Service:Init(registry: any): ()
 	self._rejections = {}
 	self._lastWarn = {}
 	self._remotes = {}
-
 	self._folder = ensureChild(ReplicatedStorage, "Folder", RemoteSchema.FolderName)
-	--[[ ipairs over RemoteSchema.List, never pairs over .Remotes: `pairs` order is unspecified, and
-	     the List is sorted so every server -> client remote is created FIRST, so a client already
-	     listening cannot miss an early push while the inbound events are still being made. ]]
+	-- ipairs over the sorted List, never pairs over .Remotes: `pairs` order is unspecified, and the
+	-- List puts every server -> client remote FIRST so a listening client cannot miss an early push.
 	for _, def in ipairs(RemoteSchema.List :: { RemoteDef }) do
 		self._remotes[def.Name] = ensureChild(self._folder, "RemoteEvent", def.Name)
 	end
@@ -224,7 +206,6 @@ function Service:Start(): ()
 		end)
 		table.insert(self._connections, connection)
 	end
-
 	-- Without this the rejection and warn-throttle tables keep one entry per departed player for the
 	-- lifetime of the server.
 	local removing = Players.PlayerRemoving:Connect(function(player: Player)
@@ -243,9 +224,8 @@ function Service:Stop(): ()
 	self:_disconnectAll()
 end
 
---[[ Claim a client -> server remote. Every refusal here is a mistake made at boot by trusted code,
-     so it errors rather than returning false: a silent no-op would leave a feature permanently
-     unreachable with nothing in the log to say why. ]]
+-- Claim a client -> server remote. Every refusal here is a mistake made at boot by trusted code, so
+-- it errors: a silent no-op would leave a feature unreachable with nothing in the log to say why.
 function Service:On(name: string, handler: Handler): ()
 	local def: RemoteDef? = RemoteSchema.get(name)
 	if def == nil or def.Direction ~= C2S then
@@ -263,9 +243,8 @@ function Service:On(name: string, handler: Handler): ()
 	self._handlers[name] = handler
 end
 
---[[ A player can leave between the decision to send and the send -- a reply to their own remote, a
-     queued notification, a broadcast to a list built a frame ago. That race is unavoidable, so a
-     departed target is skipped silently; only a bad NAME is an error. ]]
+-- A player can leave between the decision to send and the send (a reply to their own remote, a
+-- queued notify). That race is unavoidable, so a departed target is skipped; only a bad NAME errors.
 function Service:FireClient(player: Player, name: string, payload: any): ()
 	local remote = outbound(self, name, "FireClient")
 	if not isLivePlayer(player) then
@@ -291,8 +270,7 @@ function Service:FireAllClients(name: string, payload: any): ()
 	outbound(self, name, "FireAllClients"):FireAllClients(payload)
 end
 
--- nil for an unknown name rather than an error: "does this remote exist" is a fair question, and
--- this is the lookup tests and client-facing code use to answer it.
+-- nil for an unknown name rather than an error: "does this remote exist" is a fair question.
 function Service:GetRemote(name: string): RemoteEvent?
 	if type(name) ~= "string" then
 		return nil
@@ -300,9 +278,8 @@ function Service:GetRemote(name: string): RemoteEvent?
 	return self._remotes[name]
 end
 
---[[ userId -> remote name -> rejection count. Copied, not handed out live: a telemetry reader that
-     mutated the table would corrupt the counters it is reading. userId 0 collects everything not
-     attributable to a live player -- see UNKNOWN_SENDER. ]]
+-- userId -> remote name -> rejection count. Copied, not handed out live: a telemetry reader that
+-- mutated the table would corrupt the counters it reads. userId 0 is UNKNOWN_SENDER.
 function Service:GetRejectionStats(): { [number]: { [string]: number } }
 	local copy: { [number]: { [string]: number } } = {}
 	for userId, byRemote in pairs(self._rejections) do

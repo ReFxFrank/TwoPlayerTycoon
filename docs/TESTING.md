@@ -94,6 +94,27 @@ Assertions: `t.eq t.neq t.near t.gt t.lt t.truthy t.falsy t.deepEq t.throws t.no
 `Mock.reset()` runs before **every** test: fresh instance tree, fresh clock, fresh modules, fresh
 datastores. Nothing leaks between tests.
 
+**Load stateful services inside the test, not at the top of the file.** A service module is a
+singleton holding live state — loaded profiles, memoised DataStore handles, event connections.
+`Mock.reset()` clears the module cache, so a reference captured at registration time keeps pointing
+at the *previous* test's instance, complete with its state and its now-detached store handle. Pure
+modules (`Economy`, `StateSchema`, the data tables) are safe to capture at the top because they hold
+nothing.
+
+```lua
+local function boot()
+    local wrapper = loadModule("ServerScriptService/Core/Services/DataStoreWrapper")
+    local profiles = loadModule("ServerScriptService/Core/Services/ProfileService")
+    profiles:Init({ Get = function() return wrapper end })
+    profiles:Start()
+    return profiles
+end
+
+t.test("...", function()
+    local ProfileService = boot()   -- fresh instance, clean world
+end)
+```
+
 ## Conventions
 
 - Test the *contract*, not the implementation. Reason codes, cost monotonicity and gate outcomes are

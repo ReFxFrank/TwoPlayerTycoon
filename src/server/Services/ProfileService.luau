@@ -62,9 +62,7 @@ local running = false
 -- systems draw from, which would make their tests non-reproducible.
 local rng = Random.new(os.time())
 
-local function keyFor(player: Player): string
-	return SAVE.KeyPrefix .. tostring(player.UserId)
-end
+local function keyFor(player: Player): string return SAVE.KeyPrefix .. tostring(player.UserId) end
 
 --[[ The stored value is { Lock = {JobId, Stamp}, Data = Profile }. A raw legacy Profile (written by
      a build predating the lock) has no Data field and is read as unlocked data, so an old save is
@@ -125,9 +123,8 @@ local function register(player: Player, profile: Profile): Profile
 end
 
 --[[ WHY this profile is never written back: the DataStore being unreachable says nothing about what
-     is stored in it. Persisting this one would replace a veteran's real save with zeroes on the
-     strength of a transient outage -- the worst outcome available to this module, and strictly worse
-     than losing a single session's progress. So it is flagged, and Save refuses it. ]]
+     is stored in it, so persisting this one would replace a veteran's real save with zeroes on the
+     strength of a transient outage. That is far worse than losing one session, so Save skips it. ]]
 local function unsavable(player: Player): Profile
 	local profile: any = StateSchema.newProfile()
 	profile.__NoSave = true
@@ -165,15 +162,11 @@ local function writeProfile(entry: Entry, release: boolean): boolean
 	return ok
 end
 
---[[ Public API ]]
-
 function Service:LoadAsync(player: Player): Profile?
 	local existing = entries[player]
 	if existing ~= nil then return existing.Profile end -- a second load would take a second lock
-	local key = keyFor(player)
-	local attempts = math.max(SESSION.LockRetries, 1)
+	local key, attempts = keyFor(player), math.max(SESSION.LockRetries, 1)
 	local loaded: Profile? = nil
-
 	for attempt = 1, attempts do
 		local claimed = false
 		local ok = wrapper:Update(SAVE.DataStoreName, key, function(current: any): any
@@ -197,7 +190,6 @@ function Service:LoadAsync(player: Player): Profile?
 		if claimed and profile ~= nil then return register(player, profile) end
 		if attempt < attempts then task.wait(SESSION.LockRetryDelay) end
 	end
-
 	--[[ Give up with nil, NOT a blank profile. The caller kicks the player with a clear message and
 	     they rejoin in seconds; handing back an empty profile would let the next save overwrite a
 	     real one, which is unrecoverable. A lost session beats a lost account. ]]
@@ -226,9 +218,8 @@ function Service:Save(player: Player, opts: { Release: boolean? }?): boolean
 			waited += SAVE_POLL_SECONDS
 		end
 		-- Coalesce: the in-flight write publishes the same live table this call would send, so a
-		-- second round trip buys nothing. A Release cannot be coalesced (it has to clear the lock)
-		-- so it falls through and writes once the first call finishes -- unless that one is still
-		-- stuck, in which case a concurrent second write is the worse option.
+		-- second round trip buys nothing. A Release must clear the lock, so it instead falls through
+		-- and writes after the first call -- unless that one is still stuck, when racing it is worse.
 		if not release or entry.Saving then return entry.LastSaveOk end
 	end
 	entry.Saving = true
@@ -242,8 +233,7 @@ end
 function Service:SaveAll(release: boolean?): ()
 	--[[ Bounded by the shutdown budget: Roblox hard-kills the server ~30s into BindToClose whatever
 	     the handler is doing, so a queue of failing saves must be abandoned in time for the players
-	     behind it rather than allowed to eat the whole window. os.clock is monotonic, so a wall
-	     clock correction mid-shutdown cannot stretch or collapse the budget. ]]
+	     behind it. os.clock is monotonic: a wall clock correction cannot stretch or collapse it. ]]
 	local deadline = os.clock() + SAVE.ShutdownBudgetSeconds
 	local doRelease = release == true
 	for player in pairs(entries) do
@@ -269,13 +259,10 @@ function Service:Release(player: Player): ()
 	entries[player] = nil
 end
 
---[[ ServiceRegistry contract ]]
-
 function Service:Init(registry: any): ()
 	wrapper = registry:Get("DataStoreWrapper") -- resolved only: section 6 forbids calls during Init
 	running = false
-	-- Rebuilt so a re-Init never inherits entries (and their live autosave threads) from a previous
-	-- boot, which would leave two services saving through one lock.
+	-- Rebuilt: a re-Init inheriting entries would leave two autosave loops writing through one lock.
 	entries = {}
 end
 
@@ -285,7 +272,6 @@ function Service:Start(): ()
 		Service:Release(player) -- saves with Release = true, then drops the in-memory profile
 	end)
 	table.insert(connections, leaving)
-
 	game:BindToClose(function() -- prescribed by spec section 6 for exactly this
 		-- Shorter retry schedule FIRST: the wrapper's full backoff sleeps 1+2+4+8 = 15s on a single
 		-- failing key, so one unlucky player would eat most of the budget and everyone behind them
@@ -295,7 +281,6 @@ function Service:Start(): ()
 		end
 		Service:SaveAll(true)
 	end)
-
 	-- A profile loaded before Start (a boot-order edge, or a test) still gets its loop.
 	for _, entry in pairs(entries) do startAutosave(entry) end
 end
@@ -305,8 +290,8 @@ function Service:Stop(): ()
 	for _, connection in ipairs(connections) do connection:Disconnect() end
 	table.clear(connections)
 	for _, entry in pairs(entries) do entry.Autosave = false end
-	-- Deliberately does NOT save: the BindToClose handler owns the shutdown write, and a second pass
-	-- here would either double-write every profile or race the first one mid-flight.
+	-- Deliberately does NOT save: BindToClose owns the shutdown write, and a second pass here would
+	-- either double-write every profile or race the first one mid-flight.
 end
 
 return Service

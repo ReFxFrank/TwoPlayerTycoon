@@ -1,13 +1,12 @@
 --!strict
 --[[
     PlotBuilder
-    Builds and tears down the Instance tree of one Sanctum: a floor slab per Wing, the purchase pads
-    and their blank signs, the Ley Rail decks a Wellspring's Motes ride, the floating Conflux and its
+    Builds and tears down one Sanctum's Instance tree: a floor slab per Wing, the purchase pads and
+    their blank signs, the Ley Rail decks a Wellspring's Motes ride, the floating Conflux and its
     Font, the Motes folder, and the per-slot spawn and link markers. Placement comes from PlotLayout
-    and every colour/material from Theme, so this module owns geometry and nothing else: no income,
-    no affordability checks, no ProximityPrompts. PurchaseService owns every prompt and all pad
-    wording -- PlotBuilder only leaves it an empty, correctly-placed, correctly-keyed pad to dress.
-    Owner: server/Systems  |  Consumers: PlotService, which hands the Runtime on to PurchaseService,
+    and colour/material from Theme -- geometry is all this module owns: no income, no affordability
+    checks, no prompts. PurchaseService owns each prompt and all wording; it inherits blank pads.
+    Owner: server/Systems  |  Consumers: PlotService, which passes the Runtime to PurchaseService,
                                          DropperSystem, MoteSystem and EvolutionService
 ]]
 
@@ -24,38 +23,31 @@ local UpgradeData = require(Modules:WaitForChild("UpgradeData"))
 type Section = SectionData.Section
 type Appearance = Theme.ConfluxAppearance
 
--- One purchasable needing a pad, plus the Runtime.Pads/Signs key it answers to. Kind and Id are
--- published verbatim as the PadKind/PadId attributes PurchaseService reads back off the pad.
+-- A purchasable needing a pad + its Runtime.Pads/Signs key. Kind/Id become the pad's attributes.
 type PadEntry = { Key: string, Kind: string, Id: string }
 
 type Runtime = {
 	Model: Instance, Conflux: Instance, Font: Instance, MoteFolder: Instance, PlotId: number,
-	Sections: { [string]: Instance }, Pads: { [string]: Instance }, Origin: CFrame,
-	RailFolders: { [string]: Instance }, Signs: { [string]: TextLabel },
-}
+	Origin: CFrame, Sections: { [string]: Instance }, Pads: { [string]: Instance },
+	RailFolders: { [string]: Instance }, Signs: { [string]: TextLabel } }
 
-type PartProps = {
-	Name: string, Size: Vector3, CFrame: CFrame, Color: Color3, Material: Enum.Material,
-	Parent: Instance, Transparency: number?, CanCollide: boolean?,
-}
+type PartProps = { Name: string, Size: Vector3, CFrame: CFrame, Color: Color3, Parent: Instance,
+	Material: Enum.Material, Transparency: number?, CanCollide: boolean? }
 
--- PlotLayout owns every POSITION; these are the extents filling the space it reserves. Its pad line
--- spacing is 12 studs, so a 6-stud pad leaves a walkway, and a 2-tall pad centred on PlotLayout's
--- PAD_HEIGHT of 1.5 rests exactly on the 0.5 slab top instead of hovering above it.
+-- PlotLayout owns every POSITION; these are the extents that fill the space it reserves. Its pad
+-- line spacing is 12 studs so a 6-stud pad leaves a walkway, and a 2-tall pad centred on its
+-- PAD_HEIGHT of 1.5 rests on the 0.5 slab top rather than hovering.
 local PAD_SIZE = Vector3.new(6, 2, 6)
-local RAIL_WIDTH, RAIL_THICKNESS = 2.2, 0.4
-local MIN_RAIL_LENGTH = 0.5 -- shorter than this is a degenerate invisible part; skip the segment
-local FONT_SIZE = Vector3.new(12, 6, 12)
-local MARKER_SIZE = Vector3.new(8, 0.2, 8)
+local FONT_SIZE, MARKER_SIZE = Vector3.new(12, 6, 12), Vector3.new(8, 0.2, 8)
 local MARKER_DROP = -3.4 -- spawn CFrames float at head clearance; the decal belongs on the floor
 local MAX_LIGHT_RANGE = 60 -- PointLight.Range is hard-capped at 60 by the engine
+local RAIL_WIDTH, RAIL_THICKNESS, MIN_RAIL_LENGTH = 2.2, 0.4, 0.5 -- below MIN a segment is degenerate
 
--- Theme publishes materials for the Conflux and the Affinities, but a Sanctum's static architecture
--- has no Theme entry, so its materials are named once here.
-local FLOOR_MATERIAL = Enum.Material.Slate
-local PAD_MATERIAL = Enum.Material.Metal
-local NEON = Enum.Material.Neon -- rails and Font: both glow, so they read as live ley-work
-local MARKER_MATERIAL = Enum.Material.ForceField
+-- Theme has materials for the Conflux and the Affinities but none for static architecture, so a
+-- Sanctum's structural materials are named once here. NEON covers rails and the Font: both glow, so
+-- they read as live ley-work rather than as more masonry.
+local FLOOR_MATERIAL, PAD_MATERIAL = Enum.Material.Slate, Enum.Material.Metal
+local NEON, MARKER_MATERIAL = Enum.Material.Neon, Enum.Material.ForceField
 local HIDDEN_ROOT_NAME = "SanctumHiddenWings" -- where locked Wings wait; see setSectionVisible
 
 local PlotBuilder = {}
@@ -87,35 +79,28 @@ local function makeSign(adornee: Instance, text: string, height: number): TextLa
 	gui.Name = "Sign"
 	gui.Size = UDim2.new(0, 220, 0, 70)
 	gui.StudsOffset = Vector3.new(0, height, 0)
-	gui.LightInfluence = 0 -- pads sit in the Conflux glow; unlit text stays legible at every Stage
-	-- Six Sanctums x ~25 signs is 150 billboards; culling the ones already unreadable (past ~90
-	-- studs) is free and keeps a full server off the client's GUI budget.
-	gui.MaxDistance = 90
+	gui.MaxDistance = 90 -- 6 Sanctums x ~25 signs = 150 billboards; cull the already-illegible ones
 	gui.Parent = adornee
-
 	local label = Instance.new("TextLabel")
-	label.Name = "Label"
 	label.Size = UDim2.new(1, 0, 1, 0)
 	label.BackgroundTransparency = 1
 	label.TextColor3 = Theme.Ui.Text
-	label.TextStrokeTransparency = 0.4 -- pads glow; a stroke keeps text off its own background
+	label.TextStrokeTransparency = 0.4 -- pads glow; a stroke keeps the text off its own background
 	label.TextScaled = true
 	label.Text = text
 	label.Parent = gui
 	return label
 end
 
---[[ The per-Wing pad numbering, assigned in exactly one place.
-     PlotLayout.padCFrame and PlotLayout.railPath take a PER-WING running index, not a catalogue
-     Order -- DropperData and UpgradeData both number from 1, so reusing Order would stack an Upgrade
-     pad on a Wellspring. Wellsprings are numbered FIRST so they always occupy 1..N: rails are built
-     for exactly those indices, and PlotLayout cycles rail lanes every 3 orders, so keeping
-     Wellsprings low keeps their rails inside that tight lane set. ]]
+--[[ The per-Wing pad numbering, assigned in exactly one place. PlotLayout.padCFrame and .railPath
+     take a PER-WING running index, not a catalogue Order -- DropperData and UpgradeData both number
+     from 1, so reusing Order would stack an Upgrade pad on a Wellspring. Wellsprings are numbered
+     FIRST so they always occupy 1..N: rails are built for exactly those indices. ]]
 local function padPlan(sectionId: string): { PadEntry }
 	local plan: { PadEntry } = {}
 	local function collect(kind: string, list: { any })
 		for _, def in ipairs(list) do
-			-- Read on a Wing, RequiredSection means "my prerequisite": an unlock pad must stand on
+			-- On a Wing, RequiredSection reads as "my prerequisite": its unlock pad must stand on
 			-- the Wing you can already reach, never inside the room it sells.
 			if def.RequiredSection == sectionId then
 				table.insert(plan, { Key = kind .. ":" .. def.Id, Kind = kind, Id = def.Id })
@@ -140,9 +125,8 @@ local function makePad(parent: Instance, cf: CFrame, entry: PadEntry, sectionId:
 	})
 	pad:SetAttribute("PadKind", entry.Kind)
 	pad:SetAttribute("PadId", entry.Id)
-	-- EXTRA beyond the spec's PadKind/PadId: MoteSystem needs (section, order) to recompute a
-	-- Wellspring's rail path and that order is invented here, so publish it rather than have every
-	-- consumer re-derive padPlan and silently drift away from the pad it is aiming at.
+	-- EXTRA: MoteSystem needs (section, order) to recompute a rail path and that order is invented
+	-- here, so publish it instead of having every consumer re-derive padPlan and drift out of sync.
 	pad:SetAttribute("PadSection", sectionId)
 	pad:SetAttribute("PadOrder", order)
 	return pad
@@ -157,16 +141,14 @@ local function buildRail(parent: Instance, origin: CFrame, section: Section, ord
 	for i = 1, #path - 1 do
 		local a, b = path[i].Position, path[i + 1].Position
 		local dx, dz = b.X - a.X, b.Z - a.Z
-		-- Length is measured in the XZ plane and the deck is left level: waypoint heights change
-		-- between legs (nozzle -> deck -> Font), and a level deck at the mean height reads as a
-		-- stepped rail instead of a twisted one. Motes still fly the true 3D path.
+		-- Length is XZ-only and the deck is left level: waypoint heights change between legs
+		-- (nozzle -> deck -> Font) and a stepped rail beats a twisted one. Motes fly the true path.
 		local length = math.sqrt(dx * dx + dz * dz)
 		if length >= MIN_RAIL_LENGTH then
 			makePart({
-				Name = string.format("Segment_%d", i),
-				Size = Vector3.new(RAIL_WIDTH, RAIL_THICKNESS, length),
-				-- Identity looks down -Z, so yaw = atan2(-dx, -dz) aims the long axis along the leg,
-				-- the same convention PlotLayout uses to orient its own waypoints.
+				Name = string.format("Segment_%d", i), Size = Vector3.new(RAIL_WIDTH, RAIL_THICKNESS, length),
+				-- Identity looks down -Z, so yaw = atan2(-dx, -dz) aims the long axis along the leg
+				-- -- the same convention PlotLayout uses to orient its own waypoints.
 				CFrame = CFrame.new((a.X + b.X) * 0.5, (a.Y + b.Y) * 0.5, (a.Z + b.Z) * 0.5)
 					* CFrame.Angles(0, math.atan2(-dx, -dz), 0),
 				Color = colour, Material = NEON, Parent = folder, Transparency = 0.25,
@@ -183,9 +165,8 @@ local function hiddenHolder(model: Instance): Instance
 end
 
 function PlotBuilder.buildSection(sanctumModel: Instance, section: Section): Instance
-	-- The origin is recovered from the Model because the spec's signature has nowhere to pass it.
-	-- Defaulting to plot 1 on a missing or non-numeric attribute keeps a hand-built test Model
-	-- buildable instead of erroring on arithmetic-on-nil deep inside PlotLayout.
+	-- Origin is recovered from the Model: the spec's signature has nowhere to pass it. Defaulting to
+	-- plot 1 on a missing/non-numeric attribute avoids an arithmetic-on-nil deep inside PlotLayout.
 	local plotId = sanctumModel:GetAttribute("PlotId")
 	local origin = PlotLayout.sanctumOrigin(if type(plotId) == "number" then plotId else 1)
 
@@ -197,7 +178,7 @@ function PlotBuilder.buildSection(sanctumModel: Instance, section: Section): Ins
 		Color = if section.Id == SectionData.Base then Theme.Ui.Stroke else Theme.Ui.Panel,
 		Material = FLOOR_MATERIAL, Parent = model,
 	})
-	newFolder("Pads", model)
+	newFolder("Pads", model) -- both filled by build(); buildSection only guarantees they exist
 	newFolder("Rails", model)
 	model.Parent = sanctumModel
 	return model
@@ -209,10 +190,8 @@ function PlotBuilder.build(plotId: number, parent: Instance): (Instance, Runtime
 	model.Name = string.format("Sanctum_%d", plotId)
 	model:SetAttribute("PlotId", plotId) -- read back by buildSection, and handy in Studio
 
-	local sections: { [string]: Instance } = {}
-	local railFolders: { [string]: Instance } = {}
-	local pads: { [string]: Instance } = {}
-	local signs: { [string]: TextLabel } = {}
+	local sections: { [string]: Instance }, railFolders: { [string]: Instance } = {}, {}
+	local pads: { [string]: Instance }, signs: { [string]: TextLabel } = {}, {}
 	for _, section in ipairs(SectionData.List) do
 		local sectionModel = PlotBuilder.buildSection(model, section)
 		local padFolder = sectionModel:FindFirstChild("Pads") :: Instance
@@ -229,8 +208,7 @@ function PlotBuilder.build(plotId: number, parent: Instance): (Instance, Runtime
 		end
 	end
 
-	-- Stage 1 unattuned is the only look PlotBuilder knows; EvolutionService pushes every later one
-	-- through setConfluxAppearance.
+	-- Stage 1 unattuned is the only look PlotBuilder knows; later ones arrive via setConfluxAppearance.
 	local look = Theme.getConfluxAppearance(1, nil)
 	local size = math.max(1, look.Size)
 	local conflux = makePart({
@@ -239,7 +217,6 @@ function PlotBuilder.build(plotId: number, parent: Instance): (Instance, Runtime
 		CanCollide = false, -- it floats 20 studs up, but a solid Conflux would block arriving Motes
 	})
 	local light = Instance.new("PointLight")
-	light.Name = "ConfluxGlow"
 	light.Color = look.Color
 	light.Range = math.min(MAX_LIGHT_RANGE, size * 3)
 	light.Brightness = 2.5
@@ -261,17 +238,16 @@ function PlotBuilder.build(plotId: number, parent: Instance): (Instance, Runtime
 			Color = Theme.Ui.Positive, Material = MARKER_MATERIAL, Parent = markers,
 			CanCollide = false, -- a spawning character must not be shoved off its own marker
 		})
-		-- Link pads are Sanctum furniture, not Wing furniture: PlotLayout places them separately, so
-		-- they carry order 0 -- a value that never indexes a Wing pad line.
+		-- Link pads are Sanctum furniture, not Wing furniture -- PlotLayout places them separately,
+		-- so they carry order 0, a value that never indexes a Wing pad line.
 		local key = "link:" .. slot
 		local entry: PadEntry = { Key = key, Kind = "link", Id = tostring(slot) }
-		local pad = makePad(markers, PlotLayout.linkPadCFrame(origin, slot), entry, SectionData.Base, 0)
-		pads[key] = pad
-		signs[key] = makeSign(pad, "", 3.5)
+		pads[key] = makePad(markers, PlotLayout.linkPadCFrame(origin, slot), entry, SectionData.Base, 0)
+		signs[key] = makeSign(pads[key], "", 3.5)
 	end
 
-	-- Parented LAST so the Sanctum replicates in one burst rather than as ~200 separate part
-	-- additions streaming to every client while it is still half-assembled.
+	-- Parented LAST: the Sanctum then replicates as one burst rather than as ~200 part additions
+	-- streaming to every client while it is still half-assembled.
 	model.Parent = parent
 	return model, {
 		Model = model, Sections = sections, Pads = pads, Conflux = conflux, Font = font,
@@ -279,18 +255,16 @@ function PlotBuilder.build(plotId: number, parent: Instance): (Instance, Runtime
 	}
 end
 
---[[ Locked Wings are REPARENTED out of the world, not made transparent.
-     A transparent slab is still a rendered part with a physics record, still streamed to every
-     client, and its pads would still be reachable by a ProximityPrompt -- so PurchaseService would
-     have to re-check the lock on every trigger. Parking the Wing in ServerStorage costs the client
-     literally nothing (ServerStorage never replicates) and makes an unowned Wing's pads unreachable
-     by construction rather than by a check someone could forget. The trade: those Instances still
-     exist, so PlotBuilder.destroy has to sweep both places. ]]
+--[[ Locked Wings are REPARENTED out of the world, not made transparent. A transparent slab is still
+     a rendered part with a physics record, still streamed to every client, and its pads would still
+     be reachable by a ProximityPrompt -- PurchaseService would have to re-check the lock on every
+     trigger. ServerStorage costs the client nothing (it never replicates) and makes an unowned
+     Wing's pads unreachable by construction. The trade: destroy() must sweep both places. ]]
 function PlotBuilder.setSectionVisible(runtime: Runtime, sectionId: string, visible: boolean)
 	local section = runtime.Sections[sectionId]
 	if section == nil then
-		-- A sanitised save can still name a Wing this build does not have; ignoring a stale id beats
-		-- taking down the whole Sanctum rebuild with it.
+		-- A sanitised save can still name a Wing this build lacks; ignore it rather than kill the
+		-- whole rebuild over one stale id.
 		return
 	end
 	section.Parent = if visible then runtime.Model else hiddenHolder(runtime.Model)
@@ -298,8 +272,7 @@ end
 
 function PlotBuilder.setConfluxAppearance(runtime: Runtime, appearance: Appearance)
 	local conflux = runtime.Conflux :: Part
-	-- Clamped because a zero or negative Size would make the Conflux vanish, which reads as a bug
-	-- rather than as an Attunement.
+	-- Clamped: a zero/negative Size would make the Conflux vanish, reading as a bug not an Attunement.
 	local size = math.max(1, appearance.Size)
 	conflux.Size = Vector3.new(size, size, size)
 	conflux.Color = appearance.Color
@@ -312,14 +285,12 @@ function PlotBuilder.setConfluxAppearance(runtime: Runtime, appearance: Appearan
 end
 
 function PlotBuilder.destroy(model: Instance)
-	-- Locked Wings live OUTSIDE this Model (setSectionVisible), so Model:Destroy() on its own would
-	-- leak every Wing the Sanctum never unlocked for the remaining life of the server.
+	-- Locked Wings live OUTSIDE this Model, so Model:Destroy() alone would leak every Wing the
+	-- Sanctum never unlocked, for the remaining life of the server.
 	local root = ServerStorage:FindFirstChild(HIDDEN_ROOT_NAME)
-	if root ~= nil then
-		local holder = root:FindFirstChild(model.Name .. "_Hidden")
-		if holder ~= nil then
-			holder:Destroy()
-		end
+	local holder = if root ~= nil then root:FindFirstChild(model.Name .. "_Hidden") else nil
+	if holder ~= nil then
+		holder:Destroy()
 	end
 	model:Destroy()
 end

@@ -2692,6 +2692,309 @@ return Service
 
 --#endregion
 end
+MODULE_ORDER[#MODULE_ORDER + 1] = { Path = "ServerScriptService/Core/Services/ProfileService", Class = "ModuleScript", File = "src/server/Services/ProfileService.luau" }
+MODULE_DEFS["ServerScriptService/Core/Services/ProfileService"] = function(script, require, ...)
+--#region src/server/Services/ProfileService.luau
+--!strict
+--[[
+	ProfileService
+	The only path between a Player and their saved Profile. Every load takes a JobId-stamped session
+	lock through DataStoreWrapper:Update, every save refreshes it (or clears it on release), and
+	everything read back goes through StateSchema.migrate, so a corrupt or forged record is repaired
+	rather than fatal. A player whose lock is held by another LIVE server is refused (nil) so the
+	caller can kick them honestly; a player the DataStore cannot serve at all still gets a playable
+	session on a profile flagged __NoSave that is never written back.
+	Owner: server/Services  |  Consumers: PlotService, EconomyService, RebirthService, LeaderboardService
+]]
+
+local Players = game:GetService("Players")
+
+local Modules = game:GetService("ReplicatedStorage"):WaitForChild("Modules")
+local GameConfig = require(Modules:WaitForChild("GameConfig"))
+local Signal = require(Modules:WaitForChild("Signal"))
+local StateSchema = require(Modules:WaitForChild("StateSchema"))
+
+type Profile = StateSchema.Profile
+type Lock = { JobId: string, Stamp: number }
+-- Spec section 3.1: a connection is anything with :Disconnect(). Structural, so this module behaves
+-- identically under Roblox's RBXScriptConnection and under the headless mock.
+type Connection = { Disconnect: (self: any) -> () }
+type Entry = {
+	Player: Player,
+	Profile: Profile,
+	Saving: boolean, -- a write is in flight; a second Save must not interleave with it
+	LastSaveOk: boolean, -- result of the last write, handed back to coalesced callers
+	Released: boolean, -- a release-write already cleared the lock; do not write again
+	PlaytimeStamp: number, -- os.time() up to which Stats.Playtime has been accounted for
+	Autosave: boolean, -- false tells the parked autosave thread to exit at its next wake
+}
+
+local SAVE = GameConfig.Save
+local SESSION = GameConfig.Session
+
+-- Studio reports an empty JobId. A constant stand-in is right there: Studio runs one server at a
+-- time, so a restarted play-test reclaims its own lock immediately instead of waiting out
+-- LockStaleSeconds. Live, JobId is unique per server, which is the entire mechanism.
+local JOB_ID: string = if type(game.JobId) == "string" and #game.JobId > 0 then game.JobId else "studio-solo"
+-- Poll cadence and ceiling for a caller waiting on an in-flight save. The ceiling clears
+-- DataStoreWrapper's full 1+2+4+8s backoff, so a slow-but-healthy save is waited out while one
+-- wedged behind an outage cannot park a PlayerRemoving or a shutdown forever.
+local SAVE_POLL_SECONDS, SAVE_WAIT_TIMEOUT = 0.1, 20
+-- Floor on the autosave period: a hand-edited config (Jitter >= AutosaveSeconds) must not be able to
+-- turn the loop into a DataStore flood.
+local MIN_AUTOSAVE_SECONDS = 5
+
+local Service = {}
+Service.Name = "ProfileService"
+-- Built at module scope, not in Init: recreating them would silently drop every connection a peer
+-- has made. The harness re-requires modules per test, so they are fresh each run anyway.
+Service.ProfileLoaded = Signal.new()
+Service.ProfileReleasing = Signal.new()
+
+local entries: { [Player]: Entry } = {}
+local connections: { Connection } = {}
+local wrapper: any = nil -- DataStoreWrapper, resolved in Init
+local running = false
+-- Own RNG so autosave jitter never perturbs the global math.random sequence mote paths and other
+-- systems draw from, which would make their tests non-reproducible.
+local rng = Random.new(os.time())
+
+local function keyFor(player: Player): string return SAVE.KeyPrefix .. tostring(player.UserId) end
+
+--[[ The stored value is { Lock = {JobId, Stamp}, Data = Profile }. A raw legacy Profile (written by
+     a build predating the lock) has no Data field and is read as unlocked data, so an old save is
+     adopted rather than mistaken for garbage and overwritten. ]]
+local function unwrap(raw: any): (Lock?, any)
+	if type(raw) ~= "table" then return nil, nil end
+	local stored = raw :: { [string]: any }
+	if type(stored.Data) ~= "table" then return nil, raw end
+	local lock = stored.Lock
+	if type(lock) ~= "table" or type(lock.JobId) ~= "string" or type(lock.Stamp) ~= "number" then
+		-- A malformed or absent lock is no lock. Refusing to load over a half-written lock record
+		-- would strand the player for LockStaleSeconds over a value we can simply replace.
+		return nil, stored.Data
+	end
+	return { JobId = lock.JobId, Stamp = lock.Stamp }, stored.Data
+end
+
+--[[ A lock blocks a load only while it is live AND belongs to someone else.
+     WHY a stale lock MUST be stealable: a server that crashes never runs its release-save, so its
+     lock is left behind forever. Without the steal, one crash locks that player out of their own
+     save permanently -- the account becomes unloadable. The steal is the repair for a dead server.
+     WHY the window must sit well above the autosave interval: every save refreshes the stamp, so a
+     live session's lock is never older than one autosave period (120s +/-20s). LockStaleSeconds is
+     900 -- seven autosaves of slack -- so a laggy but living server is never mistaken for a dead
+     one. A window near or below the autosave period would steal locks from LIVE sessions and let
+     two servers write one profile: exactly the corruption the lock exists to prevent. ]]
+local function blocks(lock: Lock?, now: number): boolean
+	if lock == nil or lock.JobId == JOB_ID then return false end -- unlocked, or ours (a rejoin here)
+	return (now - lock.Stamp) <= SESSION.LockStaleSeconds
+end
+
+local function startAutosave(entry: Entry): ()
+	if entry.Autosave then return end -- a second thread would double this player's write rate
+	entry.Autosave = true
+	task.spawn(function()
+		while entry.Autosave and running do
+			-- The +/- jitter IS the stagger: players who joined on the same frame land up to 2 x
+			-- AutosaveJitter (40s) apart, and re-rolling each cycle stops them re-converging. A
+			-- fixed period would have all twelve occupants of a full server writing on one frame.
+			local jitter = rng:NextNumber(-SAVE.AutosaveJitter, SAVE.AutosaveJitter)
+			task.wait(math.max(SAVE.AutosaveSeconds + jitter, MIN_AUTOSAVE_SECONDS))
+			-- Re-checked after the park: the player may have left (or the server stopped) while this
+			-- thread slept, and saving a released profile would retake a lock nobody holds.
+			if not entry.Autosave or not running or entries[entry.Player] ~= entry then break end
+			Service:Save(entry.Player)
+		end
+		entry.Autosave = false
+	end)
+end
+
+local function register(player: Player, profile: Profile): Profile
+	local entry: Entry = { Player = player, Profile = profile, Saving = false, LastSaveOk = false,
+		Released = false, PlaytimeStamp = os.time(), Autosave = false }
+	entries[player] = entry
+	if running then startAutosave(entry) end
+	Service.ProfileLoaded:Fire(player, profile)
+	return profile
+end
+
+--[[ WHY this profile is never written back: the DataStore being unreachable says nothing about what
+     is stored in it, so persisting this one would replace a veteran's real save with zeroes on the
+     strength of a transient outage. That is far worse than losing one session, so Save skips it. ]]
+local function unsavable(player: Player): Profile
+	local profile: any = StateSchema.newProfile()
+	profile.__NoSave = true
+	warn(("[ProfileService] %s is on an unsaved profile: the DataStore is unreachable"):format(player.Name))
+	return register(player, profile :: Profile)
+end
+
+local function writeProfile(entry: Entry, release: boolean): boolean
+	local profile, now = entry.Profile, os.time()
+	-- Playtime accrues here rather than on a timer, and the stamp advances only once the seconds it
+	-- covers are in the payload: a failed write leaves them in memory for the next save instead of
+	-- double-counting or dropping them.
+	profile.Stats.Playtime += math.max(now - entry.PlaytimeStamp, 0)
+	entry.PlaytimeStamp = now
+	profile.Stats.LastSave = now
+	local stolen = false
+	local ok = wrapper:Update(SAVE.DataStoreName, keyFor(entry.Player), function(current: any): any
+		-- Runs once per DataStoreWrapper attempt and recomputes from `current` alone; `stolen` is a
+		-- last-write-wins status flag, never an accumulator.
+		local lock = unwrap(current)
+		if lock ~= nil and lock.JobId ~= JOB_ID then
+			-- Another server holds this player's lock, so it has already LOADED their profile: ours
+			-- is a stale fork now, and writing it would erase their live session.
+			stolen = true
+			return nil -- abort the write
+		end
+		stolen = false
+		return { Lock = if release then nil else { JobId = JOB_ID, Stamp = os.time() }, Data = profile }
+	end)
+	if stolen then
+		warn(("[ProfileService] abandoned save for %s: another server owns the session lock"):format(entry.Player.Name))
+		return false
+	end
+	if not ok then warn(("[ProfileService] save failed for %s after all retries"):format(entry.Player.Name)) end
+	return ok
+end
+
+function Service:LoadAsync(player: Player): Profile?
+	local existing = entries[player]
+	if existing ~= nil then return existing.Profile end -- a second load would take a second lock
+	local key, attempts = keyFor(player), math.max(SESSION.LockRetries, 1)
+	local loaded: Profile? = nil
+	for attempt = 1, attempts do
+		local claimed = false
+		local ok = wrapper:Update(SAVE.DataStoreName, key, function(current: any): any
+			claimed = false -- recomputed per attempt; the wrapper may run this more than once
+			local now = os.time()
+			local lock, data = unwrap(current)
+			if blocks(lock, now) then return nil end -- a live server owns it: nothing is written
+			-- migrate sanitises, so `data` may be nil, a string or a tampered table and what comes
+			-- back is still a legal Profile. A corrupt save is therefore a non-event.
+			local profile = StateSchema.migrate(data)
+			profile.Stats.JoinCount += 1
+			claimed, loaded = true, profile
+			return { Lock = { JobId = JOB_ID, Stamp = now }, Data = profile }
+		end)
+		if not ok then
+			-- The wrapper already exhausted its own retry schedule, so this is not contention: the
+			-- DataStore is unreachable. Five more lock attempts would only delay the join.
+			return unsavable(player)
+		end
+		local profile = loaded
+		if claimed and profile ~= nil then return register(player, profile) end
+		if attempt < attempts then task.wait(SESSION.LockRetryDelay) end
+	end
+	--[[ Give up with nil, NOT a blank profile. The caller kicks the player with a clear message and
+	     they rejoin in seconds; handing back an empty profile would let the next save overwrite a
+	     real one, which is unrecoverable. A lost session beats a lost account. ]]
+	warn(("[ProfileService] no session lock for %s after %d attempts"):format(player.Name, attempts))
+	return nil
+end
+
+function Service:Get(player: Player): Profile?
+	local entry = entries[player]
+	return if entry ~= nil then entry.Profile else nil
+end
+
+function Service:IsLoaded(player: Player): boolean
+	return entries[player] ~= nil
+end
+
+function Service:Save(player: Player, opts: { Release: boolean? }?): boolean
+	local entry = entries[player]
+	if entry == nil then return false end -- nothing loaded: no state to write, no lock to refresh
+	local release = if opts ~= nil then opts.Release == true else false
+	if (entry.Profile :: any).__NoSave == true then return false end -- see `unsavable`
+	if entry.Saving then
+		local waited = 0
+		while entry.Saving and waited < SAVE_WAIT_TIMEOUT do
+			task.wait(SAVE_POLL_SECONDS)
+			waited += SAVE_POLL_SECONDS
+		end
+		-- Coalesce: the in-flight write publishes the same live table this call would send, so a
+		-- second round trip buys nothing. A Release must clear the lock, so it instead falls through
+		-- and writes after the first call -- unless that one is still stuck, when racing it is worse.
+		if not release or entry.Saving then return entry.LastSaveOk end
+	end
+	entry.Saving = true
+	local ok = writeProfile(entry, release)
+	entry.Saving = false
+	entry.LastSaveOk = ok
+	if ok and release then entry.Released = true end
+	return ok
+end
+
+function Service:SaveAll(release: boolean?): ()
+	--[[ Bounded by the shutdown budget: Roblox hard-kills the server ~30s into BindToClose whatever
+	     the handler is doing, so a queue of failing saves must be abandoned in time for the players
+	     behind it. os.clock is monotonic: a wall clock correction cannot stretch or collapse it. ]]
+	local deadline = os.clock() + SAVE.ShutdownBudgetSeconds
+	local doRelease = release == true
+	for player in pairs(entries) do
+		if os.clock() >= deadline then
+			warn("[ProfileService] shutdown budget exhausted; the remaining profiles were not saved")
+			break
+		end
+		Service:Save(player, { Release = doRelease })
+	end
+end
+
+function Service:Release(player: Player): ()
+	local entry = entries[player]
+	if entry == nil then return end
+	-- Fired before the final write so a consumer can flush last-moment state into the profile. A
+	-- handler that yields may miss that window, which is why every other service writes through on
+	-- mutation instead of hoarding state until release.
+	Service.ProfileReleasing:Fire(player, entry.Profile)
+	-- The release-write is what clears the session lock; skipping it would strand the player behind
+	-- their own lock until it aged out at LockStaleSeconds.
+	if not entry.Released then Service:Save(player, { Release = true }) end
+	entry.Autosave = false -- the parked autosave thread exits at its next wake
+	entries[player] = nil
+end
+
+function Service:Init(registry: any): ()
+	wrapper = registry:Get("DataStoreWrapper") -- resolved only: section 6 forbids calls during Init
+	running = false
+	-- Rebuilt: a re-Init inheriting entries would leave two autosave loops writing through one lock.
+	entries = {}
+end
+
+function Service:Start(): ()
+	running = true
+	local leaving = Players.PlayerRemoving:Connect(function(player: Player)
+		Service:Release(player) -- saves with Release = true, then drops the in-memory profile
+	end)
+	table.insert(connections, leaving)
+	game:BindToClose(function() -- prescribed by spec section 6 for exactly this
+		-- Shorter retry schedule FIRST: the wrapper's full backoff sleeps 1+2+4+8 = 15s on a single
+		-- failing key, so one unlucky player would eat most of the budget and everyone behind them
+		-- would be saved by nothing at all.
+		if wrapper ~= nil and type(wrapper.SetMaxAttempts) == "function" then
+			wrapper:SetMaxAttempts(2)
+		end
+		Service:SaveAll(true)
+	end)
+	-- A profile loaded before Start (a boot-order edge, or a test) still gets its loop.
+	for _, entry in pairs(entries) do startAutosave(entry) end
+end
+
+function Service:Stop(): ()
+	running = false -- every autosave thread exits at its next wake
+	for _, connection in ipairs(connections) do connection:Disconnect() end
+	table.clear(connections)
+	for _, entry in pairs(entries) do entry.Autosave = false end
+	-- Deliberately does NOT save: BindToClose owns the shutdown write, and a second pass here would
+	-- either double-write every profile or race the first one mid-flight.
+end
+
+return Service
+
+--#endregion
+end
 MODULE_ORDER[#MODULE_ORDER + 1] = { Path = "ServerScriptService/Core/Services/RateLimiter", Class = "ModuleScript", File = "src/server/Services/RateLimiter.luau" }
 MODULE_DEFS["ServerScriptService/Core/Services/RateLimiter"] = function(script, require, ...)
 --#region src/server/Services/RateLimiter.luau
@@ -2903,6 +3206,1096 @@ function Service:Stats(player: Player): { [string]: number }
 end
 
 return Service
+
+--#endregion
+end
+MODULE_ORDER[#MODULE_ORDER + 1] = { Path = "ServerScriptService/Core/Services/RemoteService", Class = "ModuleScript", File = "src/server/Services/RemoteService.luau" }
+MODULE_DEFS["ServerScriptService/Core/Services/RemoteService"] = function(script, require, ...)
+--#region src/server/Services/RemoteService.luau
+--!strict
+--[[
+    RemoteService
+    The one door a client -> server message walks through: it builds the SanctumRemotes folder and
+    every RemoteEvent RemoteSchema declares, then funnels every inbound event into one guarded
+    dispatcher -- sender check, rate-limit token, payload validation, handler inside a pcall, so one
+    erroring handler cannot take a remote down for everybody. Outbound sends are name- and
+    direction-checked against the same schema, so a typo is a boot-time error rather than silence.
+    Owner: server/Services  |  Consumers: every service that talks to a client, RateLimiter, tests
+]]
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local Modules = ReplicatedStorage:WaitForChild("Modules")
+local RemoteSchema = require(Modules:WaitForChild("RemoteSchema"))
+
+-- Spec section 3.1: anything with :Disconnect() is a connection -- structural, so the mock fits too.
+type Connection = { Disconnect: (self: any) -> () }
+type Handler = (player: Player, payload: any) -> ()
+
+-- A local mirror of RemoteSchema.RemoteDef rather than an import: the test bundler strips `export`
+-- from type aliases, so a cross-module type reference would not resolve inside the harness.
+type RemoteDef = {
+	Name: string, Direction: string, RateLimit: { Tokens: number, Interval: number }?,
+	Validate: ((payload: any) -> (boolean, string?))?,
+}
+
+local C2S = "ClientToServer"
+local S2C = "ServerToClient"
+
+--[[ A rejected call is one an exploiter repeats as fast as the network allows. Counting each is
+     cheap; PRINTING each is not -- unthrottled warns turn a spam loop into a log flood, itself a
+     denial of service. The counter always increments; only the warn is rationed, per player. ]]
+local WARN_INTERVAL = 10
+
+--[[ Rejection bucket for anything that is not a live player: a garbage first argument, or a stale
+     Player whose PlayerRemoving has already run. Neither can be cleaned up later, so keying them by
+     real UserId would re-create entries nothing removes -- one slow leak per departed player. ]]
+local UNKNOWN_SENDER = 0
+
+local Service = {}
+Service.Name = "RemoteService"
+
+-- The clock behind the warn throttle, read through this field so tests can substitute it. tick() is
+-- the clock the headless harness can advance; its backwards jumps are handled in noteRejection.
+Service.Clock = tick
+
+Service._rateLimiter = nil :: any
+Service._folder = nil :: any
+Service._remotes = {} :: { [string]: any }
+Service._handlers = {} :: { [string]: Handler }
+Service._connections = {} :: { Connection }
+Service._rejections = {} :: { [number]: { [string]: number } }
+Service._lastWarn = {} :: { [number]: number }
+
+--[[ True only for a player the server can still reach. `Parent ~= Players` is the O(1) "still in
+     Players" test (engine and mock both unparent on PlayerRemoving); the typeof/IsA pair in front
+     makes it total, since Mock.fireServer hands this nils and tables that .Parent would throw on. ]]
+local function isLivePlayer(player: any): boolean
+	return typeof(player) == "Instance" and player:IsA("Player") and player.Parent == Players
+end
+
+-- Record one rejection and, at most once per player per WARN_INTERVAL, say so. `reason` is for the
+-- SERVER log only: telling an exploiter which gate stopped them is free reconnaissance.
+local function noteRejection(self: any, userId: number, remoteName: string, reason: string): ()
+	local byRemote = self._rejections[userId]
+	if byRemote == nil then
+		byRemote = {}
+		self._rejections[userId] = byRemote
+	end
+	byRemote[remoteName] = (byRemote[remoteName] or 0) + 1
+
+	local now = Service.Clock()
+	local last = self._lastWarn[userId]
+	-- `now < last` means the clock jumped backwards (tick() follows the host wall clock); warn and
+	-- re-anchor, because a bare `now - last < WARN_INTERVAL` would mute the log for the whole jump.
+	if last ~= nil and now >= last and now - last < WARN_INTERVAL then
+		return
+	end
+	self._lastWarn[userId] = now
+	warn(string.format("[RemoteService] rejected %s from userId %d: %s", remoteName, userId, reason))
+end
+
+-- The guarded path every inbound message takes. It NEVER errors (an error unwinds the shared
+-- OnServerEvent thread) and NEVER replies (a reply leaks which gate closed).
+local function dispatch(self: any, def: RemoteDef, player: any, payload: any): ()
+	-- 1. Sender. The engine supplies this, but a stale reference still arrives -- an event queued
+	-- before a disconnect lands after it -- and that Player has no profile, sanctum or character.
+	if not isLivePlayer(player) then
+		noteRejection(self, UNKNOWN_SENDER, def.Name, "sender is not a live player")
+		return
+	end
+	-- A non-number UserId cannot happen on a real Player, but the rejection table is keyed by it and
+	-- `t[nil] = v` throws -- exactly the crash this dispatcher exists to prevent.
+	local raw = player.UserId
+	local userId: number = if type(raw) == "number" then raw else UNKNOWN_SENDER
+	-- An inbound def missing either piece is a RemoteSchema bug. Fail closed rather than skipping
+	-- the missing check: a visibly dead feature beats an unthrottled or unvalidated front door.
+	local budget, validate = def.RateLimit, def.Validate
+	if budget == nil or validate == nil then
+		noteRejection(self, userId, def.Name, "schema entry has no rate limit or validator")
+		return
+	end
+
+	-- 2. Rate limit BEFORE validation: validation is the pricier check, so a flood dies cheaper here.
+	if not self._rateLimiter:Consume(player, def.Name, budget.Tokens, budget.Interval) then
+		noteRejection(self, userId, def.Name, "rate limited")
+		return
+	end
+
+	-- 3. Payload. RemoteSchema wraps every validator so it cannot throw; the pcall is here because
+	-- this module must not lean on that promise -- an escaping error would skip the accounting.
+	local ran, accepted, why = pcall(validate, payload)
+	if not ran then
+		noteRejection(self, userId, def.Name, "validator errored")
+		return
+	elseif accepted ~= true then
+		noteRejection(self, userId, def.Name, if type(why) == "string" then why else "invalid payload")
+		return
+	end
+
+	-- 4. Nothing has claimed this remote. Counted, not ignored: normal during boot, dead feature after.
+	local handler = self._handlers[def.Name]
+	if handler == nil then
+		noteRejection(self, userId, def.Name, "no handler registered")
+		return
+	end
+
+	-- 5. The handler is another service's code reached from the network edge. Isolate it. The warn is
+	-- not throttled -- an erroring handler is a server bug worth seeing, and step 2 already caps it.
+	local ok, err = pcall(handler, player, payload)
+	if not ok then
+		warn(string.format("[RemoteService] handler for %s errored: %s", def.Name, tostring(err)))
+	end
+end
+
+--[[ Resolve an outbound remote, erroring on a name that is unknown or inbound. Outbound names are
+     server-authored constants, so a wrong one is a typo; returning nil (ServiceRegistry:Get's
+     reasoning) would make it a message that never arrives. Level 3 blames Fire*'s caller. ]]
+local function outbound(self: any, name: string, caller: string): any
+	local def: RemoteDef? = RemoteSchema.get(name)
+	if def == nil or def.Direction ~= S2C then
+		local why = if def == nil then "no such remote in RemoteSchema" else "that remote is inbound"
+		error(string.format("RemoteService:%s('%s'): %s", caller, tostring(name), why), 3)
+	end
+	local remote = self._remotes[name]
+	if remote == nil then
+		error(string.format("RemoteService:%s('%s'): remote missing -- Init has not run", caller, name), 3)
+	end
+	return remote
+end
+
+--[[ `parent`'s child of `className` named `name`, created only if absent. Reuse is the point: after
+     a soft restart clients still hold references to these instances, and rebuilding would leave them
+     listening to dead ones. A wrong-class squatter is destroyed -- WaitForChild would resolve it. ]]
+local function ensureChild(parent: any, className: string, name: string): any
+	local existing = parent:FindFirstChild(name)
+	if existing ~= nil then
+		if existing:IsA(className) then
+			return existing
+		end
+		existing:Destroy()
+	end
+	local created = Instance.new(className)
+	created.Name = name
+	-- Parented last, so a client's WaitForChild can only ever resolve a fully built instance.
+	created.Parent = parent
+	return created
+end
+
+function Service:_disconnectAll(): ()
+	for _, connection in ipairs(self._connections) do
+		connection:Disconnect()
+	end
+	table.clear(self._connections)
+end
+
+function Service:Init(registry: any): ()
+	self._rateLimiter = registry:Get("RateLimiter")
+	-- A re-Init must not inherit live connections from the previous run: an orphaned OnServerEvent
+	-- handler would keep dispatching into the discarded handler table forever.
+	self:_disconnectAll()
+	self._handlers = {}
+	self._rejections = {}
+	self._lastWarn = {}
+	self._remotes = {}
+	self._folder = ensureChild(ReplicatedStorage, "Folder", RemoteSchema.FolderName)
+	-- ipairs over the sorted List, never pairs over .Remotes: `pairs` order is unspecified, and the
+	-- List puts every server -> client remote FIRST so a listening client cannot miss an early push.
+	for _, def in ipairs(RemoteSchema.List :: { RemoteDef }) do
+		self._remotes[def.Name] = ensureChild(self._folder, "RemoteEvent", def.Name)
+	end
+end
+
+function Service:Start(): ()
+	for _, def in ipairs(RemoteSchema.List :: { RemoteDef }) do
+		local remote = self._remotes[def.Name]
+		if def.Direction ~= C2S or remote == nil then
+			continue
+		end
+		-- Arguments past the first are dropped rather than rejected: the handler signature is fixed
+		-- at (player, payload), so a smuggled extra has nowhere to arrive.
+		local connection = remote.OnServerEvent:Connect(function(player: any, payload: any)
+			dispatch(self, def, player, payload)
+		end)
+		table.insert(self._connections, connection)
+	end
+	-- Without this the rejection and warn-throttle tables keep one entry per departed player for the
+	-- lifetime of the server.
+	local removing = Players.PlayerRemoving:Connect(function(player: Player)
+		local userId = player.UserId
+		if type(userId) == "number" then
+			self._rejections[userId] = nil
+			self._lastWarn[userId] = nil
+		end
+	end)
+	table.insert(self._connections, removing)
+end
+
+-- Disconnects only. The folder and its remotes deliberately survive, so a Stop/Init cycle does not
+-- invalidate the references every connected client is already holding.
+function Service:Stop(): ()
+	self:_disconnectAll()
+end
+
+-- Claim a client -> server remote. Every refusal here is a mistake made at boot by trusted code, so
+-- it errors: a silent no-op would leave a feature unreachable with nothing in the log to say why.
+function Service:On(name: string, handler: Handler): ()
+	local def: RemoteDef? = RemoteSchema.get(name)
+	if def == nil or def.Direction ~= C2S then
+		local why = if def == nil then "no such remote in RemoteSchema" else "that remote is outbound"
+		error(string.format("RemoteService:On('%s'): %s", tostring(name), why), 2)
+	end
+	if type(handler) ~= "function" then
+		error(string.format("RemoteService:On('%s') expects a function, got %s", name, typeof(handler)), 2)
+	end
+	if self._handlers[name] ~= nil then
+		-- Two handlers on one remote has no good reading: either the second replaces the first (a
+		-- feature stops working) or both run (every payload processed twice, once per service).
+		error(string.format("RemoteService:On('%s'): a handler is already registered", name), 2)
+	end
+	self._handlers[name] = handler
+end
+
+-- A player can leave between the decision to send and the send (a reply to their own remote, a
+-- queued notify). That race is unavoidable, so a departed target is skipped; only a bad NAME errors.
+function Service:FireClient(player: Player, name: string, payload: any): ()
+	local remote = outbound(self, name, "FireClient")
+	if not isLivePlayer(player) then
+		return
+	end
+	remote:FireClient(player, payload)
+end
+
+function Service:FireClients(players: { Player }, name: string, payload: any): ()
+	local remote = outbound(self, name, "FireClients")
+	-- A non-table list is a caller reading an empty sanctum; nothing to send is not an error.
+	if type(players) ~= "table" then
+		return
+	end
+	for _, player in ipairs(players) do
+		if isLivePlayer(player) then
+			remote:FireClient(player, payload)
+		end
+	end
+end
+
+function Service:FireAllClients(name: string, payload: any): ()
+	outbound(self, name, "FireAllClients"):FireAllClients(payload)
+end
+
+-- nil for an unknown name rather than an error: "does this remote exist" is a fair question.
+function Service:GetRemote(name: string): RemoteEvent?
+	if type(name) ~= "string" then
+		return nil
+	end
+	return self._remotes[name]
+end
+
+-- userId -> remote name -> rejection count. Copied, not handed out live: a telemetry reader that
+-- mutated the table would corrupt the counters it reads. userId 0 is UNKNOWN_SENDER.
+function Service:GetRejectionStats(): { [number]: { [string]: number } }
+	local copy: { [number]: { [string]: number } } = {}
+	for userId, byRemote in pairs(self._rejections) do
+		copy[userId] = table.clone(byRemote)
+	end
+	return copy
+end
+
+-- The warn throttle is cleared alongside the counters: a stale timestamp would otherwise mute the
+-- first warning of the next test or telemetry window for up to WARN_INTERVAL seconds.
+function Service:ResetRejectionStats(): ()
+	table.clear(self._rejections)
+	table.clear(self._lastWarn)
+end
+
+return Service
+
+--#endregion
+end
+MODULE_ORDER[#MODULE_ORDER + 1] = { Path = "ServerScriptService/Core/Systems/DropperSystem", Class = "ModuleScript", File = "src/server/Systems/DropperSystem.luau" }
+MODULE_DEFS["ServerScriptService/Core/Systems/DropperSystem"] = function(script, require, ...)
+--#region src/server/Systems/DropperSystem.luau
+--!strict
+--[[
+	DropperSystem
+	The emit clock of one Sanctum. It keeps an independent accumulator per OWNED COPY of a Wellspring
+	-- three Ember Vents are three staggered streams, not one stream emitting three Motes at once --
+	re-reads each stream's interval from Economy on every Step so an upgrade or Attunement lands on
+	the very next frame, and bounds catch-up so a laggy Step cannot avalanche. It builds no Instances
+	and knows nothing about Motes: it announces OnSpawn(def, index) and PlotService decides what that
+	means.
+	Owner: server/Systems  |  Consumers: PlotService (owns one per Sanctum, drives it from the one
+	                                     shared Heartbeat loop)
+]]
+
+local Modules = game:GetService("ReplicatedStorage"):WaitForChild("Modules")
+local Signal = require(Modules:WaitForChild("Signal"))
+local Economy = require(Modules:WaitForChild("Economy"))
+local DropperData = require(Modules:WaitForChild("DropperData"))
+
+type Dropper = DropperData.Dropper
+
+-- Structural and deliberately loose. PlotService owns the real Sanctum type and requires THIS
+-- module, so naming its type here would be a require cycle; only `State` is ever read, which also
+-- lets the headless harness drive a Step with a plain table.
+type Sanctum = { State: any }
+
+type Stream = {
+	Def: Dropper,
+	Index: number, -- 1..owned: WHICH copy of this Wellspring, passed straight to OnSpawn
+	Key: string, -- "<id>#<index>": the identity whose accumulator phase Rebuild preserves
+	Elapsed: number, -- seconds banked toward the current interval
+}
+
+-- CATCH-UP BOUND. A Step arriving with a huge dt (a server hitch, a resumed Studio breakpoint, a
+-- test calling Step(60)) must not emit one Mote per elapsed interval: at Economy's 0.15s floor that
+-- is 400 spawns for ONE Wellspring inside ONE frame, each allocating a part -- the hitch would
+-- become a freeze, which is exactly the failure this bound exists to prevent. Four is sized off the
+-- production cadence (GameConfig.Income.TickRate = 10, so dt = 0.1): it absorbs a 0.6s stall at the
+-- fastest legal interval and never fires in normal play.
+local MAX_CATCHUP_PER_STEP = 4
+
+-- Economy.getDropperInterval ignores its Multipliers argument BY DESIGN (prestige and Stage scale a
+-- Mote's value, not the cadence -- scaling both would compound one bonus twice), but the signature
+-- demands one. This neutral table keeps the seeding call honest without inventing a bonus.
+local NEUTRAL: Economy.Multipliers = { Prestige = 1, Stage = 1, Affinity = 1, Upgrades = 1, Debug = 1 }
+
+-- R2 low-discrepancy constants (1/g and 1/g^2 for the plastic number). Successive ordinals land far
+-- apart in [0,1), so a freshly bought third Ember Vent syncs neither with the first two nor with a
+-- Dew Font that happens to share its interval. Deterministic -- no Random -- so mote tests reproduce.
+local PHASE_PER_DROPPER = 0.7548776662466927
+local PHASE_PER_COPY = 0.5698402909980532
+
+-- NaN is the reason this is not a plain `or`: every comparison against NaN is false, so an unguarded
+-- clamp silently passes it through and one poisoned accumulator never emits again.
+local function num(v: any, default: number): number
+	return if type(v) == "number" and v == v and v ~= math.huge and v ~= -math.huge then v else default
+end
+
+local DropperSystem = {}
+
+local DropperRuntime = {}
+DropperRuntime.__index = DropperRuntime
+
+type DropperRuntimeSelf = {
+	OnSpawn: Signal.Signal, -- (dropperDef: Dropper, index: number)
+	_sanctum: Sanctum,
+	_streams: { Stream }, -- iteration order for Step
+	_byKey: { [string]: Stream }, -- phase-preservation index for Rebuild
+	_destroyed: boolean,
+}
+type DropperRuntime = typeof(setmetatable({} :: DropperRuntimeSelf, DropperRuntime))
+
+-- Owned count for one catalogue entry, hardened against a corrupt save: non-numbers, NaN, negatives
+-- and fractions collapse to a whole number, and MaxOwned caps it so `Droppers.ember_vent = 1e9`
+-- allocates 25 streams rather than a billion.
+local function ownedCount(raw: any, def: Dropper): number
+	local max = math.max(0, math.floor(num(def.MaxOwned, 0)))
+	return math.clamp(math.floor(num(raw, 0)), 0, max)
+end
+
+-- Starting phase for a brand new stream, in seconds. Offsetting by the R2 fraction of the interval
+-- is what stops a pair who just bought three Wellsprings from watching all three fire in lockstep
+-- forever after.
+local function initialElapsed(sanctum: Sanctum, def: Dropper, index: number): number
+	local interval = Economy.getDropperInterval(def, sanctum.State, NEUTRAL)
+	local order = num(def.Order, 1)
+	local fraction = ((order - 1) * PHASE_PER_DROPPER + (index - 1) * PHASE_PER_COPY) % 1
+	return interval * fraction
+end
+
+function DropperSystem.new(sanctum: Sanctum): DropperRuntime
+	local self: DropperRuntime = setmetatable({
+		OnSpawn = Signal.new(),
+		_sanctum = sanctum,
+		_streams = {},
+		_byKey = {},
+		_destroyed = false,
+	}, DropperRuntime)
+	-- A Sanctum loaded from a save already owns Wellsprings; without this it would sit silent until
+	-- the first purchase happened to call Rebuild.
+	self:Rebuild()
+	return self
+end
+
+-- Re-derives the stream set from PlotState. Called after every purchase, Attunement and Transcendence.
+function DropperRuntime.Rebuild(self: DropperRuntime): ()
+	-- PlotService can release a Sanctum in the same frame a purchase queued a rebuild.
+	if self._destroyed then
+		return
+	end
+	local state = self._sanctum.State
+	local owned = if type(state) == "table" then (state :: any).Droppers else nil
+	local ownedMap: { [string]: any } = if type(owned) == "table" then owned else {}
+
+	local streams: { Stream } = {}
+	local byKey: { [string]: Stream } = {}
+	-- Iterate the CATALOGUE, never the save. That is Economy's doctrine applied to the emit clock:
+	-- an id injected into a tampered profile ("i_win" = 99) can never create a stream at all.
+	for _, def in ipairs(DropperData.List) do
+		local count = ownedCount(ownedMap[def.Id], def)
+		for index = 1, count do
+			local key = def.Id .. "#" .. index
+			local stream = self._byKey[key]
+			if stream == nil then
+				-- Only genuinely NEW copies start fresh.
+				stream = {
+					Def = def,
+					Index = index,
+					Key = key,
+					Elapsed = initialElapsed(self._sanctum, def, index),
+				}
+			else
+				-- Reusing the table preserves Elapsed. Without that, every purchase would reset the
+				-- timer of every Wellspring the pair already owned, so a fast-clicking player could
+				-- starve their own income by never letting a stream reach its interval.
+				stream.Def = def
+			end
+			streams[#streams + 1] = stream
+			byKey[key] = stream
+		end
+	end
+	self._streams = streams
+	-- Streams for copies that are gone (a Transcendence reset) simply fall out of the new index.
+	self._byKey = byKey
+end
+
+function DropperRuntime.Step(self: DropperRuntime, dt: number, multipliers: Economy.Multipliers): ()
+	if self._destroyed then
+		return
+	end
+	local step = num(dt, 0)
+	-- A non-positive or non-finite dt (a clock that stepped backwards, a NaN out of a division)
+	-- would either do nothing or poison every accumulator permanently. Drop the frame instead.
+	if step <= 0 then
+		return
+	end
+	local state = self._sanctum.State
+	local m: Economy.Multipliers = if type(multipliers) == "table" then multipliers else NEUTRAL
+
+	for _, stream in ipairs(self._streams) do
+		-- Re-read every Step, never cached: a SpawnRate upgrade or an Affinity choice must change
+		-- the cadence on the next frame, not at the next Rebuild. Economy floors this at 0.15, so it
+		-- is always a safe divisor and a safe modulus below.
+		local interval = Economy.getDropperInterval(stream.Def, state, m)
+		local elapsed = stream.Elapsed + step
+		local emitted = 0
+		while elapsed >= interval and emitted < MAX_CATCHUP_PER_STEP do
+			elapsed -= interval
+			emitted += 1
+			self.OnSpawn:Fire(stream.Def, stream.Index)
+		end
+		-- Backlog past the bound is DISCARDED, not banked. Carrying it would pin every Wellspring at
+		-- the catch-up cap for minutes after a single hitch, turning one stutter into a lasting lag
+		-- tax; the modulus keeps the sub-interval phase so the stream stays staggered. In the normal
+		-- path (elapsed already < interval) this is a no-op.
+		stream.Elapsed = elapsed % interval
+	end
+end
+
+-- Live stream count -- one per owned copy. Exposed for PlotService diagnostics and the timing tests;
+-- it is a read-only view, not part of the emit contract.
+function DropperRuntime.StreamCount(self: DropperRuntime): number
+	return #self._streams
+end
+
+function DropperRuntime.Destroy(self: DropperRuntime): ()
+	self._destroyed = true
+	-- Cleared before the signal dies so a Step already part-way through a release cannot resurrect
+	-- work against a Sanctum whose State has been handed back.
+	table.clear(self._streams)
+	table.clear(self._byKey)
+	self.OnSpawn:Destroy()
+end
+
+return DropperSystem
+
+--#endregion
+end
+MODULE_ORDER[#MODULE_ORDER + 1] = { Path = "ServerScriptService/Core/Systems/MoteSystem", Class = "ModuleScript", File = "src/server/Systems/MoteSystem.luau" }
+MODULE_DEFS["ServerScriptService/Core/Systems/MoteSystem"] = function(script, require, ...)
+--#region src/server/Systems/MoteSystem.luau
+--!strict
+--[[
+	MoteSystem
+	The flight pool of one Sanctum. Every Mote is an ANCHORED part walked along a precomputed Ley
+	Rail polyline by CFrame -- no physics body, no Touched connection (spec decision 8) -- and is
+	collected the moment its ARC-LENGTH progress reaches 1. It owns the live-Mote cap, the Debris
+	leak backstop and the orphan sweep. It never touches the wallet: it announces OnCollected(value,
+	def) and EconomyService decides what the Essence is worth.
+	Owner: server/Systems  |  Consumers: PlotService (owns one per Sanctum, drives it from the one
+	                                     shared Heartbeat loop)
+]]
+
+local Debris = game:GetService("Debris")
+
+local Modules = game:GetService("ReplicatedStorage"):WaitForChild("Modules")
+local Signal = require(Modules:WaitForChild("Signal"))
+local Economy = require(Modules:WaitForChild("Economy"))
+local GameConfig = require(Modules:WaitForChild("GameConfig"))
+local DropperData = require(Modules:WaitForChild("DropperData"))
+
+type Dropper = DropperData.Dropper
+
+-- Structural and deliberately loose: PlotService owns the real Sanctum type and requires THIS
+-- module, so naming its type here would be a require cycle. Only State (for the cap) and
+-- Runtime.MoteFolder (for parenting) are ever read, which also lets the harness drive a plain table.
+type Sanctum = { State: any, Runtime: any }
+
+-- The part handle stays `any` so this module loads unchanged under the headless harness, whose
+-- Instances are tables rather than userdata.
+type MotePart = any
+
+type Mote = {
+	Part: MotePart,
+	Def: Dropper,
+	Value: number, -- Essence this Mote is worth when it lands; already fully multiplied
+	Progress: number, -- 0..1 across the WHOLE polyline
+	Travel: number, -- seconds for the full flight; the divisor progress advances by
+	Path: { CFrame }, -- borrowed by reference and NEVER mutated, so callers may cache one per pad
+	Marks: { number }, -- cumulative arc length at each waypoint; Marks[1] = 0
+	Length: number, -- Marks[#Marks]
+	Cursor: number, -- segment the Mote is currently on; monotonic, so lookup is O(1) amortised
+}
+
+local MIN_TRAVEL = 0.05 -- divisor floor: dt / 0 is inf progress, which skips the flight entirely
+local MAX_TRAVEL = 3600 -- a Mote that would fly for an hour is a leak, not a Mote
+
+local function num(v: any, default: number): number
+	return if type(v) == "number" and v == v and v ~= math.huge and v ~= -math.huge then v else default
+end
+
+-- Cumulative arc length, computed ONCE per Spawn. Interpolating by waypoint INDEX instead would make
+-- a 4-stud hop off the nozzle and a 90-stud trunk run take exactly as long as each other, so a Mote
+-- would crawl across the short segments and teleport across the long one.
+local function measure(path: { CFrame }): ({ number }, number)
+	local marks = table.create(#path)
+	marks[1] = 0
+	local total = 0
+	for i = 2, #path do
+		local delta = (path[i].Position - path[i - 1].Position).Magnitude
+		-- A NaN or inf waypoint would poison every later mark and freeze the Mote on the pad; treat
+		-- that segment as a zero-length hop instead so the rest of the rail still measures.
+		total += num(delta, 0)
+		marks[i] = total
+	end
+	return marks, total
+end
+
+-- World CFrame for the Mote's current progress, interpolated by DISTANCE along the polyline.
+local function poseOf(mote: Mote): CFrame
+	local path, marks = mote.Path, mote.Marks
+	local last = #path
+	if mote.Length <= 0 then
+		-- Degenerate rail (every waypoint identical, or all lengths rejected above): there is no
+		-- distance to divide by, so walk the waypoints uniformly rather than dividing by zero.
+		local slot = math.clamp(1 + mote.Progress * (last - 1), 1, last)
+		local index = math.min(math.floor(slot), last - 1)
+		return path[index]:Lerp(path[index + 1], slot - index)
+	end
+	local target = mote.Progress * mote.Length
+	-- Progress only ever increases, so the cursor only ever moves forward: this scan costs O(1)
+	-- amortised over the whole flight instead of an O(waypoints) search on every tick of every Mote.
+	local cursor = mote.Cursor
+	while cursor < last - 1 and marks[cursor + 1] < target do
+		cursor += 1
+	end
+	mote.Cursor = cursor
+	local span = marks[cursor + 1] - marks[cursor]
+	local alpha = if span > 0 then (target - marks[cursor]) / span else 0
+	return path[cursor]:Lerp(path[cursor + 1], math.clamp(alpha, 0, 1))
+end
+
+-- Resolved per Spawn, never cached at construction: PlotService rebuilds the Sanctum model on
+-- Transcendence, and a cached folder would parent every later Mote into a destroyed tree where the
+-- orphan sweep would silently eat it.
+local function moteFolder(sanctum: Sanctum): MotePart?
+	local runtime = sanctum.Runtime
+	if runtime == nil then
+		return nil
+	end
+	return (runtime :: any).MoteFolder
+end
+
+local MoteSystem = {}
+
+local MoteRuntime = {}
+MoteRuntime.__index = MoteRuntime
+
+type MoteRuntimeSelf = {
+	OnCollected: Signal.Signal, -- (value: number, dropperDef: Dropper)
+	_sanctum: Sanctum,
+	_motes: { Mote },
+	_destroyed: boolean,
+}
+type MoteRuntime = typeof(setmetatable({} :: MoteRuntimeSelf, MoteRuntime))
+
+function MoteSystem.new(sanctum: Sanctum): MoteRuntime
+	return setmetatable({
+		OnCollected = Signal.new(),
+		_sanctum = sanctum,
+		_motes = {},
+		_destroyed = false,
+	}, MoteRuntime)
+end
+
+function MoteRuntime.Count(self: MoteRuntime): number
+	return #self._motes
+end
+
+-- Builds the visual. Split out only so Spawn stays readable; every property here is set because its
+-- default is wrong for a Mote, not for decoration.
+local function buildPart(def: Dropper, pose: CFrame, folder: MotePart): MotePart
+	local part = Instance.new("Part")
+	part.Name = "Mote"
+	part.Anchored = true -- decision 8: CFrame-driven, never handed to the physics solver
+	part.CanCollide = false -- a Mote must never shove a player off their own rail
+	part.CanTouch = false -- there is no Touched listener anywhere; this drops the touch bookkeeping
+	part.CanQuery = false -- and keeps 60 parts per Sanctum out of every raycast
+	part.CastShadow = false -- 60 shadow casters per Sanctum for a 1.4-stud bauble is pure cost
+	part.Size = if typeof(GameConfig.Mote.Size) == "Vector3" then GameConfig.Mote.Size else Vector3.new(1.4, 1.4, 1.4)
+	part.Shape = Enum.PartType.Ball
+	-- Guarded: a def edited badly in a live patch would otherwise throw INSIDE the spawn loop, and
+	-- one bad catalogue entry would stop every Sanctum on the server from earning.
+	if typeof(def.Color) == "Color3" then
+		part.Color = def.Color
+	end
+	if typeof(def.Material) == "EnumItem" then
+		part.Material = def.Material
+	end
+	part.CFrame = pose
+	part.Parent = folder
+	-- Leak backstop. Every path out of Step destroys its own part, so this only ever fires for a Mote
+	-- the server somehow stopped stepping -- which is precisely the case that would otherwise leak.
+	Debris:AddItem(part, math.max(1, num(GameConfig.Mote.LifetimeSeconds, 30)))
+	return part
+end
+
+function MoteRuntime.Spawn(
+	self: MoteRuntime,
+	dropperDef: Dropper,
+	value: number,
+	path: { CFrame },
+	travelTime: number
+): boolean
+	-- A released Sanctum has no wallet left to credit, so this drops the Mote outright rather than
+	-- firing OnCollected at a listener PlotService has already torn down.
+	if self._destroyed then
+		return false
+	end
+	local worth = num(value, 0)
+	-- Non-finite or non-positive value means a bug upstream (a corrupt def, a NaN multiplier). It is
+	-- NOT credited: an inf written into the shared wallet is unrecoverable, and a 0 is just noise.
+	if worth <= 0 then
+		return false
+	end
+	-- Malformed rail. Also not credited -- unlike the cap below, this is a PlotLayout/PlotBuilder bug,
+	-- and paying for it would hide it behind income that still looks correct.
+	if type(path) ~= "table" or #path < 2 then
+		return false
+	end
+	for index = 1, #path do
+		if typeof(path[index]) ~= "CFrame" then
+			return false
+		end
+	end
+
+	-- OVERFLOW. Income is NEVER lost to the cap (decision 8): the value is credited immediately and
+	-- only the VISUAL is dropped, so a pair who let Motes pile up lose feedback, never Essence. The
+	-- false return tells the caller no part exists to track.
+	if #self._motes >= Economy.getMoteCapacity(self._sanctum.State) then
+		self.OnCollected:Fire(worth, dropperDef)
+		return false
+	end
+	local folder = moteFolder(self._sanctum)
+	if folder == nil then
+		-- Same rule as the cap: a Sanctum whose Runtime has no MoteFolder (a builder that has not
+		-- finished yet) can render nothing, but it must not silently swallow the Essence either.
+		self.OnCollected:Fire(worth, dropperDef)
+		return false
+	end
+
+	local travel = math.clamp(num(travelTime, num(GameConfig.Mote.BaseTravelSeconds, 6)), MIN_TRAVEL, MAX_TRAVEL)
+	local marks, length = measure(path)
+	local part = buildPart(dropperDef, path[1], folder)
+	self._motes[#self._motes + 1] = {
+		Part = part,
+		Def = dropperDef,
+		Value = worth,
+		Progress = 0,
+		Travel = travel,
+		Path = path,
+		Marks = marks,
+		Length = length,
+		Cursor = 1,
+	}
+	return true
+end
+
+function MoteRuntime.Step(self: MoteRuntime, dt: number): ()
+	if self._destroyed then
+		return
+	end
+	local step = num(dt, 0)
+	-- A non-positive or non-finite dt would either do nothing or set every Progress to NaN, after
+	-- which `Progress >= 1` is false forever and no Mote is ever collected again.
+	if step <= 0 then
+		return
+	end
+	local motes = self._motes
+	-- Backwards, because finished Motes are removed in place and a forward loop would skip whichever
+	-- element slid down into the freed slot.
+	for index = #motes, 1, -1 do
+		local mote = motes[index]
+		local part = mote.Part
+		if part.Parent == nil then
+			-- Destroyed out from under us: the Debris backstop fired, or the whole Sanctum model was
+			-- torn down. Dropped WITHOUT crediting -- crediting here is how one Mote gets paid for
+			-- twice (once on the sweep, once when it lands) or paid for having never landed at all.
+			table.remove(motes, index)
+		else
+			mote.Progress += step / mote.Travel
+			if mote.Progress >= 1 then
+				-- Removed BEFORE the signal so a handler reading Count() (or spawning a replacement
+				-- Mote from inside OnCollected) already sees the freed capacity slot.
+				table.remove(motes, index)
+				part:Destroy()
+				self.OnCollected:Fire(mote.Value, mote.Def)
+			else
+				part.CFrame = poseOf(mote)
+			end
+		end
+	end
+end
+
+function MoteRuntime.Clear(self: MoteRuntime): ()
+	local motes = self._motes
+	-- Value in flight is deliberately DISCARDED, not credited. Clear is called on Transcendence,
+	-- which is resetting the wallet in the same breath, and on plot release, where there is no wallet
+	-- left -- crediting here would hand a pair free Essence for pressing reset.
+	for index = #motes, 1, -1 do
+		local part = motes[index].Part
+		if part ~= nil then
+			part:Destroy()
+		end
+	end
+	table.clear(motes)
+end
+
+function MoteRuntime.Destroy(self: MoteRuntime): ()
+	-- Clear FIRST: sixty anchored parts per Sanctum, six Sanctums, every release -- a skipped cleanup
+	-- here is a slow leak that only shows up hours into a live server.
+	self:Clear()
+	self._destroyed = true
+	self.OnCollected:Destroy()
+end
+
+return MoteSystem
+
+--#endregion
+end
+MODULE_ORDER[#MODULE_ORDER + 1] = { Path = "ServerScriptService/Core/Systems/PlotBuilder", Class = "ModuleScript", File = "src/server/Systems/PlotBuilder.luau" }
+MODULE_DEFS["ServerScriptService/Core/Systems/PlotBuilder"] = function(script, require, ...)
+--#region src/server/Systems/PlotBuilder.luau
+--!strict
+--[[
+    PlotBuilder
+    Builds and tears down one Sanctum's Instance tree: a floor slab per Wing, the purchase pads and
+    their blank signs, the Ley Rail decks a Wellspring's Motes ride, the floating Conflux and its
+    Font, the Motes folder, and the per-slot spawn and link markers. Placement comes from PlotLayout
+    and colour/material from Theme -- geometry is all this module owns: no income, no affordability
+    checks, no prompts. PurchaseService owns each prompt and all wording; it inherits blank pads.
+    Owner: server/Systems  |  Consumers: PlotService, which passes the Runtime to PurchaseService,
+                                         DropperSystem, MoteSystem and EvolutionService
+]]
+
+local ServerStorage = game:GetService("ServerStorage")
+
+local Modules = game:GetService("ReplicatedStorage"):WaitForChild("Modules")
+local DropperData = require(Modules:WaitForChild("DropperData"))
+local GameConfig = require(Modules:WaitForChild("GameConfig"))
+local PlotLayout = require(Modules:WaitForChild("PlotLayout"))
+local SectionData = require(Modules:WaitForChild("SectionData"))
+local Theme = require(Modules:WaitForChild("Theme"))
+local UpgradeData = require(Modules:WaitForChild("UpgradeData"))
+
+type Section = SectionData.Section
+type Appearance = Theme.ConfluxAppearance
+
+-- A purchasable needing a pad + its Runtime.Pads/Signs key. Kind/Id become the pad's attributes.
+type PadEntry = { Key: string, Kind: string, Id: string }
+
+type Runtime = {
+	Model: Instance, Conflux: Instance, Font: Instance, MoteFolder: Instance, PlotId: number,
+	Origin: CFrame, Sections: { [string]: Instance }, Pads: { [string]: Instance },
+	RailFolders: { [string]: Instance }, Signs: { [string]: TextLabel } }
+
+type PartProps = { Name: string, Size: Vector3, CFrame: CFrame, Color: Color3, Parent: Instance,
+	Material: Enum.Material, Transparency: number?, CanCollide: boolean? }
+
+-- PlotLayout owns every POSITION; these are the extents that fill the space it reserves. Its pad
+-- line spacing is 12 studs so a 6-stud pad leaves a walkway, and a 2-tall pad centred on its
+-- PAD_HEIGHT of 1.5 rests on the 0.5 slab top rather than hovering.
+local PAD_SIZE = Vector3.new(6, 2, 6)
+local FONT_SIZE, MARKER_SIZE = Vector3.new(12, 6, 12), Vector3.new(8, 0.2, 8)
+local MARKER_DROP = -3.4 -- spawn CFrames float at head clearance; the decal belongs on the floor
+local MAX_LIGHT_RANGE = 60 -- PointLight.Range is hard-capped at 60 by the engine
+local RAIL_WIDTH, RAIL_THICKNESS, MIN_RAIL_LENGTH = 2.2, 0.4, 0.5 -- below MIN a segment is degenerate
+
+-- Theme has materials for the Conflux and the Affinities but none for static architecture, so a
+-- Sanctum's structural materials are named once here. NEON covers rails and the Font: both glow, so
+-- they read as live ley-work rather than as more masonry.
+local FLOOR_MATERIAL, PAD_MATERIAL = Enum.Material.Slate, Enum.Material.Metal
+local NEON, MARKER_MATERIAL = Enum.Material.Neon, Enum.Material.ForceField
+local HIDDEN_ROOT_NAME = "SanctumHiddenWings" -- where locked Wings wait; see setSectionVisible
+
+local PlotBuilder = {}
+
+local function newFolder(name: string, parent: Instance): Folder
+	local folder = Instance.new("Folder")
+	folder.Name = name
+	folder.Parent = parent
+	return folder
+end
+
+local function makePart(props: PartProps): Part
+	local part = Instance.new("Part")
+	part.Name = props.Name
+	part.Size = props.Size
+	part.CFrame = props.CFrame
+	part.Color = props.Color
+	part.Material = props.Material
+	part.Anchored = true -- correctness, not optimisation: an unanchored slab falls out of the world
+	part.CanCollide = if props.CanCollide == nil then true else props.CanCollide
+	part.Transparency = props.Transparency or 0
+	part.Parent = props.Parent
+	return part
+end
+
+-- A blank billboard label. PurchaseService writes pad wording; the Font supplies its own up front.
+local function makeSign(adornee: Instance, text: string, height: number): TextLabel
+	local gui = Instance.new("BillboardGui")
+	gui.Name = "Sign"
+	gui.Size = UDim2.new(0, 220, 0, 70)
+	gui.StudsOffset = Vector3.new(0, height, 0)
+	gui.MaxDistance = 90 -- 6 Sanctums x ~25 signs = 150 billboards; cull the already-illegible ones
+	gui.Parent = adornee
+	local label = Instance.new("TextLabel")
+	label.Size = UDim2.new(1, 0, 1, 0)
+	label.BackgroundTransparency = 1
+	label.TextColor3 = Theme.Ui.Text
+	label.TextStrokeTransparency = 0.4 -- pads glow; a stroke keeps the text off its own background
+	label.TextScaled = true
+	label.Text = text
+	label.Parent = gui
+	return label
+end
+
+--[[ The per-Wing pad numbering, assigned in exactly one place. PlotLayout.padCFrame and .railPath
+     take a PER-WING running index, not a catalogue Order -- DropperData and UpgradeData both number
+     from 1, so reusing Order would stack an Upgrade pad on a Wellspring. Wellsprings are numbered
+     FIRST so they always occupy 1..N: rails are built for exactly those indices. ]]
+local function padPlan(sectionId: string): { PadEntry }
+	local plan: { PadEntry } = {}
+	local function collect(kind: string, list: { any })
+		for _, def in ipairs(list) do
+			-- On a Wing, RequiredSection reads as "my prerequisite": its unlock pad must stand on
+			-- the Wing you can already reach, never inside the room it sells.
+			if def.RequiredSection == sectionId then
+				table.insert(plan, { Key = kind .. ":" .. def.Id, Kind = kind, Id = def.Id })
+			end
+		end
+	end
+	collect("dropper", DropperData.List)
+	collect("upgrade", UpgradeData.List)
+	collect("section", SectionData.List)
+	if sectionId == SectionData.Base then
+		-- Both Sanctum-wide rituals act on the Conflux, so they stand on the Wing that holds it.
+		table.insert(plan, { Key = "attune", Kind = "attune", Id = "attune" })
+		table.insert(plan, { Key = "transcend", Kind = "transcend", Id = "transcend" })
+	end
+	return plan
+end
+
+local function makePad(parent: Instance, cf: CFrame, entry: PadEntry, sectionId: string, order: number): Part
+	local pad = makePart({
+		Name = string.format("Pad_%s_%s", entry.Kind, entry.Id), Size = PAD_SIZE, CFrame = cf,
+		Color = Theme.Ui.Panel, Material = PAD_MATERIAL, Parent = parent,
+	})
+	pad:SetAttribute("PadKind", entry.Kind)
+	pad:SetAttribute("PadId", entry.Id)
+	-- EXTRA: MoteSystem needs (section, order) to recompute a rail path and that order is invented
+	-- here, so publish it instead of having every consumer re-derive padPlan and drift out of sync.
+	pad:SetAttribute("PadSection", sectionId)
+	pad:SetAttribute("PadOrder", order)
+	return pad
+end
+
+-- One Ley Rail: thin decks joining consecutive PlotLayout.railPath waypoints.
+local function buildRail(parent: Instance, origin: CFrame, section: Section, order: number, id: string)
+	local def = DropperData.get(id)
+	local colour = if def ~= nil then def.Color else Theme.Ui.Accent
+	local path = PlotLayout.railPath(origin, section, order)
+	local folder = newFolder("Rail_" .. id, parent)
+	for i = 1, #path - 1 do
+		local a, b = path[i].Position, path[i + 1].Position
+		local dx, dz = b.X - a.X, b.Z - a.Z
+		-- Length is XZ-only and the deck is left level: waypoint heights change between legs
+		-- (nozzle -> deck -> Font) and a stepped rail beats a twisted one. Motes fly the true path.
+		local length = math.sqrt(dx * dx + dz * dz)
+		if length >= MIN_RAIL_LENGTH then
+			makePart({
+				Name = string.format("Segment_%d", i), Size = Vector3.new(RAIL_WIDTH, RAIL_THICKNESS, length),
+				-- Identity looks down -Z, so yaw = atan2(-dx, -dz) aims the long axis along the leg
+				-- -- the same convention PlotLayout uses to orient its own waypoints.
+				CFrame = CFrame.new((a.X + b.X) * 0.5, (a.Y + b.Y) * 0.5, (a.Z + b.Z) * 0.5)
+					* CFrame.Angles(0, math.atan2(-dx, -dz), 0),
+				Color = colour, Material = NEON, Parent = folder, Transparency = 0.25,
+				CanCollide = false, -- a player must never be able to stand on or snag a rail
+			})
+		end
+	end
+end
+
+local function hiddenHolder(model: Instance): Instance
+	local root = ServerStorage:FindFirstChild(HIDDEN_ROOT_NAME) or newFolder(HIDDEN_ROOT_NAME, ServerStorage)
+	local name = model.Name .. "_Hidden"
+	return root:FindFirstChild(name) or newFolder(name, root)
+end
+
+function PlotBuilder.buildSection(sanctumModel: Instance, section: Section): Instance
+	-- Origin is recovered from the Model: the spec's signature has nowhere to pass it. Defaulting to
+	-- plot 1 on a missing/non-numeric attribute avoids an arithmetic-on-nil deep inside PlotLayout.
+	local plotId = sanctumModel:GetAttribute("PlotId")
+	local origin = PlotLayout.sanctumOrigin(if type(plotId) == "number" then plotId else 1)
+
+	local model = Instance.new("Model")
+	model.Name = section.Id
+	makePart({
+		Name = "Floor", Size = section.Size, CFrame = PlotLayout.sectionCFrame(origin, section),
+		-- The base Wing is tinted apart so the Core reads as the heart of the Sanctum.
+		Color = if section.Id == SectionData.Base then Theme.Ui.Stroke else Theme.Ui.Panel,
+		Material = FLOOR_MATERIAL, Parent = model,
+	})
+	newFolder("Pads", model) -- both filled by build(); buildSection only guarantees they exist
+	newFolder("Rails", model)
+	model.Parent = sanctumModel
+	return model
+end
+
+function PlotBuilder.build(plotId: number, parent: Instance): (Instance, Runtime)
+	local origin = PlotLayout.sanctumOrigin(plotId)
+	local model = Instance.new("Model")
+	model.Name = string.format("Sanctum_%d", plotId)
+	model:SetAttribute("PlotId", plotId) -- read back by buildSection, and handy in Studio
+
+	local sections: { [string]: Instance }, railFolders: { [string]: Instance } = {}, {}
+	local pads: { [string]: Instance }, signs: { [string]: TextLabel } = {}, {}
+	for _, section in ipairs(SectionData.List) do
+		local sectionModel = PlotBuilder.buildSection(model, section)
+		local padFolder = sectionModel:FindFirstChild("Pads") :: Instance
+		local railFolder = sectionModel:FindFirstChild("Rails") :: Instance
+		sections[section.Id] = sectionModel
+		railFolders[section.Id] = railFolder
+		for order, entry in ipairs(padPlan(section.Id)) do
+			local pad = makePad(padFolder, PlotLayout.padCFrame(origin, section, order), entry, section.Id, order)
+			pads[entry.Key] = pad
+			signs[entry.Key] = makeSign(pad, "", 3.5)
+			if entry.Kind == "dropper" then
+				buildRail(railFolder, origin, section, order, entry.Id)
+			end
+		end
+	end
+
+	-- Stage 1 unattuned is the only look PlotBuilder knows; later ones arrive via setConfluxAppearance.
+	local look = Theme.getConfluxAppearance(1, nil)
+	local size = math.max(1, look.Size)
+	local conflux = makePart({
+		Name = "Conflux", Size = Vector3.new(size, size, size), CFrame = PlotLayout.confluxCFrame(origin),
+		Color = look.Color, Material = look.Material, Parent = model, Transparency = 0.15,
+		CanCollide = false, -- it floats 20 studs up, but a solid Conflux would block arriving Motes
+	})
+	local light = Instance.new("PointLight")
+	light.Color = look.Color
+	light.Range = math.min(MAX_LIGHT_RANGE, size * 3)
+	light.Brightness = 2.5
+	light.Parent = conflux
+
+	local font = makePart({
+		Name = "ConfluxFont", Size = FONT_SIZE, CFrame = PlotLayout.fontCFrame(origin),
+		Color = Theme.Ui.Accent, Material = NEON, Parent = model,
+		CanCollide = false, -- every rail ends inside it; nothing may be deflected on the way in
+	})
+	makeSign(font, string.format("Sanctum %d", plotId), 6)
+
+	local motes = newFolder("Motes", model)
+	local markers = newFolder("Markers", model)
+	for slot = 1, GameConfig.Plot.SlotsPerSanctum do
+		makePart({
+			Name = string.format("SpawnMarker_%d", slot), Size = MARKER_SIZE, Transparency = 0.5,
+			CFrame = PlotLayout.spawnSlotCFrame(origin, slot) * CFrame.new(0, MARKER_DROP, 0),
+			Color = Theme.Ui.Positive, Material = MARKER_MATERIAL, Parent = markers,
+			CanCollide = false, -- a spawning character must not be shoved off its own marker
+		})
+		-- Link pads are Sanctum furniture, not Wing furniture -- PlotLayout places them separately,
+		-- so they carry order 0, a value that never indexes a Wing pad line.
+		local key = "link:" .. slot
+		local entry: PadEntry = { Key = key, Kind = "link", Id = tostring(slot) }
+		pads[key] = makePad(markers, PlotLayout.linkPadCFrame(origin, slot), entry, SectionData.Base, 0)
+		signs[key] = makeSign(pads[key], "", 3.5)
+	end
+
+	-- Parented LAST: the Sanctum then replicates as one burst rather than as ~200 part additions
+	-- streaming to every client while it is still half-assembled.
+	model.Parent = parent
+	return model, {
+		Model = model, Sections = sections, Pads = pads, Conflux = conflux, Font = font,
+		MoteFolder = motes, RailFolders = railFolders, Signs = signs, PlotId = plotId, Origin = origin,
+	}
+end
+
+--[[ Locked Wings are REPARENTED out of the world, not made transparent. A transparent slab is still
+     a rendered part with a physics record, still streamed to every client, and its pads would still
+     be reachable by a ProximityPrompt -- PurchaseService would have to re-check the lock on every
+     trigger. ServerStorage costs the client nothing (it never replicates) and makes an unowned
+     Wing's pads unreachable by construction. The trade: destroy() must sweep both places. ]]
+function PlotBuilder.setSectionVisible(runtime: Runtime, sectionId: string, visible: boolean)
+	local section = runtime.Sections[sectionId]
+	if section == nil then
+		-- A sanitised save can still name a Wing this build lacks; ignore it rather than kill the
+		-- whole rebuild over one stale id.
+		return
+	end
+	section.Parent = if visible then runtime.Model else hiddenHolder(runtime.Model)
+end
+
+function PlotBuilder.setConfluxAppearance(runtime: Runtime, appearance: Appearance)
+	local conflux = runtime.Conflux :: Part
+	-- Clamped: a zero/negative Size would make the Conflux vanish, reading as a bug not an Attunement.
+	local size = math.max(1, appearance.Size)
+	conflux.Size = Vector3.new(size, size, size)
+	conflux.Color = appearance.Color
+	conflux.Material = appearance.Material
+	local light = conflux:FindFirstChildOfClass("PointLight")
+	if light ~= nil then
+		light.Color = appearance.Color
+		light.Range = math.min(MAX_LIGHT_RANGE, size * 3)
+	end
+end
+
+function PlotBuilder.destroy(model: Instance)
+	-- Locked Wings live OUTSIDE this Model, so Model:Destroy() alone would leak every Wing the
+	-- Sanctum never unlocked, for the remaining life of the server.
+	local root = ServerStorage:FindFirstChild(HIDDEN_ROOT_NAME)
+	local holder = if root ~= nil then root:FindFirstChild(model.Name .. "_Hidden") else nil
+	if holder ~= nil then
+		holder:Destroy()
+	end
+	model:Destroy()
+end
+
+return PlotBuilder
 
 --#endregion
 end
@@ -4096,7 +5489,13 @@ local GameConfig = {
 	Debug = {
 		Enabled = false, -- verbose server logging
 		FastMode = false, -- income x FastIncomeMultiplier, costs / FastCostDivisor (Economy honours it)
-		AllowDataReset = true, -- gates the ResetData remote entirely
+		-- Two-part gate on the destructive "reset my save" action. AllowDataReset compiles the
+		-- feature in at all; DataResetStudioOnly keeps it out of players' reach on a live server
+		-- while leaving it available while developing. GameConfig stays pure, so the RunService
+		-- check itself lives in ProfileService (authoritative) and SettingsController (hides the
+		-- button) rather than here.
+		AllowDataReset = true,
+		DataResetStudioOnly = true,
 		FastIncomeMultiplier = 25, -- magnitude of the FastMode income boost
 		FastCostDivisor = 10, -- magnitude of the FastMode cost reduction
 	},
@@ -7736,6 +9135,388 @@ t.test("geometry helpers tolerate junk without erroring", function()
     t.noThrow(function() return PlotLayout.sanctumOrigin(0 / 0) end)
     t.noThrow(function() return PlotLayout.padCFrame(origin, SectionData.List[1], 0 / 0) end)
     t.noThrow(function() return PlotLayout.spawnSlotCFrame(origin, 99) end)
+end)
+
+--#endregion
+end }
+SPECS[#SPECS + 1] = { Name = "profile.spec", Run = function(t, Mock, loadModule, runScript)
+--#region tests/specs/profile.spec.luau
+--[[
+    profile.spec
+    Session locking is the highest-risk logic in the game: get it wrong in one direction and a
+    crashed server locks a player out of their own save forever; get it wrong in the other and two
+    servers write one profile. Both directions are tested here, along with the outage path, because
+    the worst outcome available to this module is overwriting a real save with a blank one.
+
+    NOTE for anyone adding to this file: stateful services must be loaded INSIDE a test, never at
+    registration time. Mock.reset() clears the module cache between tests, so a reference captured
+    at the top of the file would keep pointing at the previous test's service -- complete with its
+    loaded profiles and its memoised (now detached) DataStore handle.
+]]
+
+local StateSchema = loadModule("ReplicatedStorage/Modules/StateSchema")
+local GameConfig = loadModule("ReplicatedStorage/Modules/GameConfig")
+local DropperData = loadModule("ReplicatedStorage/Modules/DropperData")
+
+local JOB_ID = game.JobId
+local STORE = GameConfig.Save.DataStoreName
+local firstDropper = DropperData.List[1]
+
+--- Fresh service instances on a clean world. ProfileService only resolves DataStoreWrapper.
+local function boot()
+    local wrapper = loadModule("ServerScriptService/Core/Services/DataStoreWrapper")
+    local profiles = loadModule("ServerScriptService/Core/Services/ProfileService")
+    profiles:Init({
+        Get = function(_, name)
+            if name == "DataStoreWrapper" then return wrapper end
+            error("unexpected dependency " .. tostring(name), 0)
+        end,
+    })
+    profiles:Start()
+    return profiles, wrapper
+end
+
+local function rawStore()
+    return game:GetService("DataStoreService"):GetDataStore(STORE)
+end
+
+local function keyFor(userId)
+    return GameConfig.Save.KeyPrefix .. tostring(userId)
+end
+
+local function seedStored(userId, value)
+    rawStore():SetAsync(keyFor(userId), value)
+end
+
+local function readStored(userId)
+    return rawStore():GetAsync(keyFor(userId))
+end
+
+-------------------------------------------------------------------------------
+-- Happy path
+-------------------------------------------------------------------------------
+t.test("a first-time player gets a fresh legal profile and takes the lock", function()
+    local ProfileService = boot()
+    local player = Mock.addPlayer("Ash", 501)
+    local profile = ProfileService:LoadAsync(player)
+
+    t.truthy(profile, "a first join must always succeed")
+    t.eq(profile.SchemaVersion, StateSchema.VERSION)
+    t.eq(profile.Plot.Essence, 0)
+    t.eq(profile.Stats.JoinCount, 1)
+    t.truthy(ProfileService:IsLoaded(player))
+    t.eq(ProfileService:Get(player), profile)
+
+    local stored = readStored(501)
+    t.truthy(stored, "the load itself claims the lock, so the record exists immediately")
+    t.eq(stored.Lock.JobId, JOB_ID)
+    t.truthy(stored.Data ~= nil, "data lives under Data, alongside the lock")
+end)
+
+t.test("ProfileLoaded fires with the player and profile", function()
+    local ProfileService = boot()
+    local seen = {}
+    ProfileService.ProfileLoaded:Connect(function(player, profile)
+        table.insert(seen, { player.Name, profile.Stats.JoinCount })
+    end)
+    local player = Mock.addPlayer("Ash", 501)
+    ProfileService:LoadAsync(player)
+    Mock.advance(0)
+    t.eq(#seen, 1)
+    t.eq(seen[1][1], "Ash")
+end)
+
+t.test("progress survives a save, a server restart and a rejoin", function()
+    local ProfileService = boot()
+    local player = Mock.addPlayer("Ash", 501)
+    local profile = ProfileService:LoadAsync(player)
+    profile.Plot.Essence = 12345
+    profile.Plot.Stage = 4
+    profile.Plot.Droppers[firstDropper.Id] = 6
+    profile.Prestige.Rebirths = 3
+    t.truthy(ProfileService:Save(player, { Release = true }))
+
+    -- restartServer drops all runtime state but keeps datastore contents, exactly like a real
+    -- shutdown followed by a fresh server starting up.
+    Mock.restartServer()
+    local Reloaded = boot()
+    local rejoined = Mock.addPlayer("Ash", 501)
+    local after = Reloaded:LoadAsync(rejoined)
+
+    t.truthy(after, "the released lock lets the next server in")
+    t.eq(after.Plot.Essence, 12345)
+    t.eq(after.Plot.Stage, 4)
+    t.eq(after.Plot.Droppers[firstDropper.Id], 6)
+    t.eq(after.Prestige.Rebirths, 3)
+    t.eq(after.Stats.JoinCount, 2, "join count accumulates across sessions")
+end)
+
+t.test("a second LoadAsync for the same player returns the same profile, not a second lock", function()
+    local ProfileService = boot()
+    local player = Mock.addPlayer("Ash", 501)
+    local first = ProfileService:LoadAsync(player)
+    local second = ProfileService:LoadAsync(player)
+    t.eq(first, second)
+    t.eq(first.Stats.JoinCount, 1, "the second call did not re-run the load")
+end)
+
+-------------------------------------------------------------------------------
+-- Locking
+-------------------------------------------------------------------------------
+t.test("a LIVE lock held by another server blocks the load", function()
+    local ProfileService = boot()
+    seedStored(501, {
+        Lock = { JobId = "some-other-live-server", Stamp = os.time() },
+        Data = StateSchema.newProfile(),
+    })
+    local player = Mock.addPlayer("Ash", 501)
+    local profile = ProfileService:LoadAsync(player)
+
+    t.eq(profile, nil, "nil, NOT a blank profile -- a lost session beats a lost account")
+    t.falsy(ProfileService:IsLoaded(player))
+    t.eq(readStored(501).Lock.JobId, "some-other-live-server", "the foreign lock is untouched")
+end)
+
+t.test("a STALE lock is stolen, because a crashed server never releases one", function()
+    local ProfileService = boot()
+    local existing = StateSchema.newProfile()
+    existing.Plot.Essence = 777
+    seedStored(501, {
+        -- Older than LockStaleSeconds: the server that wrote it is gone. Without the steal this
+        -- account would be unloadable forever.
+        Lock = { JobId = "crashed-server", Stamp = os.time() - GameConfig.Session.LockStaleSeconds - 60 },
+        Data = existing,
+    })
+    local player = Mock.addPlayer("Ash", 501)
+    local profile = ProfileService:LoadAsync(player)
+
+    t.truthy(profile, "the stale lock was stolen")
+    t.eq(profile.Plot.Essence, 777, "and the real save came with it")
+    t.eq(readStored(501).Lock.JobId, JOB_ID)
+end)
+
+t.test("the stale window sits far above the autosave interval", function()
+    -- If it did not, a live session's lock (refreshed every autosave) could be stolen by another
+    -- server and two servers would write one profile: the exact corruption the lock prevents.
+    local worstCaseAge = GameConfig.Save.AutosaveSeconds + GameConfig.Save.AutosaveJitter
+    t.gt(GameConfig.Session.LockStaleSeconds, worstCaseAge * 4,
+        "a laggy but living server must never be mistaken for a dead one")
+end)
+
+t.test("our own lock does not block us (a rejoin to the same server)", function()
+    local ProfileService = boot()
+    local existing = StateSchema.newProfile()
+    existing.Plot.Essence = 42
+    seedStored(501, { Lock = { JobId = JOB_ID, Stamp = os.time() }, Data = existing })
+    local player = Mock.addPlayer("Ash", 501)
+    local profile = ProfileService:LoadAsync(player)
+    t.truthy(profile, "a player who rejoined the same server must not be locked out by themselves")
+    t.eq(profile.Plot.Essence, 42)
+end)
+
+t.test("a legacy unwrapped profile is adopted, not mistaken for garbage", function()
+    local ProfileService = boot()
+    local legacy = StateSchema.newProfile()
+    legacy.Plot.Essence = 999
+    seedStored(501, legacy) -- written by a build predating the lock wrapper
+    local player = Mock.addPlayer("Ash", 501)
+    local profile = ProfileService:LoadAsync(player)
+    t.truthy(profile)
+    t.eq(profile.Plot.Essence, 999, "an old save is upgraded in place, never overwritten")
+end)
+
+t.test("a malformed lock record is treated as no lock", function()
+    local ProfileService = boot()
+    local data = StateSchema.newProfile()
+    data.Plot.Essence = 55
+    for index, badLock in ipairs({ "not a table", { JobId = 12 }, { Stamp = "soon" }, {} }) do
+        local userId = 700 + index
+        seedStored(userId, { Lock = badLock, Data = data })
+        local player = Mock.addPlayer("Ash" .. index, userId)
+        local profile = ProfileService:LoadAsync(player)
+        t.truthy(profile, "a half-written lock must not strand a player for 15 minutes")
+        t.eq(profile.Plot.Essence, 55)
+    end
+end)
+
+t.test("a corrupt stored value loads as a repaired profile", function()
+    local ProfileService = boot()
+    seedStored(501, { Lock = { JobId = "old", Stamp = 0 }, Data = {
+        Plot = { Essence = "lots", Stage = 99, Droppers = { god_mode = 1e9 } },
+        Prestige = { Rebirths = 1e300 },
+    } })
+    local player = Mock.addPlayer("Ash", 501)
+    local profile = ProfileService:LoadAsync(player)
+    t.truthy(profile, "a corrupt save is a non-event, not a failed join")
+    t.eq(profile.Plot.Droppers.god_mode, nil)
+    t.truthy(profile.Plot.Essence == profile.Plot.Essence and profile.Plot.Essence >= 0)
+end)
+
+-------------------------------------------------------------------------------
+-- Saving
+-------------------------------------------------------------------------------
+t.test("saving refreshes the lock stamp so a live session is never seen as stale", function()
+    local ProfileService = boot()
+    local player = Mock.addPlayer("Ash", 501)
+    ProfileService:LoadAsync(player)
+    local firstStamp = readStored(501).Lock.Stamp
+    Mock.advance(200)
+    ProfileService:Save(player)
+    t.gt(readStored(501).Lock.Stamp, firstStamp)
+end)
+
+t.test("releasing clears the lock so the next server can load immediately", function()
+    local ProfileService = boot()
+    local player = Mock.addPlayer("Ash", 501)
+    ProfileService:LoadAsync(player)
+    ProfileService:Save(player, { Release = true })
+    local stored = readStored(501)
+    t.truthy(stored.Lock == nil or stored.Lock.JobId == nil or stored.Lock.Stamp == 0,
+        "a released record must not block the next join")
+end)
+
+t.test("a save is abandoned when another server has taken the lock", function()
+    local ProfileService = boot()
+    local player = Mock.addPlayer("Ash", 501)
+    local profile = ProfileService:LoadAsync(player)
+    profile.Plot.Essence = 500
+    -- Simulate our lock being stolen while we were playing.
+    seedStored(501, { Lock = { JobId = "other-server", Stamp = os.time() }, Data = { Plot = { Essence = 1 } } })
+    local ok = ProfileService:Save(player)
+    t.falsy(ok, "writing here would clobber the server that now owns this player")
+    t.eq(readStored(501).Lock.JobId, "other-server")
+end)
+
+t.test("playtime accumulates across saves", function()
+    local ProfileService = boot()
+    local player = Mock.addPlayer("Ash", 501)
+    local profile = ProfileService:LoadAsync(player)
+    Mock.advance(300)
+    ProfileService:Save(player)
+    t.gt(profile.Stats.Playtime, 0)
+    t.gt(profile.Stats.LastSave, 0)
+end)
+
+t.test("autosave writes on its own without being asked", function()
+    local ProfileService = boot()
+    local player = Mock.addPlayer("Ash", 501)
+    local profile = ProfileService:LoadAsync(player)
+    profile.Plot.Essence = 4242
+    local before = readStored(501).Data.Plot.Essence
+
+    -- One autosave period plus the maximum jitter.
+    Mock.advance(GameConfig.Save.AutosaveSeconds + GameConfig.Save.AutosaveJitter + 5)
+    local after = readStored(501).Data.Plot.Essence
+    t.neq(after, before)
+    t.eq(after, 4242, "the autosave published the live table")
+end)
+
+t.test("autosave stops when the player leaves", function()
+    local ProfileService = boot()
+    local player = Mock.addPlayer("Ash", 501)
+    ProfileService:LoadAsync(player)
+    ProfileService:Release(player)
+    Mock.removePlayer(player)
+    local callsBefore = Mock.DataStore.calls()
+    Mock.advance(GameConfig.Save.AutosaveSeconds * 3)
+    t.eq(Mock.DataStore.calls(), callsBefore, "a released profile must not keep retaking the lock")
+end)
+
+t.test("concurrent saves coalesce instead of racing", function()
+    local ProfileService = boot()
+    Mock.DataStore.setLatency(2)
+    local player = Mock.addPlayer("Ash", 501)
+    ProfileService:LoadAsync(player)
+    local callsBefore = Mock.DataStore.calls()
+    task.spawn(function() ProfileService:Save(player) end)
+    task.spawn(function() ProfileService:Save(player) end)
+    Mock.advance(10)
+    t.lt(Mock.DataStore.calls() - callsBefore, 3, "two overlapping saves must not both round-trip")
+end)
+
+-------------------------------------------------------------------------------
+-- Outage
+-------------------------------------------------------------------------------
+t.test("a dead DataStore still lets the player in, on a profile that is never written back", function()
+    local ProfileService = boot()
+    Mock.DataStore.failAlways(true)
+    local player = Mock.addPlayer("Ash", 501)
+    local profile = ProfileService:LoadAsync(player)
+
+    t.truthy(profile, "an outage must not stop people playing")
+    t.truthy(ProfileService:IsLoaded(player))
+    Mock.DataStore.failAlways(false)
+    local callsBefore = Mock.DataStore.calls()
+    t.falsy(ProfileService:Save(player),
+        "and must NEVER be persisted: it would replace a real save with zeroes")
+    t.eq(Mock.DataStore.calls(), callsBefore, "no write was even attempted")
+end)
+
+t.test("a DataStore that fails then recovers loads normally", function()
+    local ProfileService = boot()
+    Mock.DataStore.failNext(3) -- inside DataStoreWrapper's retry budget
+    local player = Mock.addPlayer("Ash", 501)
+    local profile = ProfileService:LoadAsync(player)
+    t.truthy(profile)
+    t.falsy(rawget(profile, "__NoSave"), "a transient blip is not an outage")
+    t.truthy(ProfileService:Save(player))
+end)
+
+-------------------------------------------------------------------------------
+-- Shutdown
+-------------------------------------------------------------------------------
+t.test("SaveAll releases every loaded profile", function()
+    local ProfileService = boot()
+    local ash = Mock.addPlayer("Ash", 501)
+    local bree = Mock.addPlayer("Bree", 502)
+    ProfileService:LoadAsync(ash).Plot.Essence = 100
+    ProfileService:LoadAsync(bree).Plot.Essence = 200
+    ProfileService:SaveAll(true)
+    t.eq(readStored(501).Data.Plot.Essence, 100)
+    t.eq(readStored(502).Data.Plot.Essence, 200)
+end)
+
+t.test("a shutdown save is bounded so one bad player cannot eat everyone's budget", function()
+    local ProfileService = boot()
+    Mock.DataStore.setLatency(20) -- every write is slower than the whole shutdown window
+    for index = 1, 5 do
+        ProfileService:LoadAsync(Mock.addPlayer("P" .. index, 600 + index))
+    end
+    local before = Mock.now()
+    ProfileService:SaveAll(true)
+    local spent = Mock.now() - before
+    t.lt(spent, GameConfig.Save.ShutdownBudgetSeconds * 3,
+        ("SaveAll ran for %.1fs; Roblox hard-kills the server around %ds"):format(
+            spent, GameConfig.Save.ShutdownBudgetSeconds))
+end)
+
+t.test("BindToClose is registered and drives the shutdown save", function()
+    local ProfileService = boot()
+    local player = Mock.addPlayer("Ash", 501)
+    ProfileService:LoadAsync(player).Plot.Essence = 8888
+    Mock.shutdown()
+    t.eq(readStored(501).Data.Plot.Essence, 8888, "progress is not lost when the server closes")
+end)
+
+t.test("a player leaving is saved and released automatically", function()
+    local ProfileService = boot()
+    local player = Mock.addPlayer("Ash", 501)
+    ProfileService:LoadAsync(player).Plot.Essence = 313
+    Mock.removePlayer(player)
+    Mock.advance(1)
+    t.eq(readStored(501).Data.Plot.Essence, 313)
+    t.falsy(ProfileService:IsLoaded(player), "the in-memory profile is dropped")
+end)
+
+t.test("every entry point tolerates a player it has never seen", function()
+    local ProfileService = boot()
+    local stranger = Mock.addPlayer("Stranger", 999)
+    t.eq(ProfileService:Get(stranger), nil)
+    t.falsy(ProfileService:IsLoaded(stranger))
+    t.falsy(ProfileService:Save(stranger))
+    t.noThrow(function() ProfileService:Release(stranger) end)
+    t.noThrow(function() ProfileService:Save(nil) end)
+    t.noThrow(function() ProfileService:Get(nil) end)
 end)
 
 --#endregion
