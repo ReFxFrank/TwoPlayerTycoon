@@ -1,0 +1,12 @@
+# Build output
+/.bundle/
+*.rbxl
+*.rbxlx
+*.rbxl.lock
+*.rbxlx.lock
+sourcemap.json
+
+# Tooling
+node_modules/
+.DS_Store
+*.log
