@@ -2692,6 +2692,284 @@ return Service
 
 --#endregion
 end
+MODULE_ORDER[#MODULE_ORDER + 1] = { Path = "ServerScriptService/Core/Services/EconomyService", Class = "ModuleScript", File = "src/server/Services/EconomyService.luau" }
+MODULE_DEFS["ServerScriptService/Core/Services/EconomyService"] = function(script, require, ...)
+--#region src/server/Services/EconomyService.luau
+--!strict
+--[[
+	EconomyService
+	The ONLY writer of PlotState.Essence in the whole game. Every other service asks it: motes credit
+	through Credit, pads and attunements spend through TryDebit, and nothing else is allowed to touch
+	the shared wallet. It also owns the per-Sanctum Multipliers CACHE -- Economy.getMultipliers walks
+	every upgrade in the catalogue and this runs inside the one income Heartbeat, so the result is
+	computed on change (RefreshMultipliers) rather than on read. Every method is total: it runs in
+	that shared loop, where one error would stop income for every Sanctum on the server.
+	Owner: server/Services  |  Consumers: PlotService, PurchaseService, EvolutionService,
+	                                      RebirthService, StateReplicator, LeaderboardService
+]]
+
+local Modules = game:GetService("ReplicatedStorage"):WaitForChild("Modules")
+local Economy = require(Modules:WaitForChild("Economy"))
+local GameConfig = require(Modules:WaitForChild("GameConfig"))
+local StateSchema = require(Modules:WaitForChild("StateSchema"))
+
+type Multipliers = Economy.Multipliers
+--[[ Every public method takes the Sanctum as `any` rather than a named type. Two reasons: PlotService
+     owns the real Sanctum type and resolves THIS service through the registry, so naming it here
+     would be a require cycle; and the argument is untrusted anyway -- it is validated at runtime by
+     stateOf, which is what lets the harness drive these methods with a plain table. Only State,
+     Occupants and Dirty are ever touched. ]]
+type Occupant = { [string]: any }
+
+local function isFinite(v: any): boolean
+	return type(v) == "number" and v == v and v ~= math.huge and v ~= -math.huge
+end
+
+local MAX_CURRENCY = StateSchema.MAX_CURRENCY
+--[[ Dust floor. A credit smaller than this is arithmetic noise -- a rounding remainder, or a corrupt
+     def yielding 1e-300 -- and adding it to a wallet held as a double changes nothing while still
+     costing a dirty flag and a replication tick every frame. GameConfig owns the number; the guard
+     is here because a hand-edited config must never turn the floor into NaN (which rejects every
+     credit) or into a large number (which would silently swallow real income). ]]
+local CONFIGURED_FLOOR = GameConfig.Income.MinCredit
+local MIN_CREDIT = math.clamp(if isFinite(CONFIGURED_FLOOR) then CONFIGURED_FLOOR else 0.0001, 0, 1)
+local EMPTY: { [string]: any } = {}
+-- No occupants resolved => no prestige bonus. Shared and never written to.
+local NO_REBIRTHS: { number } = {}
+
+local Service = {}
+Service.Name = "EconomyService"
+
+local profiles: any = nil -- ProfileService, resolved in Init (registered before this service)
+local plots: any = nil -- PlotService, resolved LAZILY: it is registered AFTER this service
+local registryRef: any = nil
+-- Fires at most once per boot: the clamp below can only engage on a balance bug, and a warning per
+-- mote would bury the one line that matters under thousands of copies.
+local clampWarned = false
+
+-- Every currency read passes through here: NaN/inf/nil/string all collapse to 0, and a stored value
+-- above the ceiling (a corrupt save) is repaired on the spot rather than propagated into a write.
+local function currency(v: any): number
+	return if isFinite(v) then math.clamp(v :: number, 0, MAX_CURRENCY) else 0
+end
+
+--[[ The one gate every public method opens with. A nil, non-table or State-less Sanctum returns nil
+     and the caller no-ops: PlotService drives all six Sanctums from ONE Heartbeat, so erroring on a
+     half-released plot would take income down for every player on the server, not just that one. ]]
+local function stateOf(sanctum: any): { [string]: any }?
+	if type(sanctum) ~= "table" then return nil end
+	local state = (sanctum :: { [string]: any }).State
+	return if type(state) == "table" then state :: { [string]: any } else nil
+end
+
+--[[ Occupants is keyed by UserId in PlotService, but this walks it with `pairs` and reads each entry
+     structurally, so a differently-keyed table (or one holding a nil-ed slot mid-release) iterates
+     correctly instead of erroring. ]]
+local function eachOccupant(sanctum: any, fn: (Occupant) -> ()): ()
+	local list = (sanctum :: { [string]: any }).Occupants
+	if type(list) ~= "table" then return end
+	for _, entry in pairs(list :: { [any]: any }) do
+		if type(entry) == "table" then fn(entry :: Occupant) end
+	end
+end
+
+-- pcall'd: a Player is userdata, and reading a field off one that has already left can throw. A
+-- failed read simply means "cannot identify this player", never a crash inside the income loop.
+local function userIdOf(player: any): number?
+	if player == nil then return nil end
+	local ok, id = pcall(function(): any return (player :: any).UserId end)
+	return if ok and isFinite(id) then id :: number else nil
+end
+
+-- Identity by object first, UserId second: the object compare is what matches under Roblox, the
+-- UserId compare is what matches a rejoined Player instance or a harness table.
+local function isSource(occupant: Occupant, player: any, userId: number?): boolean
+	if player == nil then return false end
+	if occupant.Player == player then return true end
+	return userId ~= nil and occupant.UserId == userId
+end
+
+--[[ Dirty is set on the Sanctum FIRST, so the flag survives even when PlotService is not resolvable
+     yet (boot order) -- StateReplicator reads the field, not the call. The peer call is what fires
+     SanctumChanged for anyone listening. ]]
+local function markDirty(sanctum: any): ()
+	(sanctum :: { [string]: any }).Dirty = true
+	-- TryGet, never Get: PlotService is legitimately absent during Init and in unit tests, where Get
+	-- would ERROR by design. The type check covers a stub registry (the harness passes a table with
+	-- only Get) -- calling a nil TryGet would throw from inside the income loop.
+	if plots == nil and type(registryRef) == "table" and type(registryRef.TryGet) == "function" then
+		plots = registryRef:TryGet("PlotService")
+	end
+	if plots ~= nil and type(plots.MarkDirty) == "function" then
+		plots:MarkDirty(sanctum)
+	end
+end
+
+-- Weak KEYS so a Sanctum that PlotService has released is not pinned alive by its cached
+-- multipliers; the entry disappears with the plot instead of leaking for the life of the server.
+local function newCache(): { [any]: Multipliers }
+	return (setmetatable({}, { __mode = "k" }) :: any) :: { [any]: Multipliers }
+end
+local cache: { [any]: Multipliers } = newCache()
+
+--[[ The prestige half of the multiplier stack lives in per-player Profiles, not in PlotState, so it
+     is gathered here per refresh. A missing profile contributes nothing rather than defaulting to
+     something: a player whose profile failed to load must not silently earn a stranger's bonus. ]]
+local function rebirthsOf(sanctum: any): { number }
+	if profiles == nil then return NO_REBIRTHS end
+	local list: { number } = {}
+	eachOccupant(sanctum, function(occupant: Occupant)
+		local player = occupant.Player
+		if player == nil then return end
+		local profile = profiles:Get(player)
+		local prestige = if type(profile) == "table" then (profile :: any).Prestige else nil
+		if type(prestige) == "table" then
+			-- Raw: Economy.getPrestigeMultiplier clamps to RebirthData.MaxTrackedRebirths itself, so
+			-- a tampered count is capped in exactly one place.
+			table.insert(list, if isFinite(prestige.Rebirths) then prestige.Rebirths else 0)
+		end
+	end)
+	return list
+end
+
+--[[ Public API ]]
+
+--[[ Recompute and cache. MUST be called after any stage, affinity, upgrade or occupancy change --
+     those are the four inputs to Economy.getMultipliers, and a stale cache would pay the old rate
+     until something else happened to invalidate it. ]]
+function Service:RefreshMultipliers(sanctum: any): Multipliers
+	local state = stateOf(sanctum)
+	if state == nil then
+		-- A corrupt Sanctum still gets legal, neutral multipliers (Economy defaults every field) so
+		-- the caller can multiply by them; nothing is cached against a key we could not validate.
+		return Economy.getMultipliers(EMPTY :: any, NO_REBIRTHS)
+	end
+	local multipliers = Economy.getMultipliers(state :: any, rebirthsOf(sanctum))
+	-- Frozen because the table is SHARED with every reader until the next refresh: a consumer
+	-- adjusting one field in place would silently retune income for the whole Sanctum.
+	cache[sanctum] = table.freeze(multipliers)
+	return multipliers
+end
+
+-- Lazy read. The cache miss path is the same recompute, so a caller never has to know whether
+-- anything has refreshed this Sanctum yet.
+function Service:GetMultipliers(sanctum: any): Multipliers
+	if type(sanctum) == "table" then
+		local cached = cache[sanctum]
+		if cached ~= nil then return cached end
+	end
+	return Service:RefreshMultipliers(sanctum)
+end
+
+--[[ The only way Essence enters the world. Returns the amount actually credited, which is 0 for
+     every rejected call, so a caller can log or account for the difference.
+     `amount` is already fully multiplied by the caller (MoteSystem values a mote through
+     Economy.getMoteValue) -- this function applies no multipliers of its own. ]]
+function Service:Credit(sanctum: any, amount: number, sourcePlayer: Player?): number
+	local state = stateOf(sanctum)
+	if state == nil then return 0 end
+	-- `not isFinite` first: every comparison against NaN is false, so an unguarded `amount <= 0`
+	-- would pass NaN straight through and poison the wallet permanently.
+	if not isFinite(amount) or amount < MIN_CREDIT then return 0 end
+
+	local wallet = currency(state.Essence)
+	--[[ Ceiling clamp. MAX_CURRENCY (1e15) sits below 2^53, the last exactly-representable integer:
+	     past it a shared wallet stops being exact and additions silently round away. Reaching it in
+	     play is impossible, so the clamp engaging means a runaway multiplier -- worth exactly one
+	     loud line, and worth surviving rather than storing an inf that would destroy the save. ]]
+	local credited = math.min(amount, MAX_CURRENCY - wallet)
+	if credited < amount and not clampWarned then
+		clampWarned = true
+		warn(("[EconomyService] essence clamped at %g -- a multiplier has run away"):format(MAX_CURRENCY))
+	end
+	if credited <= 0 then return 0 end
+
+	state.Essence = wallet + credited
+	-- LifetimeEssence is the transcendence gate and resets with the Sanctum, so it tracks what was
+	-- actually banked, not what was offered: the clamped figure keeps the two in step.
+	state.LifetimeEssence = math.min(currency(state.LifetimeEssence) + credited, MAX_CURRENCY)
+
+	local sourceId = userIdOf(sourcePlayer)
+	eachOccupant(sanctum, function(occupant: Occupant)
+		-- Lifetime stat, per player, never reset: BOTH occupants earn from a shared wallet, so both
+		-- profiles are credited in full rather than splitting one payout between them.
+		local player = occupant.Player
+		local profile = if player ~= nil and profiles ~= nil then profiles:Get(player) else nil
+		local stats = if type(profile) == "table" then (profile :: any).Stats else nil
+		if type(stats) == "table" then
+			stats.TotalEssenceEarned = math.min(currency(stats.TotalEssenceEarned) + credited, MAX_CURRENCY)
+		end
+		if isSource(occupant, sourcePlayer, sourceId) then
+			occupant.Contribution = math.min(currency(occupant.Contribution) + credited, MAX_CURRENCY)
+		end
+	end)
+
+	markDirty(sanctum)
+	return credited
+end
+
+--[[ The only way Essence leaves the world. Atomic in the sense that matters here: the balance is
+     re-read from live state and tested INSIDE this call, so a price checked by PurchaseService a
+     moment ago cannot be spent twice by two pads triggered on the same frame. Nothing is mutated on
+     a failed debit, and Essence can never go negative. ]]
+function Service:TryDebit(sanctum: any, amount: number): boolean
+	local state = stateOf(sanctum)
+	if state == nil then return false end
+	-- NaN, inf (a maxed upgrade's cost) and negative "refunds" are all rejected here
+	if not isFinite(amount) or amount < 0 then return false end
+	-- Economy.canAfford, not a local comparison: the pad's affordability check and this debit must
+	-- agree exactly, or a purchase can pass the gate and then fail to pay for itself.
+	if not Economy.canAfford(state :: any, amount) then return false end
+	if amount <= 0 then
+		return true -- a free item (a FastMode-discounted cost that floored to 0): nothing to move
+	end
+	-- currency() re-clamps as it reads, so a corrupt balance ABOVE the ceiling is repaired by the
+	-- same statement that spends from it rather than being carried forward into the next save.
+	state.Essence = math.max(0, currency(state.Essence) - amount)
+	markDirty(sanctum)
+	return true
+end
+
+--[[ Session-only leaderboard flavour (spec 1.2): it records who carried, and touches NO wallet.
+     Contribution lives on the Occupant, not in PlotState, so it is never saved and never merged. ]]
+function Service:AddContribution(sanctum: any, player: any, amount: number): ()
+	if stateOf(sanctum) == nil or not isFinite(amount) or amount <= 0 then return end
+	local userId = userIdOf(player)
+	eachOccupant(sanctum, function(occupant: Occupant)
+		if isSource(occupant, player, userId) then
+			occupant.Contribution = math.min(currency(occupant.Contribution) + amount, MAX_CURRENCY)
+			markDirty(sanctum) -- Contribution rides the full snapshot; the partner panel reads it
+		end
+	end)
+end
+
+--[[ ServiceRegistry contract ]]
+
+function Service:Init(registry: any): ()
+	registryRef = registry
+	profiles = registry:Get("ProfileService") -- resolved only: section 6 forbids calls during Init
+	--[[ PlotService is registered AFTER this service, so it does not exist yet. It is resolved
+	     lazily in markDirty instead -- Get here would error and abort the whole boot. ]]
+	plots = nil
+	-- Rebuilt so a re-Init never serves multipliers cached against a previous boot's Sanctums.
+	cache = newCache()
+	clampWarned = false
+end
+
+function Service:Start(): ()
+	-- Nothing to connect: this service is entirely driven by its callers. The cache is invalidated
+	-- by whoever changes an input (PlotService on occupancy, EvolutionService on stage/affinity,
+	-- PurchaseService on an upgrade, RebirthService on prestige), which is the only correct moment.
+end
+
+function Service:Stop(): ()
+	cache = newCache()
+end
+
+return Service
+
+--#endregion
+end
 MODULE_ORDER[#MODULE_ORDER + 1] = { Path = "ServerScriptService/Core/Services/ProfileService", Class = "ModuleScript", File = "src/server/Services/ProfileService.luau" }
 MODULE_DEFS["ServerScriptService/Core/Services/ProfileService"] = function(script, require, ...)
 --#region src/server/Services/ProfileService.luau
@@ -9739,6 +10017,723 @@ t.test("NO client->server payload may carry a quantity, price, id or balance", f
     -- And positively: the only numeric field anywhere in the inbound protocol is LinkResponse.PlotId,
     -- which names a plot rather than a quantity.
     t.truthy(accepts(RemoteSchema.Remotes.LinkResponse, { PlotId = 1, Accept = false }))
+end)
+
+--#endregion
+end }
+SPECS[#SPECS + 1] = { Name = "remoteservice.spec", Run = function(t, Mock, loadModule, runScript)
+--#region tests/specs/remoteservice.spec.luau
+--[[
+    remoteservice.spec
+    Every client->server message in the game passes through one dispatcher. This spec attacks it the
+    way an exploiter would: Mock.fireServer bypasses all client-side checks, so anything that gets
+    through here gets through in production.
+
+    The gates, in order: live sender -> rate limit -> payload validation -> registered handler ->
+    pcall'd call. Each is tested independently, and each rejection must be silent to the client.
+]]
+
+local RemoteSchema = loadModule("ReplicatedStorage/Modules/RemoteSchema")
+local AffinityData = loadModule("ReplicatedStorage/Modules/AffinityData")
+
+local function boot()
+    local limiter = loadModule("ServerScriptService/Core/Services/RateLimiter")
+    local remotes = loadModule("ServerScriptService/Core/Services/RemoteService")
+    limiter:Init({})
+    limiter:Start()
+    remotes:Init({
+        Get = function(_, name)
+            if name == "RateLimiter" then return limiter end
+            error("unexpected dependency " .. tostring(name), 0)
+        end,
+    })
+    remotes:Start()
+    return remotes, limiter
+end
+
+local function folder()
+    return game:GetService("ReplicatedStorage"):FindFirstChild(RemoteSchema.FolderName)
+end
+
+-------------------------------------------------------------------------------
+-- Wiring
+-------------------------------------------------------------------------------
+t.test("every remote in the schema exists under one folder, in list order", function()
+    local RemoteService = boot()
+    local created = folder()
+    t.truthy(created, "the remotes folder was created")
+
+    local children = created:GetChildren()
+    t.eq(#children, #RemoteSchema.List, "one RemoteEvent per schema entry, no extras")
+    for _, def in ipairs(RemoteSchema.List) do
+        local remote = created:FindFirstChild(def.Name)
+        t.truthy(remote, ("remote %s is missing"):format(def.Name))
+        t.truthy(remote:IsA("RemoteEvent"))
+        t.eq(RemoteService:GetRemote(def.Name), remote)
+    end
+end)
+
+t.test("a second Init reuses the existing folder instead of orphaning client references", function()
+    boot()
+    local first = folder()
+    local second = boot()
+    t.eq(folder(), first, "clients already holding a reference must keep working across a restart")
+    t.eq(#folder():GetChildren(), #RemoteSchema.List, "and no duplicate remotes appear")
+    t.truthy(second:GetRemote("StateSync"))
+end)
+
+-------------------------------------------------------------------------------
+-- The dispatcher
+-------------------------------------------------------------------------------
+t.test("a legal payload reaches the handler with the sending player", function()
+    local RemoteService = boot()
+    local seen = {}
+    RemoteService:On("RebirthVote", function(player, payload)
+        table.insert(seen, { player.Name, payload.Accept })
+    end)
+    local player = Mock.addPlayer("Ash", 1)
+    Mock.fireServer("RebirthVote", player, { Accept = true })
+    t.eq(#seen, 1)
+    t.eq(seen[1][1], "Ash")
+    t.eq(seen[1][2], true)
+end)
+
+t.test("an invalid payload never reaches the handler", function()
+    local RemoteService = boot()
+    local calls = 0
+    RemoteService:On("ChooseAffinity", function() calls += 1 end)
+    local player = Mock.addPlayer("Ash", 1)
+
+    for _, payload in ipairs({
+        { Affinity = "plasma" },              -- outside the closed set
+        { Affinity = 1 },                     -- wrong type
+        { Affinity = "ember", Essence = 1e9 } -- extra key: the classic probe
+    }) do
+        Mock.fireServer("ChooseAffinity", player, payload)
+    end
+    Mock.fireServer("ChooseAffinity", player, nil)
+    t.eq(calls, 0, "four hostile payloads, zero handler calls")
+
+    -- Those four still cost rate-limit tokens (the limit is checked BEFORE validation, so junk
+    -- cannot be flooded for free), which is why the clock has to move before the legal one.
+    Mock.advance(RemoteSchema.Remotes.ChooseAffinity.RateLimit.Interval * 2)
+    Mock.fireServer("ChooseAffinity", player, { Affinity = AffinityData.List[1].Id })
+    t.eq(calls, 1, "and the legal one still works")
+end)
+
+t.test("rejected messages still cost rate-limit budget", function()
+    local RemoteService = boot()
+    local calls = 0
+    RemoteService:On("ChooseAffinity", function() calls += 1 end)
+    local player = Mock.addPlayer("Ash", 1)
+    local budget = RemoteSchema.Remotes.ChooseAffinity.RateLimit
+
+    -- Spend the entire budget on payloads that will be rejected...
+    for _ = 1, budget.Tokens do
+        Mock.fireServer("ChooseAffinity", player, { Affinity = "bogus" })
+    end
+    -- ...then send a perfectly legal one. It must be throttled too.
+    Mock.fireServer("ChooseAffinity", player, { Affinity = AffinityData.List[1].Id })
+    t.eq(calls, 0, "otherwise an attacker floods with junk at zero cost to their budget")
+end)
+
+t.test("rate limiting cuts a flood off, and it recovers", function()
+    local RemoteService = boot()
+    local calls = 0
+    RemoteService:On("RebirthVote", function() calls += 1 end)
+    local player = Mock.addPlayer("Ash", 1)
+    local budget = RemoteSchema.Remotes.RebirthVote.RateLimit
+
+    for _ = 1, budget.Tokens * 10 do
+        Mock.fireServer("RebirthVote", player, { Accept = true })
+    end
+    t.eq(calls, budget.Tokens, ("a %dx flood delivered exactly the budget"):format(10))
+
+    Mock.advance(budget.Interval * 2)
+    Mock.fireServer("RebirthVote", player, { Accept = true })
+    t.eq(calls, budget.Tokens + 1, "the bucket refills, so a limited player is not banned")
+end)
+
+t.test("one player's flood does not throttle another", function()
+    local RemoteService = boot()
+    local byPlayer = {}
+    RemoteService:On("RebirthVote", function(player)
+        byPlayer[player.Name] = (byPlayer[player.Name] or 0) + 1
+    end)
+    local ash = Mock.addPlayer("Ash", 1)
+    local bree = Mock.addPlayer("Bree", 2)
+    for _ = 1, 50 do Mock.fireServer("RebirthVote", ash, { Accept = true }) end
+    Mock.fireServer("RebirthVote", bree, { Accept = true })
+    t.eq(byPlayer.Bree, 1, "buckets are per player, so one exploiter cannot deny service to a partner")
+end)
+
+t.test("a remote with no registered handler is a silent rejection, not an error", function()
+    local RemoteService = boot()
+    local player = Mock.addPlayer("Ash", 1)
+    t.noThrow(function() Mock.fireServer("SetSetting", player, { Key = "Music", Value = true }) end)
+    t.gt(RemoteService:GetRejectionStats()[player.UserId].SetSetting or 0, 0,
+        "but it is counted, so a dead feature is visible in telemetry")
+end)
+
+t.test("an erroring handler cannot kill the connection for everyone else", function()
+    local RemoteService = boot()
+    local reached = 0
+    RemoteService:On("RebirthVote", function()
+        reached += 1
+        error("handler bug")
+    end)
+    local player = Mock.addPlayer("Ash", 1)
+    t.noThrow(function() Mock.fireServer("RebirthVote", player, { Accept = true }) end)
+    Mock.advance(RemoteSchema.Remotes.RebirthVote.RateLimit.Interval * 2)
+    t.noThrow(function() Mock.fireServer("RebirthVote", player, { Accept = true }) end)
+    t.eq(reached, 2, "the second message still arrived after the first one blew up")
+end)
+
+t.test("nothing is sent back to the client explaining a rejection", function()
+    local RemoteService = boot()
+    RemoteService:On("ChooseAffinity", function() end)
+    local player = Mock.addPlayer("Ash", 1)
+    Mock.clearOutbox()
+    for _ = 1, 20 do
+        Mock.fireServer("ChooseAffinity", player, { Affinity = "plasma" })
+    end
+    t.eq(#Mock.outbox, 0,
+        "a specific rejection reason is free reconnaissance; the client learns nothing")
+end)
+
+t.test("rejection stats are counted and cleared when the player leaves", function()
+    local RemoteService = boot()
+    RemoteService:On("ChooseAffinity", function() end)
+    local player = Mock.addPlayer("Ash", 1)
+    for _ = 1, 3 do Mock.fireServer("ChooseAffinity", player, { Affinity = "bogus" }) end
+    t.gt(RemoteService:GetRejectionStats()[player.UserId].ChooseAffinity, 0)
+
+    Mock.removePlayer(player)
+    -- Otherwise the table grows by one entry per player who ever joined, for the server's lifetime.
+    t.eq(RemoteService:GetRejectionStats()[player.UserId], nil, "the entry is released on leave")
+end)
+
+-------------------------------------------------------------------------------
+-- Registration discipline
+-------------------------------------------------------------------------------
+t.test("On refuses an unknown name or an outbound remote", function()
+    local RemoteService = boot()
+    t.throws(function() RemoteService:On("NotARemote", function() end) end,
+        "a typo must fail at boot, not become a feature that silently never fires")
+    t.throws(function() RemoteService:On("StateSync", function() end) end,
+        "StateSync is outbound; nothing arrives on it")
+end)
+
+t.test("On refuses a second handler for the same remote", function()
+    local RemoteService = boot()
+    RemoteService:On("RebirthVote", function() end)
+    t.throws(function() RemoteService:On("RebirthVote", function() end) end,
+        "silently replacing a handler would leave half the game wired to the old one")
+end)
+
+t.test("Fire* refuses an unknown or inbound remote name", function()
+    local RemoteService = boot()
+    local player = Mock.addPlayer("Ash", 1)
+    t.throws(function() RemoteService:FireClient(player, "NotARemote", {}) end)
+    t.throws(function() RemoteService:FireClient(player, "RebirthVote", {}) end,
+        "RebirthVote is inbound only")
+    t.throws(function() RemoteService:FireAllClients("NotARemote", {}) end)
+end)
+
+-------------------------------------------------------------------------------
+-- Outbound
+-------------------------------------------------------------------------------
+t.test("FireClient, FireClients and FireAllClients address the right people", function()
+    local RemoteService = boot()
+    local ash = Mock.addPlayer("Ash", 1)
+    local bree = Mock.addPlayer("Bree", 2)
+    Mock.clearOutbox()
+
+    RemoteService:FireClient(ash, "Notify", { Kind = "info", Text = "hello" })
+    t.eq(#Mock.outboxFor("Notify"), 1)
+    t.eq(Mock.lastOutbox("Notify").Player, ash)
+
+    RemoteService:FireClients({ ash, bree }, "Notify", { Kind = "info", Text = "both" })
+    t.eq(#Mock.outboxFor("Notify"), 3)
+
+    Mock.clearOutbox()
+    RemoteService:FireAllClients("Fx", { Kind = "attune", PlotId = 1 })
+    t.eq(#Mock.outboxFor("Fx"), 1)
+end)
+
+t.test("sending to a player who left between the decision and the send is not an error", function()
+    local RemoteService = boot()
+    local player = Mock.addPlayer("Ash", 1)
+    Mock.removePlayer(player)
+    -- An unavoidable race: the server decided to notify while they were still here.
+    t.noThrow(function() RemoteService:FireClient(player, "Notify", { Kind = "info", Text = "bye" }) end)
+    t.noThrow(function() RemoteService:FireClients({ player, nil }, "Notify", { Kind = "info", Text = "bye" }) end)
+end)
+
+-------------------------------------------------------------------------------
+-- Fuzz
+-------------------------------------------------------------------------------
+t.test("fuzz: no inbound message can throw out of the dispatcher", function()
+    local RemoteService = boot()
+    local handled = 0
+    for _, def in ipairs(RemoteSchema.List) do
+        if def.Direction == "ClientToServer" then
+            RemoteService:On(def.Name, function() handled += 1 end)
+        end
+    end
+
+    local cyclic = {}
+    cyclic.self = cyclic
+    local booby = setmetatable({}, { __index = function() error("gotcha") end })
+    local payloads = { nil, 0, -1, 0 / 0, math.huge, "", ("x"):rep(50000), true,
+        {}, { 1, 2, 3 }, cyclic, booby, print, Vector3.new(1, 2, 3), Enum.Material.Neon }
+
+    local player = Mock.addPlayer("Ash", 1)
+    for _, def in ipairs(RemoteSchema.List) do
+        if def.Direction == "ClientToServer" then
+            for index = 1, 15 do
+                t.noThrow(function() Mock.fireServer(def.Name, player, payloads[index]) end,
+                    ("%s threw on fuzz payload %d"):format(def.Name, index))
+            end
+            Mock.advance(def.RateLimit.Interval * 2)
+        end
+    end
+end)
+
+t.test("fuzz: a forged sender is refused", function()
+    local RemoteService = boot()
+    local calls = 0
+    RemoteService:On("RebirthVote", function() calls += 1 end)
+    local remote = Mock.findRemote("RebirthVote")
+    -- OnServerEvent's first argument is set by the engine in production, but the dispatcher must
+    -- still refuse a stale or bogus one rather than indexing it.
+    for _, sender in ipairs({ 42, "Ash", {}, Instance.new("Part") }) do
+        t.noThrow(function()
+            Mock.Instances.getSignal(remote, "OnServerEvent"):Fire(sender, { Accept = true })
+        end)
+    end
+    Mock.advance(0)
+    t.eq(calls, 0, "no forged sender reached the handler")
+end)
+
+t.test("a message from a player who already left is refused", function()
+    local RemoteService = boot()
+    local calls = 0
+    RemoteService:On("RebirthVote", function() calls += 1 end)
+    local player = Mock.addPlayer("Ash", 1)
+    Mock.removePlayer(player)
+    Mock.fireServer("RebirthVote", player, { Accept = true })
+    t.eq(calls, 0, "a stale player reference must not reach a service")
+end)
+
+t.test("Stop disconnects handlers but leaves the remotes in place", function()
+    local RemoteService = boot()
+    local calls = 0
+    RemoteService:On("RebirthVote", function() calls += 1 end)
+    local player = Mock.addPlayer("Ash", 1)
+    RemoteService:Stop()
+    Mock.fireServer("RebirthVote", player, { Accept = true })
+    t.eq(calls, 0, "handlers are disconnected")
+    t.truthy(folder():FindFirstChild("RebirthVote"),
+        "but the remotes survive, so live client references stay valid")
+end)
+
+--#endregion
+end }
+SPECS[#SPECS + 1] = { Name = "simulation.spec", Run = function(t, Mock, loadModule, runScript)
+--#region tests/specs/simulation.spec.luau
+--[[
+    simulation.spec
+    DropperSystem and MoteSystem are the income loop. Both are driven purely by Step(dt), so the
+    virtual clock can run an hour of gameplay in milliseconds and assert on the Essence that came
+    out the other end.
+
+    The properties that matter: income is never lost (including at the mote cap), never
+    double-credited, and never leaks parts.
+]]
+
+local Economy = loadModule("ReplicatedStorage/Modules/Economy")
+local StateSchema = loadModule("ReplicatedStorage/Modules/StateSchema")
+local GameConfig = loadModule("ReplicatedStorage/Modules/GameConfig")
+local DropperData = loadModule("ReplicatedStorage/Modules/DropperData")
+local UpgradeData = loadModule("ReplicatedStorage/Modules/UpgradeData")
+local PlotLayout = loadModule("ReplicatedStorage/Modules/PlotLayout")
+
+local firstDropper = DropperData.List[1]
+local secondDropper = DropperData.List[2]
+
+--- A Sanctum-shaped table with just the fields these systems read.
+local function makeSanctum(droppers, overrides)
+    local state = StateSchema.newPlotState()
+    for id, count in pairs(droppers or {}) do state.Droppers[id] = count end
+    for key, value in pairs(overrides or {}) do state[key] = value end
+    local model = Instance.new("Model", workspace)
+    local motes = Instance.new("Folder", model)
+    motes.Name = "Motes"
+    return {
+        Id = 1,
+        State = state,
+        Occupants = {},
+        Runtime = { Model = model, MoteFolder = motes, Origin = PlotLayout.sanctumOrigin(1) },
+        Dirty = false,
+    }
+end
+
+local function multipliersFor(sanctum)
+    return Economy.getMultipliers(sanctum.State, {})
+end
+
+local function samplePath(sanctum)
+    return PlotLayout.railPath(sanctum.Runtime.Origin, loadModule("ReplicatedStorage/Modules/SectionData").List[1], 1)
+end
+
+-------------------------------------------------------------------------------
+-- DropperSystem
+-------------------------------------------------------------------------------
+t.test("a sanctum with no wellsprings emits nothing", function()
+    local DropperSystem = loadModule("ServerScriptService/Core/Systems/DropperSystem")
+    local sanctum = makeSanctum()
+    local runtime = DropperSystem.new(sanctum)
+    local spawns = 0
+    runtime.OnSpawn:Connect(function() spawns += 1 end)
+    for _ = 1, 600 do runtime:Step(1 / 30, multipliersFor(sanctum)) end
+    Mock.advance(0)
+    t.eq(spawns, 0)
+end)
+
+t.test("one wellspring emits at roughly its interval", function()
+    local DropperSystem = loadModule("ServerScriptService/Core/Systems/DropperSystem")
+    local sanctum = makeSanctum({ [firstDropper.Id] = 1 })
+    local runtime = DropperSystem.new(sanctum)
+    runtime:Rebuild()
+    local spawns = 0
+    runtime.OnSpawn:Connect(function() spawns += 1 end)
+
+    local seconds = 60
+    local multipliers = multipliersFor(sanctum)
+    for _ = 1, seconds * 30 do runtime:Step(1 / 30, multipliers) end
+    Mock.advance(0)
+
+    local interval = Economy.getDropperInterval(firstDropper, sanctum.State, multipliers)
+    local expected = seconds / interval
+    t.gt(spawns, expected * 0.85, ("%d spawns in %ds, expected about %.0f"):format(spawns, seconds, expected))
+    t.lt(spawns, expected * 1.15, ("%d spawns in %ds, expected about %.0f"):format(spawns, seconds, expected))
+end)
+
+t.test("owning three wellsprings triples output and staggers them", function()
+    local DropperSystem = loadModule("ServerScriptService/Core/Systems/DropperSystem")
+    local one = makeSanctum({ [firstDropper.Id] = 1 })
+    local three = makeSanctum({ [firstDropper.Id] = 3 })
+
+    local function run(sanctum)
+        local runtime = DropperSystem.new(sanctum)
+        runtime:Rebuild()
+        local times = {}
+        local elapsed = 0
+        runtime.OnSpawn:Connect(function() table.insert(times, elapsed) end)
+        local multipliers = multipliersFor(sanctum)
+        for _ = 1, 60 * 30 do
+            elapsed += 1 / 30
+            runtime:Step(1 / 30, multipliers)
+        end
+        Mock.advance(0)
+        return times
+    end
+
+    local single, triple = run(one), run(three)
+    t.near(#triple / #single, 3, 0.35, ("%d vs %d spawns"):format(#triple, #single))
+
+    -- Staggered, not synchronised: three copies firing on the same frame would arrive in bursts of
+    -- three with a full interval of silence between them.
+    local simultaneous = 0
+    for index = 2, #triple do
+        if math.abs(triple[index] - triple[index - 1]) < 0.05 then simultaneous += 1 end
+    end
+    t.lt(simultaneous, #triple * 0.25, "wellsprings fire in a stream, not in bursts")
+end)
+
+t.test("a purchase takes effect immediately and does not reset existing timers", function()
+    local DropperSystem = loadModule("ServerScriptService/Core/Systems/DropperSystem")
+    local sanctum = makeSanctum({ [firstDropper.Id] = 1 })
+    local runtime = DropperSystem.new(sanctum)
+    runtime:Rebuild()
+    local spawns = 0
+    runtime.OnSpawn:Connect(function() spawns += 1 end)
+
+    local multipliers = multipliersFor(sanctum)
+    for _ = 1, 30 * 30 do runtime:Step(1 / 30, multipliers) end
+    Mock.advance(0)
+    local before = spawns
+
+    sanctum.State.Droppers[firstDropper.Id] = 4
+    runtime:Rebuild()
+    for _ = 1, 30 * 30 do runtime:Step(1 / 30, multipliers) end
+    Mock.advance(0)
+
+    t.gt(spawns - before, before * 2, "four wellsprings out-produce one over the same window")
+end)
+
+t.test("an upgrade raises the rate without a Rebuild", function()
+    local DropperSystem = loadModule("ServerScriptService/Core/Systems/DropperSystem")
+    local cadence
+    for _, upgrade in ipairs(UpgradeData.List) do
+        if upgrade.Kind == "SpawnRate" then cadence = upgrade break end
+    end
+    t.truthy(cadence, "the data should provide a SpawnRate upgrade")
+
+    local function countSpawns(sanctum)
+        local runtime = DropperSystem.new(sanctum)
+        runtime:Rebuild()
+        local spawns = 0
+        runtime.OnSpawn:Connect(function() spawns += 1 end)
+        local multipliers = multipliersFor(sanctum)
+        for _ = 1, 120 * 30 do runtime:Step(1 / 30, multipliers) end
+        Mock.advance(0)
+        return spawns
+    end
+
+    local plain = countSpawns(makeSanctum({ [firstDropper.Id] = 1 }))
+    local upgraded = countSpawns(makeSanctum({ [firstDropper.Id] = 1 },
+        { Upgrades = { [cadence.Id] = cadence.MaxLevel } }))
+    t.gt(upgraded, plain, "the interval is re-read every Step, so upgrades apply at once")
+end)
+
+t.test("a long frame cannot produce an unbounded catch-up burst", function()
+    local DropperSystem = loadModule("ServerScriptService/Core/Systems/DropperSystem")
+    local sanctum = makeSanctum({ [firstDropper.Id] = 2 })
+    local runtime = DropperSystem.new(sanctum)
+    runtime:Rebuild()
+    local spawns = 0
+    runtime.OnSpawn:Connect(function() spawns += 1 end)
+    -- A one-hour hitch. Without a bound this is thousands of motes in a single frame, which turns a
+    -- hitch into a freeze.
+    runtime:Step(3600, multipliersFor(sanctum))
+    Mock.advance(0)
+    t.lt(spawns, 100, ("a single lagging frame emitted %d motes"):format(spawns))
+end)
+
+t.test("junk state cannot break the loop", function()
+    local DropperSystem = loadModule("ServerScriptService/Core/Systems/DropperSystem")
+    local sanctum = makeSanctum({ ghost_dropper = 5, [firstDropper.Id] = -3 })
+    local runtime = DropperSystem.new(sanctum)
+    local spawns = 0
+    runtime.OnSpawn:Connect(function() spawns += 1 end)
+    t.noThrow(function() runtime:Rebuild() end)
+    for _, dt in ipairs({ 1 / 30, 0, -1, 0 / 0, math.huge }) do
+        t.noThrow(function() runtime:Step(dt, multipliersFor(sanctum)) end,
+            "this runs inside the one heartbeat driving every plot")
+    end
+    Mock.advance(0)
+    t.eq(spawns, 0, "an unknown id and a negative count both produce nothing")
+end)
+
+-------------------------------------------------------------------------------
+-- MoteSystem
+-------------------------------------------------------------------------------
+t.test("a mote travels the rail and credits exactly once on arrival", function()
+    local MoteSystem = loadModule("ServerScriptService/Core/Systems/MoteSystem")
+    local sanctum = makeSanctum({ [firstDropper.Id] = 1 })
+    local runtime = MoteSystem.new(sanctum)
+    local credited, calls = 0, 0
+    runtime.OnCollected:Connect(function(value)
+        credited += value
+        calls += 1
+    end)
+
+    t.truthy(runtime:Spawn(firstDropper, 25, samplePath(sanctum), 4))
+    t.eq(runtime:Count(), 1)
+    t.eq(calls, 0, "nothing is credited on spawn")
+
+    for _ = 1, 2 * 30 do runtime:Step(1 / 30) end
+    Mock.advance(0)
+    t.eq(calls, 0, "still in transit halfway along the rail")
+    t.eq(runtime:Count(), 1)
+
+    for _ = 1, 3 * 30 do runtime:Step(1 / 30) end
+    Mock.advance(0)
+    t.eq(calls, 1, "credited exactly once")
+    t.eq(credited, 25)
+    t.eq(runtime:Count(), 0, "and removed from the world")
+end)
+
+t.test("a mote actually moves along the path rather than teleporting", function()
+    local MoteSystem = loadModule("ServerScriptService/Core/Systems/MoteSystem")
+    local sanctum = makeSanctum()
+    local runtime = MoteSystem.new(sanctum)
+    local path = samplePath(sanctum)
+    runtime:Spawn(firstDropper, 1, path, 4)
+
+    local part = sanctum.Runtime.MoteFolder:GetChildren()[1]
+    t.truthy(part, "a part was created for the mote")
+    local start = part.Position
+    for _ = 1, 30 do runtime:Step(1 / 30) end
+    local middle = part.Position
+    t.gt((middle - start).Magnitude, 1, "it moved")
+    t.lt((middle - path[#path].Position).Magnitude, (start - path[#path].Position).Magnitude,
+        "and moved TOWARDS the font")
+end)
+
+t.test("income is never lost at the mote cap -- only the visual is", function()
+    local MoteSystem = loadModule("ServerScriptService/Core/Systems/MoteSystem")
+    local sanctum = makeSanctum()
+    local runtime = MoteSystem.new(sanctum)
+    local credited = 0
+    runtime.OnCollected:Connect(function(value) credited += value end)
+
+    local capacity = Economy.getMoteCapacity(sanctum.State)
+    local path = samplePath(sanctum)
+    for _ = 1, capacity do runtime:Spawn(firstDropper, 10, path, 30) end
+    Mock.advance(0)
+    t.eq(runtime:Count(), capacity)
+    t.eq(credited, 0, "everything so far is still in flight")
+
+    -- Past the cap: no part, but the Essence still lands.
+    local overflowed = runtime:Spawn(firstDropper, 10, path, 30)
+    Mock.advance(0)
+    t.falsy(overflowed, "Spawn reports that no part was created")
+    t.eq(runtime:Count(), capacity, "the cap holds")
+    t.eq(credited, 10, "and the player was paid anyway")
+end)
+
+t.test("a mote destroyed from outside is dropped without being credited", function()
+    local MoteSystem = loadModule("ServerScriptService/Core/Systems/MoteSystem")
+    local sanctum = makeSanctum()
+    local runtime = MoteSystem.new(sanctum)
+    local credited = 0
+    runtime.OnCollected:Connect(function(value) credited += value end)
+    runtime:Spawn(firstDropper, 99, samplePath(sanctum), 5)
+
+    sanctum.Runtime.MoteFolder:GetChildren()[1]:Destroy()
+    for _ = 1, 30 do runtime:Step(1 / 30) end
+    Mock.advance(0)
+    t.eq(credited, 0, "a part that vanished was never delivered, so it must not pay out")
+    t.eq(runtime:Count(), 0, "but the runtime must not keep a dead reference either")
+end)
+
+t.test("motes have a Debris lifetime so nothing can leak forever", function()
+    local MoteSystem = loadModule("ServerScriptService/Core/Systems/MoteSystem")
+    local sanctum = makeSanctum()
+    local runtime = MoteSystem.new(sanctum)
+    -- A travel time far longer than the mote lifetime: Debris must reap it.
+    runtime:Spawn(firstDropper, 5, samplePath(sanctum), GameConfig.Mote.LifetimeSeconds * 10)
+    t.eq(#sanctum.Runtime.MoteFolder:GetChildren(), 1)
+    Mock.advance(GameConfig.Mote.LifetimeSeconds + 2)
+    t.eq(#sanctum.Runtime.MoteFolder:GetChildren(), 0, "Debris cleaned it up")
+end)
+
+t.test("Clear and Destroy remove every live part", function()
+    local MoteSystem = loadModule("ServerScriptService/Core/Systems/MoteSystem")
+    local sanctum = makeSanctum()
+    local runtime = MoteSystem.new(sanctum)
+    local path = samplePath(sanctum)
+    for _ = 1, 10 do runtime:Spawn(firstDropper, 1, path, 20) end
+    t.eq(runtime:Count(), 10)
+
+    runtime:Clear()
+    t.eq(runtime:Count(), 0)
+    t.eq(#sanctum.Runtime.MoteFolder:GetChildren(), 0,
+        "releasing a plot that leaks 60 parts is a slow memory leak")
+
+    for _ = 1, 5 do runtime:Spawn(firstDropper, 1, path, 20) end
+    runtime:Destroy()
+    t.eq(#sanctum.Runtime.MoteFolder:GetChildren(), 0)
+end)
+
+t.test("malformed spawns are refused rather than creating a broken mote", function()
+    local MoteSystem = loadModule("ServerScriptService/Core/Systems/MoteSystem")
+    local sanctum = makeSanctum()
+    local runtime = MoteSystem.new(sanctum)
+    local path = samplePath(sanctum)
+    local credited = 0
+    runtime.OnCollected:Connect(function(value) credited += value end)
+
+    -- A bad VALUE or a bad PATH is a bug upstream (a corrupt def, a NaN multiplier, a broken
+    -- layout). Those are refused outright and NOT credited: paying for them would hide the bug
+    -- behind income that still looks plausible.
+    for _, case in ipairs({
+        { firstDropper, 0 / 0, path, 5 },
+        { firstDropper, -5, path, 5 },
+        { firstDropper, 0, path, 5 },
+        { firstDropper, math.huge, path, 5 },
+        { firstDropper, 10, { path[1] }, 5 },
+        { firstDropper, 10, {}, 5 },
+        { firstDropper, 10, nil, 5 },
+        { firstDropper, 10, { path[1], "not a cframe" }, 5 },
+    }) do
+        t.falsy(runtime:Spawn(case[1], case[2], case[3], case[4]), "Spawn reports the refusal")
+    end
+    Mock.advance(0)
+    t.eq(runtime:Count(), 0, "no broken mote entered the world")
+    t.eq(credited, 0, "and none of them paid out")
+end)
+
+t.test("a degenerate travel time is clamped, not refused", function()
+    -- Different call: the value and the rail are fine, only the timing is nonsense. Dropping the
+    -- mote here would charge the player for a caller's mistake, so it is clamped to the rail
+    -- minimum and delivered normally.
+    local MoteSystem = loadModule("ServerScriptService/Core/Systems/MoteSystem")
+    local sanctum = makeSanctum()
+    local runtime = MoteSystem.new(sanctum)
+    local path = samplePath(sanctum)
+    local credited = 0
+    runtime.OnCollected:Connect(function(value) credited += value end)
+
+    for _, travel in ipairs({ 0, -1, 0 / 0, math.huge }) do
+        t.truthy(runtime:Spawn(firstDropper, 10, path, travel),
+            ("travel time %s should clamp, not drop the essence"):format(tostring(travel)))
+    end
+    t.eq(runtime:Count(), 4)
+
+    for _ = 1, GameConfig.Mote.BaseTravelSeconds * 2 * 30 do runtime:Step(1 / 30) end
+    Mock.advance(0)
+    t.eq(credited, 40, "every one of them still arrived and paid out")
+    t.eq(runtime:Count(), 0)
+end)
+
+t.test("Step tolerates junk dt", function()
+    local MoteSystem = loadModule("ServerScriptService/Core/Systems/MoteSystem")
+    local sanctum = makeSanctum()
+    local runtime = MoteSystem.new(sanctum)
+    runtime:Spawn(firstDropper, 1, samplePath(sanctum), 5)
+    for _, dt in ipairs({ 0, -1, 0 / 0, math.huge, 1e9 }) do
+        t.noThrow(function() runtime:Step(dt) end)
+    end
+end)
+
+-------------------------------------------------------------------------------
+-- The two together
+-------------------------------------------------------------------------------
+t.test("twenty minutes of simulated income lands within 10% of Economy's estimate", function()
+    -- This is the end-to-end check that the spawn scheduler, the rail transport and the pure income
+    -- formula all agree. If they drift, either the balance doc or the loop is lying.
+    local DropperSystem = loadModule("ServerScriptService/Core/Systems/DropperSystem")
+    local MoteSystem = loadModule("ServerScriptService/Core/Systems/MoteSystem")
+    local sanctum = makeSanctum({ [firstDropper.Id] = 5, [secondDropper.Id] = 3 })
+    local droppers = DropperSystem.new(sanctum)
+    local motes = MoteSystem.new(sanctum)
+    droppers:Rebuild()
+
+    local multipliers = multipliersFor(sanctum)
+    local travel = Economy.getRailTravelTime(sanctum.State, multipliers)
+    local path = samplePath(sanctum)
+    droppers.OnSpawn:Connect(function(def)
+        motes:Spawn(def, Economy.getMoteValue(def, sanctum.State, multipliers), path, travel)
+    end)
+    local earned = 0
+    motes.OnCollected:Connect(function(value) earned += value end)
+
+    local seconds = 1200 -- long enough to average out spawn phase, short enough to keep the suite fast
+    for _ = 1, seconds * 20 do
+        droppers:Step(1 / 20, multipliers)
+        motes:Step(1 / 20)
+    end
+    Mock.advance(0)
+
+    local predicted = Economy.estimateIncomePerSecond(sanctum.State, multipliers) * seconds
+    t.gt(earned, predicted * 0.9,
+        ("simulated %.0f essence vs predicted %.0f"):format(earned, predicted))
+    t.lt(earned, predicted * 1.1,
+        ("simulated %.0f essence vs predicted %.0f"):format(earned, predicted))
 end)
 
 --#endregion
