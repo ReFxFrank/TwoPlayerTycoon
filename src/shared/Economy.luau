@@ -4,18 +4,18 @@
     Every number the game charges, pays out or gates on, in one pure module: it reads the static
     catalogues (Dropper/Upgrade/Section/Evolution/Affinity/Rebirth) plus a PlotState and returns costs,
     multipliers, income rates and closed-set gate reasons. It holds no state, mutates nothing, touches
-    no Instance and calls no service, so server truth, client prediction and the headless test harness
-    all compute byte-identical numbers.
+    no Instance and calls no service, so server truth, client prediction and the test harness all
+    compute byte-identical numbers.
     Owner: shared  |  Consumers: EconomyService, PurchaseService, EvolutionService, RebirthService,
                                  StateSchema, DropperSystem, MoteSystem, HudController, PromptController
 ]]
 --[[ DEFENSIVE DOCTRINE -- why the reads below look paranoid. Every argument is untrusted (corrupt
-     DataStore, def renamed by a live patch, Multipliers from an older version). So: every read goes
-     through num()/map(), collapsing nil/NaN/inf/string/userdata to a safe default (NaN is the killer
-     -- `NaN >= x` is false, so unguarded clamps silently fail); every divisor is clamped off zero,
-     since an inf/NaN income is written straight back to the save and destroys it permanently; a
-     corrupt def is made INFINITELY EXPENSIVE, never free; and only catalogue ids are ever iterated,
-     so an injected save key ("i_win" = 1e300) contributes nothing to income, cost or owned counts. ]]
+     DataStore, def renamed by a live patch, Multipliers from an older version), so every read goes
+     through num()/map(), collapsing nil/NaN/inf/string/userdata to a safe default (NaN is the killer:
+     `NaN >= x` is false, so unguarded clamps silently fail); every divisor is clamped off zero, since
+     an inf/NaN income is written straight back to the save and destroys it permanently; a corrupt def
+     is made UNAFFORDABLE, never free; and only catalogue ids are iterated, so an injected save key
+     ("i_win" = 1e300) contributes nothing to income, cost or owned counts. ]]
 
 local GameConfig = require(script.Parent.GameConfig)
 local DropperData = require(script.Parent.DropperData)
@@ -35,7 +35,6 @@ export type PlotState = {
 export type Multipliers = { Prestige: number, Stage: number, Affinity: number, Upgrades: number, Debug: number }
 
 local Economy = {}
-
 -- CLOSED SET of gate reasons. The client maps these codes to human text, so a reason is a protocol
 -- value and must never carry free-form detail. locked_* are permanent, need_* are progress gates.
 local Reason = {
@@ -45,11 +44,9 @@ local Reason = {
 	Insufficient = "insufficient", -- cannot afford
 	MaxStage = "max_stage", -- already Primordial, nothing left to attune into
 	NeedEssence = "need_essence", NeedLifetime = "need_lifetime", NeedDroppers = "need_droppers",
-	NeedStage = "need_stage", -- transcend gate: below RebirthData.RequiredStage
-	UnknownId = "unknown_id", -- def nil/corrupt; treated as permanently locked
+	NeedStage = "need_stage", UnknownId = "unknown_id", -- transcend gate / def nil or corrupt
 }
 Economy.Reason = Reason
-
 -- 2^53 is the last exactly-representable integer double: staying under it keeps essence arithmetic
 -- exact and stops a runaway multiplier serialising as inf.
 local MAX_MULTIPLIER, MAX_VALUE = 1e12, 1e15
@@ -58,7 +55,6 @@ local MAX_MULTIPLIER, MAX_VALUE = 1e12, 1e15
 local UNAFFORDABLE = 1e18
 local MIN_INTERVAL = 0.15 -- spec floor; below this the mote pipeline just thrashes
 local EMPTY: { [string]: any } = {}
-
 local function isFinite(v: any): boolean
 	return type(v) == "number" and v == v and v ~= math.huge and v ~= -math.huge
 end
@@ -69,8 +65,8 @@ end
 local function map(v: any): { [string]: any }
 	return if type(v) == "table" then v :: { [string]: any } else EMPTY
 end
--- Finite, never negative (a negative multiplier would turn income into a debit), never big enough
--- that five multiplied together overflow.
+-- Finite, never negative (a negative multiplier turns income into a debit), never big enough that
+-- five multiplied together overflow.
 local function mul(v: any): number
 	return math.clamp(num(v, 1), 0, MAX_MULTIPLIER)
 end
@@ -89,37 +85,31 @@ local function sectionUnlocked(plot: any, id: any): boolean
 	if id == SectionData.Base then return true end -- core wing is unlocked by definition
 	return map(map(plot).Sections)[id] and true or false
 end
-
 -- The one choke point every cost passes through: FastMode (dev switch) divides costs so a tester can
--- walk the curve in minutes, and a non-finite cost becomes huge -- never free.
+-- walk the whole curve in minutes.
 local function finalCost(cost: number): number
 	local value = cost
 	if GameConfig.Debug.FastMode then
 		value /= math.max(1, num(GameConfig.Debug.FastCostDivisor, 1))
 	end
-	-- An overflowing curve (a corrupt save claiming 1e300 owned) collapses to UNAFFORDABLE, a
-	-- finite ceiling above any reachable Essence balance -- NOT math.huge. inf would survive into
-	-- the client snapshot, and Format renders a non-finite number as "0", so an impossible cost
-	-- would read as "free" on the pad. Finite keeps every downstream comparison and label honest.
+	-- An overflowing curve (a corrupt save claiming 1e300 owned) collapses to a FINITE ceiling above
+	-- any reachable balance, not math.huge: inf survives into the snapshot and used to render as
+	-- "0", labelling an impossible cost as free on the pad.
 	return if isFinite(value) then math.max(0, math.floor(value)) else UNAFFORDABLE
 end
-
--- cost = floor(BaseCost * CostGrowth^n), shared by wellsprings and upgrades. Growth clamps to >= 1
--- because growth below 1 makes each copy cheaper than the last: an infinite-money curve.
+-- cost = floor(BaseCost * CostGrowth^n). Growth clamps to >= 1: below 1 each copy is cheaper than
+-- the last, an infinite-money curve.
 local function curveCost(d: { [string]: any }, n: number): number
 	local growth = math.clamp(num(d.CostGrowth, 1), 1, 10)
 	local steps = math.clamp(math.floor(num(n, 0)), 0, 10000)
 	return finalCost(math.max(0, num(d.BaseCost, math.huge)) * growth ^ steps)
 end
-
 function Economy.getPrestigeMultiplier(rebirths: number): number
 	-- clamped to MaxTrackedRebirths so a tampered profile claiming 1e300 rebirths gets the cap
 	return 1 + RebirthData.MultiplierPerRebirth
 		* math.clamp(math.floor(num(rebirths, 0)), 0, RebirthData.MaxTrackedRebirths)
 end
-
--- SUM, not product (§1.5): 1 + 0.25*Ra + 0.25*Rb, so a veteran lifts a partner's sanctum without
--- squaring the pair's output.
+-- SUM, not product (§1.5): 1 + 0.25*Ra + 0.25*Rb lifts a partner's sanctum without squaring it.
 function Economy.getSanctumPrestigeMultiplier(rebirthsList: { number }): number
 	local total = 1
 	if type(rebirthsList) == "table" then
@@ -129,14 +119,12 @@ function Economy.getSanctumPrestigeMultiplier(rebirthsList: { number }): number
 	end
 	return math.clamp(num(total, 1), 1, MAX_MULTIPLIER)
 end
-
 function Economy.upgradeLevel(plot: PlotState, upgradeId: string): number
 	local def = if type(upgradeId) == "string" then UpgradeData.get(upgradeId) else nil
 	if def == nil then return 0 end -- a tampered save cannot invent an upgrade to farm effects from
 	return math.clamp(math.floor(num(map(map(plot).Upgrades)[upgradeId], 0)), 0,
 		math.max(0, math.floor(num(def.MaxLevel, 0))))
 end
-
 -- Summed PerLevel * level per `kind`; iterating the CATALOGUE (never the save) makes injected ids inert.
 function Economy.upgradeEffect(plot: PlotState, kind: string): number
 	local total = 0
@@ -147,7 +135,6 @@ function Economy.upgradeEffect(plot: PlotState, kind: string): number
 	end
 	return math.clamp(num(total, 0), 0, MAX_MULTIPLIER)
 end
-
 function Economy.getMultipliers(plot: PlotState, rebirthsList: { number }): Multipliers
 	local stage, affinity = EvolutionData.get(stageIndexOf(plot)), affinityOf(plot)
 	return {
@@ -166,12 +153,11 @@ function Economy.totalMultiplier(m: Multipliers): number
 	local product = mul(t.Prestige) * mul(t.Stage) * mul(t.Affinity) * mul(t.Upgrades) * mul(t.Debug)
 	return math.clamp(num(product, 1), 0, MAX_MULTIPLIER)
 end
-
 function Economy.getDropperCost(def: DropperData.Dropper, owned: number): number
 	return curveCost(map(def), owned)
 end
--- Same curve as UpgradeData.levelCost, re-derived so nil defs and FastMode are handled in one place;
--- math.huge at max level keeps canAfford false so no caller needs a special case.
+-- UpgradeData.levelCost re-derived, so nil defs and FastMode are handled in one place; the maxed
+-- level returns math.huge, which canAfford rejects, so no caller needs a special case.
 function Economy.getUpgradeCost(def: UpgradeData.Upgrade, level: number): number
 	local d = map(def)
 	local maxLevel = math.max(0, math.floor(num(d.MaxLevel, 0)))
@@ -182,7 +168,7 @@ function Economy.getSectionCost(def: SectionData.Section): number
 	return finalCost(math.max(0, num(map(def).Cost, math.huge)))
 end
 -- Essence per collected Mote. FontYield applies here, not in the global stack: it is a property of
--- the Font swallowing a mote, and overflow credits must match rail credits exactly.
+-- the Font swallowing a mote, and an overflow credit must match a rail credit exactly.
 function Economy.getMoteValue(def: DropperData.Dropper, plot: PlotState, m: Multipliers): number
 	local affinity = affinityOf(plot)
 	local value = math.max(0, num(map(def).BaseValue, 0)) * Economy.totalMultiplier(m)
@@ -190,9 +176,8 @@ function Economy.getMoteValue(def: DropperData.Dropper, plot: PlotState, m: Mult
 		* math.max(0, 1 + Economy.upgradeEffect(plot, "FontYield"))
 	return math.clamp(num(value, 0), 0, MAX_VALUE)
 end
-
--- `m` is accepted for signature stability but unused: prestige/stage/FastMode already scale mote
--- VALUE, and scaling the interval too would compound the same bonus twice.
+-- `m` is taken for signature stability but unused: prestige/stage/FastMode already scale mote VALUE,
+-- and scaling the interval too would compound the same bonus twice.
 function Economy.getDropperInterval(def: DropperData.Dropper, plot: PlotState, m: Multipliers): number
 	local base = math.clamp(num(map(def).Interval, 1), MIN_INTERVAL, 3600)
 	local affinity = affinityOf(plot)
@@ -201,18 +186,15 @@ function Economy.getDropperInterval(def: DropperData.Dropper, plot: PlotState, m
 		* (if affinity then mul(affinity.SpawnRateMultiplier) else 1), 1), 0.01, 100)
 	return math.max(MIN_INTERVAL, base / rate)
 end
-
 function Economy.getRailTravelTime(plot: PlotState, m: Multipliers): number
 	local base = math.max(0.05, num(GameConfig.Mote.BaseTravelSeconds, 6))
 	local floor = math.clamp(num(GameConfig.Mote.MinTravelSeconds, 1.25), 0.05, base)
 	local affinity = affinityOf(plot)
 	local speed = math.clamp(num((1 + Economy.upgradeEffect(plot, "RailSpeed"))
 		* (if affinity then mul(affinity.RailSpeedMultiplier) else 1), 1), 0.01, 100) -- divisor guard
-	-- also clamped <= base: rails may only get FASTER, so corruption cannot park motes in flight
-	-- forever to dodge the live-mote cap
+	-- also clamped <= base: rails only get FASTER, so corruption cannot park motes in flight forever
 	return math.clamp(base / speed, floor, base)
 end
-
 function Economy.getMoteCapacity(plot: PlotState): number
 	-- ceiling of 1000 parts per sanctum: the cap is a render/memory budget as well as a game rule
 	return math.clamp(math.floor(num(GameConfig.Mote.MaxLivePerSanctum, 60)
@@ -224,7 +206,6 @@ function Economy.getWalkSpeed(plot: PlotState): number
 	return math.clamp((if stage then num(stage.WalkSpeed, 16) else 16)
 		+ (if affinity then num(affinity.WalkSpeedBonus, 0) else 0), 8, 100)
 end
-
 function Economy.estimateIncomePerSecond(plot: PlotState, m: Multipliers): number
 	local total = 0
 	for _, def in ipairs(DropperData.List) do
@@ -248,9 +229,9 @@ function Economy.totalDroppersOwned(plot: PlotState): number
 	return total
 end
 
--- Gate checks return (ok, reasonCode), most-permanent-first so the UI says "locked" rather than
--- "can't afford" for something unbuyable. Shared prelude: identity, stage gate, wing gate -- a def
--- missing from its catalogue is unknown_id, so a forged pad id can never reach a debit.
+-- Gate checks return (ok, reasonCode), most-permanent-first so the UI says "locked" not "can't
+-- afford" for something unbuyable. Shared prelude: identity, stage gate, wing gate -- a def missing
+-- from its catalogue is unknown_id, so a forged pad id can never reach a debit.
 local function lockReason(plot: PlotState, d: { [string]: any }, known: boolean): string?
 	if type(d.Id) ~= "string" or not known then return Reason.UnknownId end
 	if stageIndexOf(plot) < num(d.RequiredStage, math.huge) then return Reason.LockedStage end
@@ -279,8 +260,7 @@ end
 function Economy.sectionStatus(plot: PlotState, def: SectionData.Section): (boolean, string)
 	local d = map(def)
 	if type(d.Id) ~= "string" or SectionData.get(d.Id) == nil then return false, Reason.UnknownId end
-	-- ownership first, so two players triggering one pad on the same frame get already_owned back
-	-- instead of paying for the same wing twice
+	-- ownership first: two players triggering one pad on a frame get already_owned, not a double buy
 	if sectionUnlocked(plot, d.Id) then return false, Reason.AlreadyOwned end
 	if stageIndexOf(plot) < num(d.RequiredStage, math.huge) then return false, Reason.LockedStage end
 	if d.RequiredSection ~= nil and not sectionUnlocked(plot, d.RequiredSection) then
@@ -289,10 +269,9 @@ function Economy.sectionStatus(plot: PlotState, def: SectionData.Section): (bool
 	if not Economy.canAfford(plot, Economy.getSectionCost(def)) then return false, Reason.Insufficient end
 	return true, Reason.Ok
 end
-
 -- Attunement gate. FastMode does NOT discount RequiredEssence: EvolutionService debits it straight
--- from the catalogue, so a discount here would open the gate on essence the debit then fails to take
--- and soft-lock the button. Requirements default to huge on a corrupt stage: the gate shuts.
+-- from the catalogue, so a discount would open the gate on essence the debit then fails to take.
+-- Requirements default to huge on a corrupt stage table, so the gate shuts rather than falls open.
 function Economy.attuneStatus(plot: PlotState): (boolean, string)
 	local nextStage = EvolutionData.next(stageIndexOf(plot))
 	if nextStage == nil then return false, Reason.MaxStage end
@@ -308,9 +287,8 @@ function Economy.attuneStatus(plot: PlotState): (boolean, string)
 	end
 	return true, Reason.Ok
 end
-
--- Measured against LifetimeEssence (earned since the last Transcendence), never the wallet, so the
--- pair is not locked out for having spent it on the sanctum that earned it.
+-- Against LifetimeEssence (earned since the last Transcendence), never the wallet, so the pair is
+-- not locked out for having spent it on the sanctum that earned it.
 function Economy.transcendStatus(plot: PlotState): (boolean, string)
 	if stageIndexOf(plot) < num(RebirthData.RequiredStage, math.huge) then return false, Reason.NeedStage end
 	if math.max(0, num(map(plot).LifetimeEssence, 0)) < num(RebirthData.RequiredLifetimeEssence, math.huge) then
