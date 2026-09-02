@@ -16,6 +16,9 @@ local SUFFIXES = { "K", "M", "B", "T", "Qa", "Qi", "Sx", "Sp", "Oc", "No", "Dc" 
 
 -- WHY: a NaN or inf reaching a TextLabel shows "nan"/"inf" to players and can poison later maths.
 -- Every public function funnels through this and degrades to a safe zero instead.
+-- Rendered instead of "0" when a number really is infinite; see Format.abbreviate.
+local INFINITY = "\u{221E}"
+
 local function isFinite(n: any): boolean
 	return type(n) == "number" and n == n and n ~= math.huge and n ~= -math.huge
 end
@@ -45,6 +48,14 @@ end
 --[[ 0..999 print exactly; above that use two decimals with the suffix table. ]]
 function Format.abbreviate(n: number): string
 	if not isFinite(n) then
+		-- NaN and non-numbers read as 0, but an infinity must NOT: a cost label showing "0" for an
+		-- unreachable price would read as free. Economy avoids producing infinities at all; this is
+		-- the second line of defence.
+		if n == math.huge then
+			return INFINITY
+		elseif n == -math.huge then
+			return "-" .. INFINITY
+		end
 		return "0"
 	end
 
@@ -85,6 +96,11 @@ end
      comma() is for exact counts (contributions, leaderstats), abbreviate() is for big numbers. ]]
 function Format.comma(n: number): string
 	if not isFinite(n) then
+		if n == math.huge then
+			return INFINITY
+		elseif n == -math.huge then
+			return "-" .. INFINITY
+		end
 		return "0"
 	end
 
