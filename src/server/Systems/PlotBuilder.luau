@@ -40,6 +40,7 @@ type PartProps = { Name: string, Size: Vector3, CFrame: CFrame, Color: Color3, P
 local PAD_SIZE = Vector3.new(6, 2, 6)
 local FONT_SIZE, MARKER_SIZE = Vector3.new(12, 6, 12), Vector3.new(8, 0.2, 8)
 local MARKER_DROP = -3.4 -- spawn CFrames float at head clearance; the decal belongs on the floor
+local MAX_CONFLUX_SIZE = 60 -- keeps a corrupt stage entry from producing a Sanctum-filling cube
 local MAX_LIGHT_RANGE = 60 -- PointLight.Range is hard-capped at 60 by the engine
 local RAIL_WIDTH, RAIL_THICKNESS, MIN_RAIL_LENGTH = 2.2, 0.4, 0.5 -- below MIN a segment is degenerate
 
@@ -261,6 +262,9 @@ end
      trigger. ServerStorage costs the client nothing (it never replicates) and makes an unowned
      Wing's pads unreachable by construction. The trade: destroy() must sweep both places. ]]
 function PlotBuilder.setSectionVisible(runtime: Runtime, sectionId: string, visible: boolean)
+	if type(runtime) ~= "table" or type(runtime.Sections) ~= "table" then
+		return
+	end
 	local section = runtime.Sections[sectionId]
 	if section == nil then
 		-- A sanitised save can still name a Wing this build lacks; ignore it rather than kill the
@@ -271,20 +275,42 @@ function PlotBuilder.setSectionVisible(runtime: Runtime, sectionId: string, visi
 end
 
 function PlotBuilder.setConfluxAppearance(runtime: Runtime, appearance: Appearance)
+	-- Total on purpose. This is called from the Attunement path, and a malformed appearance table
+	-- (a stale Theme entry, a sanitised save naming a stage this build lacks) must leave the
+	-- Conflux looking wrong rather than abort the Attunement half-applied.
+	if type(runtime) ~= "table" or type(appearance) ~= "table" then
+		return
+	end
 	local conflux = runtime.Conflux :: Part
+	if conflux == nil then
+		return
+	end
 	-- Clamped: a zero/negative Size would make the Conflux vanish, reading as a bug not an Attunement.
-	local size = math.max(1, appearance.Size)
+	local size = if type(appearance.Size) == "number" and appearance.Size == appearance.Size
+		then math.max(1, math.min(appearance.Size, MAX_CONFLUX_SIZE))
+		else 1
 	conflux.Size = Vector3.new(size, size, size)
-	conflux.Color = appearance.Color
-	conflux.Material = appearance.Material
+	if typeof(appearance.Color) == "Color3" then
+		conflux.Color = appearance.Color
+	end
+	if typeof(appearance.Material) == "EnumItem" then
+		conflux.Material = appearance.Material
+	end
 	local light = conflux:FindFirstChildOfClass("PointLight")
 	if light ~= nil then
-		light.Color = appearance.Color
+		if typeof(appearance.Color) == "Color3" then
+			light.Color = appearance.Color
+		end
 		light.Range = math.min(MAX_LIGHT_RANGE, size * 3)
 	end
 end
 
 function PlotBuilder.destroy(model: Instance)
+	-- Tolerates nil and a non-Instance: the release path can reach here after a partially built or
+	-- already-destroyed Sanctum, and erroring during teardown would strand the rest of the cleanup.
+	if typeof(model) ~= "Instance" then
+		return
+	end
 	-- Locked Wings live OUTSIDE this Model, so Model:Destroy() alone would leak every Wing the
 	-- Sanctum never unlocked, for the remaining life of the server.
 	local root = ServerStorage:FindFirstChild(HIDDEN_ROOT_NAME)

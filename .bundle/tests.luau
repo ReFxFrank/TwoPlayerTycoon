@@ -4318,6 +4318,7 @@ type PartProps = { Name: string, Size: Vector3, CFrame: CFrame, Color: Color3, P
 local PAD_SIZE = Vector3.new(6, 2, 6)
 local FONT_SIZE, MARKER_SIZE = Vector3.new(12, 6, 12), Vector3.new(8, 0.2, 8)
 local MARKER_DROP = -3.4 -- spawn CFrames float at head clearance; the decal belongs on the floor
+local MAX_CONFLUX_SIZE = 60 -- keeps a corrupt stage entry from producing a Sanctum-filling cube
 local MAX_LIGHT_RANGE = 60 -- PointLight.Range is hard-capped at 60 by the engine
 local RAIL_WIDTH, RAIL_THICKNESS, MIN_RAIL_LENGTH = 2.2, 0.4, 0.5 -- below MIN a segment is degenerate
 
@@ -4539,6 +4540,9 @@ end
      trigger. ServerStorage costs the client nothing (it never replicates) and makes an unowned
      Wing's pads unreachable by construction. The trade: destroy() must sweep both places. ]]
 function PlotBuilder.setSectionVisible(runtime: Runtime, sectionId: string, visible: boolean)
+	if type(runtime) ~= "table" or type(runtime.Sections) ~= "table" then
+		return
+	end
 	local section = runtime.Sections[sectionId]
 	if section == nil then
 		-- A sanitised save can still name a Wing this build lacks; ignore it rather than kill the
@@ -4549,20 +4553,42 @@ function PlotBuilder.setSectionVisible(runtime: Runtime, sectionId: string, visi
 end
 
 function PlotBuilder.setConfluxAppearance(runtime: Runtime, appearance: Appearance)
+	-- Total on purpose. This is called from the Attunement path, and a malformed appearance table
+	-- (a stale Theme entry, a sanitised save naming a stage this build lacks) must leave the
+	-- Conflux looking wrong rather than abort the Attunement half-applied.
+	if type(runtime) ~= "table" or type(appearance) ~= "table" then
+		return
+	end
 	local conflux = runtime.Conflux :: Part
+	if conflux == nil then
+		return
+	end
 	-- Clamped: a zero/negative Size would make the Conflux vanish, reading as a bug not an Attunement.
-	local size = math.max(1, appearance.Size)
+	local size = if type(appearance.Size) == "number" and appearance.Size == appearance.Size
+		then math.max(1, math.min(appearance.Size, MAX_CONFLUX_SIZE))
+		else 1
 	conflux.Size = Vector3.new(size, size, size)
-	conflux.Color = appearance.Color
-	conflux.Material = appearance.Material
+	if typeof(appearance.Color) == "Color3" then
+		conflux.Color = appearance.Color
+	end
+	if typeof(appearance.Material) == "EnumItem" then
+		conflux.Material = appearance.Material
+	end
 	local light = conflux:FindFirstChildOfClass("PointLight")
 	if light ~= nil then
-		light.Color = appearance.Color
+		if typeof(appearance.Color) == "Color3" then
+			light.Color = appearance.Color
+		end
 		light.Range = math.min(MAX_LIGHT_RANGE, size * 3)
 	end
 end
 
 function PlotBuilder.destroy(model: Instance)
+	-- Tolerates nil and a non-Instance: the release path can reach here after a partially built or
+	-- already-destroyed Sanctum, and erroring during teardown would strand the rest of the cleanup.
+	if typeof(model) ~= "Instance" then
+		return
+	end
 	-- Locked Wings live OUTSIDE this Model, so Model:Destroy() alone would leak every Wing the
 	-- Sanctum never unlocked, for the remaining life of the server.
 	local root = ServerStorage:FindFirstChild(HIDDEN_ROOT_NAME)
@@ -9413,6 +9439,201 @@ t.test("geometry helpers tolerate junk without erroring", function()
     t.noThrow(function() return PlotLayout.sanctumOrigin(0 / 0) end)
     t.noThrow(function() return PlotLayout.padCFrame(origin, SectionData.List[1], 0 / 0) end)
     t.noThrow(function() return PlotLayout.spawnSlotCFrame(origin, 99) end)
+end)
+
+--#endregion
+end }
+SPECS[#SPECS + 1] = { Name = "plotbuilder.spec", Run = function(t, Mock, loadModule, runScript)
+--#region tests/specs/plotbuilder.spec.luau
+--[[
+    plotbuilder.spec
+    PlotBuilder is pure construction, which makes its failures quiet: a missing pad is a purchase
+    nobody can make, an unanchored part is a Sanctum that falls into the void, and a plot that does
+    not fully destroy is a leak that only shows up after an hour of joins and leaves.
+]]
+
+local PlotBuilder = loadModule("ServerScriptService/Core/Systems/PlotBuilder")
+local PlotLayout = loadModule("ReplicatedStorage/Modules/PlotLayout")
+local SectionData = loadModule("ReplicatedStorage/Modules/SectionData")
+local DropperData = loadModule("ReplicatedStorage/Modules/DropperData")
+local UpgradeData = loadModule("ReplicatedStorage/Modules/UpgradeData")
+local GameConfig = loadModule("ReplicatedStorage/Modules/GameConfig")
+local Theme = loadModule("ReplicatedStorage/Modules/Theme")
+
+local function build(plotId)
+    local parent = Instance.new("Folder", workspace)
+    parent.Name = "Sanctums"
+    local model, runtime = PlotBuilder.build(plotId or 1, parent)
+    return model, runtime, parent
+end
+
+t.test("build returns a model and a runtime with every documented handle", function()
+    local model, runtime = build(1)
+    t.truthy(model, "a model was returned")
+    t.eq(model.Parent.Name, "Sanctums")
+    t.truthy(model.Name:find("1"), "the model names its plot: " .. model.Name)
+
+    for _, key in ipairs({ "Model", "Sections", "Pads", "Conflux", "Font", "MoteFolder",
+        "RailFolders", "Signs", "PlotId", "Origin" }) do
+        t.truthy(runtime[key] ~= nil, ("runtime.%s is missing"):format(key))
+    end
+    t.eq(runtime.Model, model)
+    t.eq(runtime.PlotId, 1)
+    t.eq(typeof(runtime.Origin), "CFrame")
+    t.truthy(runtime.MoteFolder:IsA("Folder"), "MoteSystem parents motes here")
+end)
+
+t.test("every section in the data gets a piece of world", function()
+    local _, runtime = build(1)
+    for _, section in ipairs(SectionData.List) do
+        t.truthy(runtime.Sections[section.Id], ("section %s was not built"):format(section.Id))
+        t.truthy(runtime.RailFolders[section.Id], ("section %s has no rail folder"):format(section.Id))
+    end
+end)
+
+t.test("every purchasable thing has a pad and a sign", function()
+    local _, runtime = build(1)
+    for _, dropper in ipairs(DropperData.List) do
+        local key = "dropper:" .. dropper.Id
+        t.truthy(runtime.Pads[key], ("no pad for wellspring %s -- it could never be bought"):format(dropper.Id))
+        t.truthy(runtime.Signs[key], ("no sign for %s"):format(key))
+    end
+    for _, upgrade in ipairs(UpgradeData.List) do
+        t.truthy(runtime.Pads["upgrade:" .. upgrade.Id], "no pad for upgrade " .. upgrade.Id)
+    end
+    for _, section in ipairs(SectionData.List) do
+        if section.Id ~= SectionData.Base then
+            t.truthy(runtime.Pads["section:" .. section.Id], "no pad for wing " .. section.Id)
+        end
+    end
+    t.truthy(runtime.Pads.attune, "no attunement pad")
+    t.truthy(runtime.Pads.transcend, "no transcendence pad")
+    for slot = 1, GameConfig.Plot.SlotsPerSanctum do
+        t.truthy(runtime.Pads["link:" .. slot], ("no link pad for slot %d"):format(slot))
+    end
+end)
+
+t.test("pads carry the attributes the client reads", function()
+    local _, runtime = build(1)
+    local pad = runtime.Pads["dropper:" .. DropperData.List[1].Id]
+    t.eq(pad:GetAttribute("PadKind"), "dropper")
+    t.eq(pad:GetAttribute("PadId"), DropperData.List[1].Id)
+    t.eq(runtime.Pads.attune:GetAttribute("PadKind"), "attune")
+end)
+
+t.test("no pad shares a position with another", function()
+    local _, runtime = build(1)
+    local seen = {}
+    for key, pad in pairs(runtime.Pads) do
+        local position = pad.Position
+        local at = ("%.1f/%.1f/%.1f"):format(position.X, position.Y, position.Z)
+        t.falsy(seen[at], ("pad %s sits on top of %s"):format(key, tostring(seen[at])))
+        seen[at] = key
+    end
+end)
+
+t.test("every part is anchored -- an unanchored Sanctum falls into the void", function()
+    local model = build(1)
+    local parts = 0
+    for _, descendant in ipairs(model:GetDescendants()) do
+        if descendant:IsA("BasePart") then
+            parts += 1
+            t.truthy(descendant.Anchored, ("%s is not anchored"):format(descendant:GetFullName()))
+        end
+    end
+    t.gt(parts, 20, "a Sanctum should be more than a handful of parts")
+end)
+
+t.test("everything built lives under the model, so destroy really is complete", function()
+    local model, runtime, parent = build(1)
+    local strays = 0
+    for _, child in ipairs(parent:GetChildren()) do
+        if child ~= model then strays += 1 end
+    end
+    t.eq(strays, 0, "nothing was parented outside the sanctum model")
+
+    -- The one legitimate exception is a hidden holder for locked wings; if the builder uses one it
+    -- must still be cleaned up by destroy.
+    local before = #workspace:GetDescendants()
+    PlotBuilder.destroy(model)
+    Mock.advance(0)
+    t.eq(model.Parent, nil, "the model is unparented")
+    t.lt(#workspace:GetDescendants(), before, "and its contents are gone")
+end)
+
+t.test("the conflux and font are placed where PlotLayout says", function()
+    local _, runtime = build(3)
+    local origin = PlotLayout.sanctumOrigin(3)
+    t.lt((runtime.Conflux.Position - PlotLayout.confluxCFrame(origin).Position).Magnitude, 1)
+    t.lt((runtime.Font.Position - PlotLayout.fontCFrame(origin).Position).Magnitude, 1)
+end)
+
+t.test("setConfluxAppearance applies colour, size and material", function()
+    local _, runtime = build(1)
+    local appearance = Theme.getConfluxAppearance(5, "tide")
+    PlotBuilder.setConfluxAppearance(runtime, appearance)
+    t.eq(runtime.Conflux.Color, appearance.Color)
+    t.eq(runtime.Conflux.Material, appearance.Material)
+    t.near(runtime.Conflux.Size.X, appearance.Size, 0.001)
+    t.noThrow(function() PlotBuilder.setConfluxAppearance(runtime, nil) end)
+    t.noThrow(function() PlotBuilder.setConfluxAppearance(runtime, { Color = "red" }) end)
+end)
+
+t.test("setSectionVisible hides and restores a locked wing", function()
+    local _, runtime = build(1)
+    local lockable
+    for _, section in ipairs(SectionData.List) do
+        if section.Id ~= SectionData.Base then lockable = section break end
+    end
+    local built = runtime.Sections[lockable.Id]
+    local parentWhenVisible = built.Parent
+
+    PlotBuilder.setSectionVisible(runtime, lockable.Id, false)
+    -- Either reparented out of the world or made invisible and non-collidable; both are legitimate,
+    -- but a locked wing must not be standable.
+    local hidden = built.Parent ~= parentWhenVisible
+    if not hidden then
+        for _, descendant in ipairs(built:GetDescendants()) do
+            if descendant:IsA("BasePart") then
+                t.falsy(descendant.CanCollide, "a locked wing must not be walkable")
+            end
+        end
+    end
+
+    PlotBuilder.setSectionVisible(runtime, lockable.Id, true)
+    t.eq(built.Parent, parentWhenVisible, "and it comes back")
+    t.noThrow(function() PlotBuilder.setSectionVisible(runtime, "no_such_wing", false) end)
+end)
+
+t.test("two sanctums are built apart and do not share instances", function()
+    local modelA, runtimeA, parent = build(1)
+    local modelB, runtimeB = PlotBuilder.build(2, parent)
+    t.neq(modelA, modelB)
+    t.neq(runtimeA.Conflux, runtimeB.Conflux)
+    t.neq(runtimeA.MoteFolder, runtimeB.MoteFolder)
+    local gap = (runtimeA.Conflux.Position - runtimeB.Conflux.Position).Magnitude
+    t.gt(gap, PlotLayout.SanctumSize.X / 2, ("sanctums are only %.0f studs apart"):format(gap))
+end)
+
+t.test("building every sanctum the config asks for does not explode", function()
+    local parent = Instance.new("Folder", workspace)
+    local runtimes = {}
+    for index = 1, GameConfig.Plot.SanctumCount do
+        local _, runtime = PlotBuilder.build(index, parent)
+        table.insert(runtimes, runtime)
+    end
+    t.eq(#parent:GetChildren(), GameConfig.Plot.SanctumCount)
+    -- Rough part-budget sanity: six sanctums should not be tens of thousands of instances.
+    t.lt(#parent:GetDescendants(), 20000,
+        ("a full server builds %d instances"):format(#parent:GetDescendants()))
+end)
+
+t.test("build tolerates junk arguments", function()
+    local parent = Instance.new("Folder", workspace)
+    t.noThrow(function() PlotBuilder.build(0, parent) end)
+    t.noThrow(function() PlotBuilder.build(-1, parent) end)
+    t.noThrow(function() PlotBuilder.destroy(nil) end)
+    t.noThrow(function() PlotBuilder.destroy(Instance.new("Part")) end)
 end)
 
 --#endregion
