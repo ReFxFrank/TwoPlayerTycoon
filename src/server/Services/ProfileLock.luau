@@ -53,4 +53,24 @@ function ProfileLock.blocks(lock: Lock?, now: number): boolean
 	return (now - lock.Stamp) <= SESSION.LockStaleSeconds
 end
 
+--[[ The lock-aware write. Lives here, next to unwrap/blocks, because the abort condition IS the
+     lock protocol: another server holding the lock has already LOADED this player, so our copy is a
+     stale fork and writing it would erase their live session. Returns (ok, stolen) so the caller can
+     tell "the DataStore refused us" from "someone else owns this player now". ]]
+function ProfileLock.write(wrapper: any, player: any, profile: any, release: boolean): (boolean, boolean)
+	local stolen = false
+	local ok = wrapper:Update(SAVE.DataStoreName, ProfileLock.keyFor(player), function(current: any): any
+		-- Runs once per DataStoreWrapper attempt and recomputes from `current` alone; `stolen` is a
+		-- last-write-wins status flag, never an accumulator.
+		local lock = ProfileLock.unwrap(current)
+		if lock ~= nil and lock.JobId ~= ProfileLock.JobId then
+			stolen = true
+			return nil -- abort the write
+		end
+		stolen = false
+		return { Lock = if release then nil else { JobId = ProfileLock.JobId, Stamp = os.time() }, Data = profile }
+	end)
+	return ok, stolen
+end
+
 return ProfileLock

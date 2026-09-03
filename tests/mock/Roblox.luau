@@ -147,6 +147,9 @@ function Mock.addPlayer(name, userId, withCharacter)
     local player = newInstance("Player", name or ("Player" .. nextUserId))
     player.UserId = userId or nextUserId
     player.DisplayName = player.Name
+    -- ClientBootstrap waits for PlayerGui; without it the whole client is untestable.
+    local playerGui = newInstance("PlayerGui", "PlayerGui")
+    playerGui.Parent = player
     player.Parent = services.Players
     if withCharacter ~= false then
         player:LoadCharacter()

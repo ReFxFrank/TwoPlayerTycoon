@@ -34,6 +34,7 @@ local CONTROLLER_ORDER = {
 	"NotifyController",
 	"PromptController",
 	"AffinityController",
+	"LinkController",
 	"RebirthController",
 	"SettingsController",
 	"EvolutionFxController",

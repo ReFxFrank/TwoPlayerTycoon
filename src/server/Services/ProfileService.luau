@@ -117,20 +117,7 @@ local function writeProfile(entry: Entry, release: boolean): boolean
 	profile.Stats.Playtime += math.max(now - entry.PlaytimeStamp, 0)
 	entry.PlaytimeStamp = now
 	profile.Stats.LastSave = now
-	local stolen = false
-	local ok = wrapper:Update(SAVE.DataStoreName, keyFor(entry.Player), function(current: any): any
-		-- Runs once per DataStoreWrapper attempt and recomputes from `current` alone; `stolen` is a
-		-- last-write-wins status flag, never an accumulator.
-		local lock = unwrap(current)
-		if lock ~= nil and lock.JobId ~= JOB_ID then
-			-- Another server holds this player's lock, so it has already LOADED their profile: ours
-			-- is a stale fork now, and writing it would erase their live session.
-			stolen = true
-			return nil -- abort the write
-		end
-		stolen = false
-		return { Lock = if release then nil else { JobId = JOB_ID, Stamp = os.time() }, Data = profile }
-	end)
+	local ok, stolen = ProfileLock.write(wrapper, entry.Player, profile, release)
 	if stolen then
 		warn(("[ProfileService] abandoned save for %s: another server owns the session lock"):format(entry.Player.Name))
 		return false
