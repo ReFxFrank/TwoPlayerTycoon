@@ -206,9 +206,16 @@ non-event instead of a crash loop.
 
 ## 13. Pacing: ~55 minutes to transcend-ready
 
-Verified by simulation rather than guessed: first purchase at 34s, Stage 2 at 4.3 min, Stage 6 at
-52 min, transcend-ready at 55 min — dropping to ~15 min for two four-rebirth players. Long enough
-that reaching Primordial feels earned, short enough to reach in one sitting.
+Measured by playing the game in the harness (`tests/specs/pacing.spec.luau`), not modelled: first
+purchase at 0.7 min, Stage 2 at 6.2 min, Stage 6 at 47.5 min, transcend-ready at 49.9 min, dropping
+to 25.0 min at four rebirths. Long enough that reaching Primordial feels earned, short enough to
+reach in one sitting.
+
+An earlier version of this document published 4.3 min for Stage 2 and claimed rebirth cut the run to
+a third. Both came from a balance model rather than a measurement, and both were wrong — Stage 2 is
+44% later than claimed, and prestige halves the run rather than thirding it. The numbers above are
+now asserted by a test, so the document cannot drift from the game again. See GAMEPLAY.md for the
+stage-2→3 wall the measurement also exposed.
 
 *Alternatives considered: ~25 minutes (better for an audience that decides in ten minutes, but the
 mid-game thins out and the six stages start to blur); ~2 hours (makes rebirth multipliers matter

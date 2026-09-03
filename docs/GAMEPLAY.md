@@ -70,8 +70,36 @@ Attunement changes the Conflux model and colour, raises the income multiplier, r
 walk speed (the Sanctum grows, so traversal has to keep up), and unlocks the next tier of
 Wellsprings, upgrades and Wings.
 
-Rough first run: **stage 2 at ~4 minutes**, **stage 6 at ~an hour**, and about a third of that at
-four rebirths.
+**Measured**, not modelled. `tests/specs/pacing.spec.luau` plays the game in the harness — real
+purchases through `PurchaseService`, real attunements, the real income loop, and a greedy buying
+policy — and reports where the milestones actually fall:
+
+| Milestone | Reached at |
+|---|---|
+| First purchase | 0.7 min |
+| Stage 2 — Wisp | 6.2 min |
+| Stage 3 — Sprite | 22.2 min |
+| Stage 4 — Elemental | 28.9 min |
+| Stage 5 — Warden | 35.1 min |
+| Stage 6 — Primordial | 47.5 min |
+| Transcend-ready | 49.9 min |
+| Transcend-ready, 4 rebirths | 25.0 min |
+
+238 purchases across the run. The spec asserts these stay in the right region, so a balance change
+that moves the curve by a factor fails a test rather than quietly making this table wrong.
+
+**The curve is lumpy, and stage 2→3 is the problem.** Gaps between stages run
+6.2 → **16.0** → 6.7 → 6.2 → 12.4 minutes. Sprite costs more than twice its neighbours: after the
+first attunement teaches the mechanic at 6 minutes, the player spends a quarter of an hour before
+the next one. Two things drive it — `wing_tide_basin` at 45,000 is the first wing that costs
+meaningfully more than the wellsprings it unlocks, and stage 3's own 12,000 essence lands before the
+stage-2 wellsprings have compounded. Halving one of those would flatten it. It is left as it is
+because the pacing was signed off before it was measured; it is the first thing to revisit if the
+mid-game reads as a grind.
+
+Prestige compresses the run to **half**, not a third: 25.0 minutes at four rebirths against 49.9
+cold. Four rebirths is ×2 income, so half is exactly what the multiplier predicts — the earlier
+"about a third" was arithmetic that no one had checked.
 
 ---
 

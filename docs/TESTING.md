@@ -115,6 +115,20 @@ t.test("...", function()
 end)
 ```
 
+## The slow one
+
+`pacing.spec` takes ~40 seconds because it genuinely plays the game twice — around 50 simulated
+minutes per run, driven through the real purchase and attunement paths. Everything else finishes in
+about five seconds. It earns the time: it is the only test that can catch the published progression
+curve drifting away from the one the game actually delivers, which is exactly what had already
+happened when it was written.
+
+Run just the fast specs while iterating:
+
+```bash
+./tests/run.sh economy      # or any substring
+```
+
 ## Conventions
 
 - Test the *contract*, not the implementation. Reason codes, cost monotonicity and gate outcomes are

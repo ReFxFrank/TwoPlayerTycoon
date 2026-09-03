@@ -36,7 +36,7 @@ Run the tests (needs Node 18+ and the [Luau CLI](https://github.com/luau-lang/lu
 ./tests/run.sh
 ```
 
-That syntax-checks every file, enforces the house rules, and runs 302 tests — the whole game server
+That syntax-checks every file, enforces the house rules, and runs 304 tests — the whole game server
 executes headlessly against a mock Roblox environment. See [docs/TESTING.md](docs/TESTING.md).
 
 ---
@@ -134,6 +134,10 @@ The three that mattered most were all the same shape, and all invisible to unit 
   hanging off `ProfileLoaded` — claiming a plot, leaderstats, replication — never started.
 - **No client ever listened for the link offer.** The server pushed `LinkOffer`, the modal was
   built, and nothing consumed it, so an occupant was never asked and could not accept.
+
+The published progression curve was wrong too, in the same way: `docs/GAMEPLAY.md` gave milestones
+that came from a balance model nobody had checked. `tests/specs/pacing.spec.luau` now plays the game
+and measures them, and the document carries the measured numbers.
 
 The suite now carries a structural guard in each direction — every client→server remote must have a
 handler, every server→client remote must have a listener — because those are the tests that catch a
