@@ -135,9 +135,10 @@ The three that mattered most were all the same shape, and all invisible to unit 
 - **No client ever listened for the link offer.** The server pushed `LinkOffer`, the modal was
   built, and nothing consumed it, so an occupant was never asked and could not accept.
 
-The published progression curve was wrong too, in the same way: `docs/GAMEPLAY.md` gave milestones
-that came from a balance model nobody had checked. `tests/specs/pacing.spec.luau` now plays the game
-and measures them, and the document carries the measured numbers.
+The published progression curve is now measured rather than modelled: `tests/specs/pacing.spec.luau`
+plays the game and reports where each milestone falls, and guards against the curve going lumpy.
+The original balance model turned out to be close; the one claim it got wrong — that rebirth cuts
+the run to a third, when it halves it — is corrected.
 
 The suite now carries a structural guard in each direction — every client→server remote must have a
 handler, every server→client remote must have a listener — because those are the tests that catch a

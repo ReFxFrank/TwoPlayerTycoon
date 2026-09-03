@@ -71,35 +71,34 @@ walk speed (the Sanctum grows, so traversal has to keep up), and unlocks the nex
 Wellsprings, upgrades and Wings.
 
 **Measured**, not modelled. `tests/specs/pacing.spec.luau` plays the game in the harness — real
-purchases through `PurchaseService`, real attunements, the real income loop, and a greedy buying
-policy — and reports where the milestones actually fall:
+purchases through `PurchaseService`, real attunements, the real income loop — and reports where the
+milestones fall:
 
-| Milestone | Reached at |
-|---|---|
-| First purchase | 0.7 min |
-| Stage 2 — Wisp | 6.2 min |
-| Stage 3 — Sprite | 22.2 min |
-| Stage 4 — Elemental | 28.9 min |
-| Stage 5 — Warden | 35.1 min |
-| Stage 6 — Primordial | 47.5 min |
-| Transcend-ready | 49.9 min |
-| Transcend-ready, 4 rebirths | 25.0 min |
+| Milestone | Reached at | Gap from previous |
+|---|---|---|
+| First purchase | 0.7 min | — |
+| Stage 2 — Wisp | 4.7 min | 4.7 min |
+| Stage 3 — Sprite | 13.9 min | 9.1 min |
+| Stage 4 — Elemental | 25.0 min | 11.2 min |
+| Stage 5 — Warden | 32.3 min | 7.2 min |
+| Stage 6 — Primordial | 44.7 min | 12.4 min |
+| Transcend-ready | 47.1 min | 2.4 min |
+| Transcend-ready, 4 rebirths | 26.3 min | — |
 
-238 purchases across the run. The spec asserts these stay in the right region, so a balance change
-that moves the curve by a factor fails a test rather than quietly making this table wrong.
+238 purchases across the run. The curve rises without a wall: every gap sits between 4 and 12.5
+minutes, and the spec fails if any stage ever costs more than three times the median — a lumpy curve
+is invisible to milestone bounds alone, because a run can hit every checkpoint on time while one
+stage in the middle becomes a grind.
 
-**The curve is lumpy, and stage 2→3 is the problem.** Gaps between stages run
-6.2 → **16.0** → 6.7 → 6.2 → 12.4 minutes. Sprite costs more than twice its neighbours: after the
-first attunement teaches the mechanic at 6 minutes, the player spends a quarter of an hour before
-the next one. Two things drive it — `wing_tide_basin` at 45,000 is the first wing that costs
-meaningfully more than the wellsprings it unlocks, and stage 3's own 12,000 essence lands before the
-stage-2 wellsprings have compounded. Halving one of those would flatten it. It is left as it is
-because the pacing was signed off before it was measured; it is the first thing to revisit if the
-mid-game reads as a grind.
+**On the precision of these numbers.** They depend on how the simulated player behaves, and one
+choice matters: when to stop investing in income and start banking the attunement cost. Sweeping
+that horizon from 60 to 240 seconds moves individual stages by a couple of minutes but leaves the
+run at **46–52 minutes** end to end, so the headline is robust and the per-stage figures are
+accurate to about ±2 minutes. Treat the table as the shape of the curve, not as stopwatch times.
 
-Prestige compresses the run to **half**, not a third: 25.0 minutes at four rebirths against 49.9
-cold. Four rebirths is ×2 income, so half is exactly what the multiplier predicts — the earlier
-"about a third" was arithmetic that no one had checked.
+Prestige compresses the run to **a little over half** — 26.3 minutes at four rebirths against 47.1
+cold. Four rebirths is ×2 income, so half is what the multiplier predicts; an earlier draft of this
+document claimed a third, which was never reachable.
 
 ---
 

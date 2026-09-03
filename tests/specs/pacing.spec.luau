@@ -42,11 +42,36 @@ end
 
 --- One purchase decision, in the order a player actually makes them: advance the Conflux if you
 --- can, then unlock space, then buy the best earner, then improve throughput.
+---
+--- SAVING IS PART OF THE POLICY, and getting it wrong invalidates the whole measurement. Both
+--- extremes are badly wrong models of a player:
+---   * Spend everything always -- never banks the attunement cost, so it only ever attunes by
+---     accident once nothing is affordable. Reads as a balance wall that is not there.
+---   * Save as soon as essence is the blocker -- never builds income, so it saves 250 essence at
+---     1/s from a standing start. Turns a 50-minute run into a 220-minute one.
+--- A player does neither: they invest while the next stage is far away and start banking once it is
+--- within reach. SAVE_WITHIN_SECONDS is that "within reach" horizon.
+local SAVE_WITHIN_SECONDS = 120
+
 local function act(services, player, sanctum)
     local state = sanctum.State
 
     if select(1, services.EvolutionService:Attune(player, sanctum)) then
         return "attune"
+    end
+
+    local _, blocked = Economy.attuneStatus(state)
+    if blocked == Economy.Reason.NeedEssence then
+        -- attuneStatus reports the FIRST failing gate, so need_essence means the lifetime and
+        -- wellspring gates are already met and only the bank is short.
+        local nextStage = EvolutionData.next(state.Stage)
+        local income = Economy.estimateIncomePerSecond(state, services.EconomyService:GetMultipliers(sanctum))
+        if nextStage ~= nil and income > 0 then
+            local shortfall = nextStage.RequiredEssence - state.Essence
+            if shortfall <= income * SAVE_WITHIN_SECONDS then
+                return nil -- close enough to be worth banking rather than spending
+            end
+        end
     end
 
     if state.Stage >= EvolutionData.AffinityUnlockStage and state.Affinity == nil then
@@ -133,6 +158,11 @@ t.test("a solo run reaches every stage, and matches the curve docs/GAMEPLAY.md p
             mins(marks.Stages[stage])))
     end
     print(("      transcend-ready: %s   (%d purchases)"):format(mins(marks.TranscendReady), marks.Purchases))
+    local previous = 0
+    for stage = 2, EvolutionData.MaxStage do
+        print(("      gap to stage %d: %s"):format(stage, mins(marks.Stages[stage] - previous)))
+        previous = marks.Stages[stage]
+    end
 
     t.truthy(marks.FirstPurchase, "the first wellspring must be affordable from a cold start")
     for stage = 2, EvolutionData.MaxStage do
@@ -146,8 +176,26 @@ t.test("a solo run reaches every stage, and matches the curve docs/GAMEPLAY.md p
     t.lt(marks.FirstPurchase, 90, "the loop must teach itself inside the first minute or so")
     t.lt(marks.Stages[2], 12 * 60, "the first attunement is the hook; it cannot be a slog")
     t.gt(marks.Stages[2], 30, "nor instant, or it teaches nothing")
+    t.lt(marks.TranscendReady, 90 * 60, "the run must fit in a sitting")
+    t.gt(marks.TranscendReady, 20 * 60, "and must not be over before it starts")
     t.truthy(marks.Stages[EvolutionData.MaxStage] < 3 * 3600,
         "Primordial must be reachable in a sitting, not a week")
+
+    --[[ THE WALL GUARD. Milestone bounds alone cannot see a lumpy curve: a run can hit every
+         checkpoint on time while one stage in the middle takes four times its neighbours, which is
+         a grind exactly where the player has just learned what attunement is. Measured gaps sit
+         between 4 and 13 minutes, so a stage costing more than three times the median is a wall. ]]
+    local gaps = {}
+    for stage = 2, EvolutionData.MaxStage do
+        table.insert(gaps, marks.Stages[stage] - (marks.Stages[stage - 1] or 0))
+    end
+    local sorted = table.clone(gaps)
+    table.sort(sorted)
+    local median = sorted[math.ceil(#sorted / 2)]
+    for index, gap in ipairs(gaps) do
+        t.lt(gap, median * 3, ("stage %d took %.1f min against a median of %.1f -- that is a wall")
+            :format(index + 1, gap / 60, median / 60))
+    end
     t.truthy(marks.TranscendReady >= marks.Stages[EvolutionData.MaxStage],
         "transcendence comes after the final stage, never before")
 

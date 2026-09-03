@@ -207,15 +207,22 @@ non-event instead of a crash loop.
 ## 13. Pacing: ~55 minutes to transcend-ready
 
 Measured by playing the game in the harness (`tests/specs/pacing.spec.luau`), not modelled: first
-purchase at 0.7 min, Stage 2 at 6.2 min, Stage 6 at 47.5 min, transcend-ready at 49.9 min, dropping
-to 25.0 min at four rebirths. Long enough that reaching Primordial feels earned, short enough to
-reach in one sitting.
+purchase at 0.7 min, Stage 2 at 4.7 min, Stage 6 at 44.7 min, transcend-ready at 47.1 min, dropping
+to 26.3 min at four rebirths. Long enough that reaching Primordial feels earned, short enough to
+reach in one sitting. The original balance model turned out to be close: it predicted 4.3 / 52 / 55
+against a measured 4.7 / 44.7 / 47.1.
 
-An earlier version of this document published 4.3 min for Stage 2 and claimed rebirth cut the run to
-a third. Both came from a balance model rather than a measurement, and both were wrong — Stage 2 is
-44% later than claimed, and prestige halves the run rather than thirding it. The numbers above are
-now asserted by a test, so the document cannot drift from the game again. See GAMEPLAY.md for the
-stage-2→3 wall the measurement also exposed.
+One claim in it was wrong and is corrected: rebirth compresses the run to **a little over half**,
+not a third. Four rebirths is ×2 income, so half is what the multiplier predicts and a third was
+never reachable.
+
+**A note on how nearly this went wrong.** The first measurement reported Stage 2 at 6.2 min and a
+16-minute wall at Stage 2→3, and this document was edited to match. Both were artifacts of the
+simulated player, not the game: it spent every coin the instant it landed, so it never banked an
+attunement cost and only ever advanced by accident once nothing was affordable. Fixing the policy —
+invest while the next stage is far, bank once it is within reach — removed the wall entirely. The
+balance was never changed, and should not have been. A measurement is only as good as the model of
+the player inside it, and a plausible-looking number is not evidence.
 
 *Alternatives considered: ~25 minutes (better for an audience that decides in ten minutes, but the
 mid-game thins out and the six stages start to blur); ~2 hours (makes rebirth multipliers matter
