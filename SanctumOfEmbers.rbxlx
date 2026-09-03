@@ -10393,6 +10393,7 @@ type Binding = {
 	Label: any,
 	Kind: string,
 	Id: string,
+	PlotId: number?,
 	Connections: { any },
 }
 
@@ -10402,6 +10403,25 @@ Controller.Name = "PromptController"
 -- A prompt normally sits directly on its pad; two hops covers a prompt nested one level deeper
 -- (inside an Attachment, say) without walking the whole Sanctum for every unrelated prompt.
 local MAX_ANCESTOR_HOPS = 2
+-- pad -> Pads folder -> Wing -> Sanctum model is three hops; a link pad is two, and a prompt nested
+-- one level deeper adds one. Five covers every shape PlotBuilder produces without walking the world.
+local MAX_SANCTUM_HOPS = 5
+
+--- The Sanctum a pad belongs to. PlotBuilder stamps PlotId on each Sanctum model.
+local function plotIdOf(node: Instance?): number?
+	local current: Instance? = node
+	for _ = 0, MAX_SANCTUM_HOPS do
+		if current == nil then
+			return nil
+		end
+		local id = current:GetAttribute("PlotId")
+		if type(id) == "number" then
+			return id
+		end
+		current = current.Parent
+	end
+	return nil
+end
 
 local bindings: { [any]: Binding } = {}
 local connections: { any } = {}
@@ -10442,6 +10462,15 @@ local function holderFor(prompt: any): Instance?
 end
 
 local function render(binding: Binding): ()
+	--[[ All six Sanctums stand on one shared grid, so this controller binds every pad on the server,
+	     not just the local player's. Affordability is computed from OUR snapshot, which is only
+	     meaningful for OUR Sanctum -- rendering a neighbour's pad from our wallet would quote them a
+	     price and a lock state derived from a PlotState that is not theirs. For a foreign pad we
+	     leave the wording PurchaseService already published from that Sanctum's own state. ]]
+	local mine = store:GetPath("Plot.Id")
+	if binding.PlotId ~= nil and type(mine) == "number" and binding.PlotId ~= mine then
+		return
+	end
 	local holder = binding.Holder
 	local locked = holder:GetAttribute("PadLocked") == true
 	local name, ok, reason, cost = PadVerdict.evaluate(plot, binding.Kind, binding.Id)
@@ -10520,6 +10549,7 @@ local function bind(prompt: any): ()
 		Label = signLabel(holder),
 		Kind = kind,
 		Id = id,
+		PlotId = plotIdOf(holder),
 		Connections = {},
 	}
 	bindings[prompt] = binding

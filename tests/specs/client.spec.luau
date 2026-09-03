@@ -186,3 +186,45 @@ t.test("the HUD renders essence from a real server push", function()
     t.truthy(label.Text:find("12") ~= nil or label.Text:find("K") ~= nil,
         "which reflects the server's number, got: " .. label.Text)
 end)
+
+t.test("pads on another player's sanctum are not rendered from your wallet", function()
+    -- All six Sanctums share one grid, so this controller binds every pad on the server. Verdicts
+    -- are computed from OUR snapshot, which is only meaningful for OUR Sanctum: rendering a
+    -- neighbour's pad from our wallet quotes them a price derived from a PlotState that is not
+    -- theirs.
+    local services = bootServer()
+    local ash = Mock.addPlayer("Ash", 1)
+    local bree = Mock.addPlayer("Bree", 2)
+    Mock.advance(1)
+    bootClient(ash)
+
+    local mine = services.PlotService:GetSanctumForPlayer(ash)
+    local theirs = services.PlotService:GetSanctumForPlayer(bree)
+    t.neq(mine.Id, theirs.Id)
+
+    -- Make the two sanctums disagree as loudly as possible.
+    services.EconomyService:Credit(mine, 5e6)
+    Mock.advance(2)
+
+    local DropperData = loadModule("ReplicatedStorage/Modules/DropperData")
+    local dropper = DropperData.List[1]
+    local function padFor(sanctum)
+        local runtime = services.PlotService:GetSanctumRuntime(sanctum)
+        return runtime.Pads["dropper:" .. dropper.Id]
+    end
+    local foreign = padFor(theirs)
+    local prompt
+    for _, descendant in ipairs(foreign:GetDescendants()) do
+        if descendant:IsA("ProximityPrompt") then prompt = descendant end
+    end
+    t.truthy(prompt, "the neighbour's pad has a prompt")
+
+    -- Whatever the neighbour's pad says must come from THEIR state, published by PurchaseService --
+    -- so it must match what their own sanctum's cost actually is, not ours.
+    local Economy = loadModule("ReplicatedStorage/Modules/Economy")
+    local theirCost = Economy.getDropperCost(dropper, theirs.State.Droppers[dropper.Id] or 0)
+    t.eq(foreign:GetAttribute("PadCost"), theirCost,
+        "the server publishes each pad from its own sanctum's state")
+    t.falsy(prompt.ActionText:find("Can't") == nil and prompt.ActionText:find("afford") ~= nil,
+        "and the client must not overwrite it with a verdict from our wallet")
+end)

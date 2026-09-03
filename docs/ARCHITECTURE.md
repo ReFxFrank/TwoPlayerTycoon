@@ -35,6 +35,10 @@ nobody can ever buy.
 | `PlotLayout` | Pure geometry: where every wing, pad, rail waypoint and spawn sits. |
 | `RemoteSchema` | The wire protocol: every remote, its direction, rate limit and payload validator. |
 
+Several modules were split out purely to stay inside the project's 300-line ceiling. In every case
+the cut followed a real seam, so the split is worth keeping on its own merits — the sub-module is
+named for a distinct concern rather than "part two".
+
 ### Utilities
 
 `GameConfig` (tunables), `Theme` (palette), `Signal`, `TableUtil`, `Format`, `Validate`,
@@ -81,13 +85,29 @@ Registration order is dependency order; `StopAll` runs in reverse.
 | `EvolutionService` | Attunement transitions and affinity choice. |
 | `RebirthService` | The consensus vote and the reset. |
 | `StateReplicator` | Throttled snapshot push. |
-| `LeaderboardService` | `leaderstats` mirrors. |
+| `LeaderboardService` | `leaderstats` mirrors, clamped into 32-bit range. |
+
+Sub-modules, each owned by exactly one service above:
+
+| Module | Owner | Role |
+|---|---|---|
+| `ProfileLock` | ProfileService | The session-lock protocol: how a stored record encodes ownership, when a lock may be stolen, and the lock-aware write. |
+| `ProfileRemotes` | ProfileService | The two remotes it owns — the Music/Sfx toggles and the Studio-gated data reset. |
+| `PlotSession` | PlotService | A player's relationship to a plot: claim, adopt, link gates, release, grace. |
+| `PlotRuntime` | PlotService | One Sanctum's machinery: model, emit clock, mote pool, rail cache, wing visibility. |
+| `PlotLinkController` | PlotService | The link offer book: who has been asked, and when the offer expires. |
+| `PlotMirror` | PlotService | The Profile ↔ PlotState bridge. The only place that decides which direction state flows. |
+| `PlotTick` | PlotService | The one income loop, and the two pieces of clock state a restart must not inherit. |
+| `PrestigeAward` | RebirthService | What a Transcendence pays one player. The only code that writes what a player cannot re-earn. |
+| `PurchasePads` | PurchaseService | The per-pad verdict: what a pad says and whether it is live. |
 
 ### Systems
 
-`PlotBuilder` (constructs a Sanctum's Instance tree), `DropperSystem` (spawn scheduling),
-`MoteSystem` (CFrame transport along rails). These are plain modules owned by `PlotService`, not
-registered services — they are per-Sanctum objects, not singletons.
+`PlotBuilder` (constructs a Sanctum's Instance tree) with `BuildKit` (its construction primitives —
+a Part factory that cannot forget to anchor, a sign factory, the shared extents; no game knowledge),
+`DropperSystem` (spawn scheduling) and `MoteSystem` (CFrame transport along the rails). These are
+plain modules owned by `PlotService`, not registered services — they are per-Sanctum objects, not
+singletons.
 
 ### The one loop
 
@@ -107,17 +127,25 @@ path yields, so a slow DataStore can never stall income.
 
 ## Client (`src/client`)
 
-`ClientBootstrap.client.luau` waits for the remotes folder, builds the UI, creates a `ClientStore`,
-then `Init`s and `Start`s each controller with a shared context.
+The client decides nothing. It renders the snapshot and forwards intent; every gate it displays is
+computed by the same `Economy` module the server authorises with, so the two cannot drift.
 
-Controllers **never read a remote directly**. They call `store:Observe("Plot.Stage", fn)` and are
-invoked once with the current value, then only when that value genuinely changes. Essence updates
-twice a second; a stage observer must not rebuild the HUD twice a second because of it.
+`ClientBootstrap` waits for the remote folder, builds the UI, creates the `ClientStore`, and is the
+**only** place `StateSync` is read. Each controller is required and started inside a `pcall`, so one
+broken controller cannot leave the player with no HUD at all.
 
-`UiBuilder` constructs the whole `ScreenGui` in code rather than shipping a `.rbxmx`, so the UI is
-reviewable in a diff.
-
----
+| Controller | Role |
+|---|---|
+| `UiBuilder` / `UiModals` | Build the whole ScreenGui in code and return named references. No behaviour. |
+| `HudController` | Essence, income, stage, multiplier, partner panel, action bar. Owns the one reason-code → text table. |
+| `PromptController` / `PadVerdict` | In-world pad wording and affordability. Skips pads on other players' Sanctums, whose verdicts belong to their state, not yours. |
+| `LinkController` | The link offer: shows it, runs the confirmation clock, answers with `LinkResponse`. |
+| `RebirthController` | The Transcendence warning and the live consensus vote. |
+| `AffinityController` | The Stage 3 elemental choice, with each element's real trade-off numbers read from data. |
+| `SettingsController` | Music/Sfx toggles and the Studio-gated, hold-to-confirm data reset. |
+| `NotifyController` | The toast stack, rate-limited so a burst cannot cover the screen. |
+| `EvolutionFxController` | Attune/transcend/purchase/link feedback. |
+| `SoundController` | Fully wired, silent until asset ids are filled in. A missing id is a no-op, never an error. |
 
 ## Two data paths
 
