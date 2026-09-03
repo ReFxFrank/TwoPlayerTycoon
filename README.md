@@ -36,7 +36,7 @@ Run the tests (needs Node 18+ and the [Luau CLI](https://github.com/luau-lang/lu
 ./tests/run.sh
 ```
 
-That syntax-checks every file, enforces the house rules, and runs 285 tests — the whole game server
+That syntax-checks every file, enforces the house rules, and runs 302 tests — the whole game server
 executes headlessly against a mock Roblox environment. See [docs/TESTING.md](docs/TESTING.md).
 
 ---
@@ -120,13 +120,24 @@ an affinity, transcends on a consensus vote, and reloads everything after a simu
 restart — then fires hostile payloads at every remote and checks that essence, stage and prestige
 did not move.
 
-Two bugs that only an end-to-end test could find were fixed on the way:
+Eleven defects were found and fixed along the way, and the pattern in them is worth stating: almost
+none were logic errors. They were **wiring gaps** — a module correct in isolation that nothing ever
+called — and **stale state**, a value left describing a world that had moved on. Every one passed
+the full suite before it was found.
+
+The three that mattered most were all the same shape, and all invisible to unit tests:
 
 - **Linking was unreachable.** Every player auto-claims a Sanctum on join, and the link gate refused
   anyone who already had one — so the two-player hook would have refused every request in
-  production while every module's own tests passed.
+  production.
 - **Joining never loaded a profile.** Nothing called `ProfileService:LoadAsync`, so the whole chain
-  that hangs off `ProfileLoaded` — claiming a plot, leaderstats, replication — never started.
+  hanging off `ProfileLoaded` — claiming a plot, leaderstats, replication — never started.
+- **No client ever listened for the link offer.** The server pushed `LinkOffer`, the modal was
+  built, and nothing consumed it, so an occupant was never asked and could not accept.
+
+The suite now carries a structural guard in each direction — every client→server remote must have a
+handler, every server→client remote must have a listener — because those are the tests that catch a
+feature nobody wired, and no per-feature test can: there is no code to write a test against.
 
 Out of scope by design: trading between Sanctums, real developer-product purchases (the code is
 structured for them — permanent progression is already separate from resettable state — but nothing
