@@ -23,6 +23,7 @@ local Peers = script.Parent
 local PlotLinkController = require(Peers:WaitForChild("PlotLinkController"))
 local PlotRuntime = require(Peers:WaitForChild("PlotRuntime"))
 local PlotSession = require(Peers:WaitForChild("PlotSession"))
+local PlotTick = require(Peers:WaitForChild("PlotTick"))
 
 type Occupant = { UserId: number, Player: any, Slot: number, JoinedAt: number, Contribution: number, Vote: boolean? }
 type Sanctum = { Id: number, Model: Instance, State: any, Occupants: { [number]: Occupant },
@@ -30,12 +31,6 @@ type Sanctum = { Id: number, Model: Instance, State: any, Occupants: { [number]:
 type Plot = any -- PlotRuntime's object; typed there, and naming it here would be a require cycle
 type Connection = { Disconnect: (self: any) -> () }
 
--- Heartbeat is DECIMATED to GameConfig.Income.TickRate: DropperSystem's catch-up bound is sized off
--- a 0.1s step, and stepping six Sanctums at render rate buys nothing a Mote's flight can show.
-local STEP_INTERVAL = 1 / math.max(1, GameConfig.Income.TickRate)
-local MAX_STEP = 0.5 -- after a hitch the banked dt would teleport every Mote to the Font in one frame
-local MIRROR_SECONDS = 1 -- how often a dirty Sanctum is copied into its occupants' Profiles
-local WARN_SECONDS = 10 -- throttle on the per-Sanctum step-failure warning
 local FOLDER_NAME = "Sanctums"
 
 local Service = {}
@@ -52,8 +47,9 @@ local byId: { [number]: Plot } = {}
 local connections: { Connection } = {}
 local heartbeat: Connection? = nil
 local links: any, profiles: any, economy: any, remotes: any = nil, nil, nil, nil
-local purchases: any, registryRef: any = nil, nil
-local accumulator, mirrorClock = 0, 0
+local purchases: any, evolution: any, registryRef: any = nil, nil, nil
+-- The one loop. Built at module scope alongside `plots`, which it holds by reference.
+local ticker = PlotTick.new(plots, PlotSession)
 
 --[[ Resolves a caller's Sanctum back to the plot that owns it. The IDENTITY check matters: a spec
      fixture (or a stale reference to a rebuilt plot) can share an Id with a live Sanctum, and
@@ -125,6 +121,15 @@ function Service:RebuildSanctum(sanctum: any): ()
 	if purchases ~= nil and type(purchases.RefreshPads) == "function" then
 		purchases:RefreshPads(plot.Sanctum)
 	end
+	--[[ Stage-derived presentation, re-asserted here rather than at each caller: attune, affinity and
+	     rebirth applied it themselves but the CLAIM path never did, so a returning Stage 4 player got
+	     a Stage 1 Conflux and Stage 1 walk speed all session. Doing it here is also ordering-proof --
+	     claim fires OccupantAdded before the save is adopted, and this runs after both. ]]
+	if evolution == nil and registryRef ~= nil then evolution = registryRef:TryGet("EvolutionService") end
+	if evolution ~= nil then
+		evolution:ApplyStageVisuals(plot.Sanctum)
+		evolution:ApplyStageStats(plot.Sanctum)
+	end
 	Service:MarkDirty(plot.Sanctum)
 end
 
@@ -174,38 +179,6 @@ function Service:ClearMotes(sanctum: any): ()
 	if plot ~= nil then plot:ClearMotes() end
 end
 
---[[ The one loop -- one connection for the WHOLE service, never one per Sanctum. ]]
-
-local function stepPlot(plot: Plot, dt: number, mirroring: boolean): ()
-	plot:Step(dt)
-	-- Cheap and non-yielding, so it rides the income tick: any save (autosave, release, shutdown)
-	-- then finds a Profile at most MIRROR_SECONDS behind the live Sanctum, whoever triggered it.
-	if mirroring and plot.Sanctum.Dirty then PlotSession.mirrorOne(plot) end
-end
-
-local function tick(dt: any): ()
-	accumulator += if type(dt) == "number" and dt == dt then dt else 0
-	if accumulator < STEP_INTERVAL then return end
-	local step = math.min(accumulator, MAX_STEP)
-	accumulator = 0
-	mirrorClock += step
-	local mirroring = mirrorClock >= MIRROR_SECONDS
-	if mirroring then mirrorClock = 0 end
-	for _, plot in ipairs(plots) do
-		plot.Announced = false -- re-arm the coalesced SanctumChanged for this tick
-		if next(plot.Sanctum.Occupants) ~= nil then
-			--[[ Per-Sanctum pcall, not one around the whole loop: an error in plot 3 must not stop
-			     plots 4-6 earning, and an unguarded error would kill this connection for every
-			     player on the server for the rest of its life. ]]
-			local ok, err = pcall(stepPlot, plot, step, mirroring)
-			if not ok and os.clock() - plot.LastWarn >= WARN_SECONDS then
-				plot.LastWarn = os.clock()
-				warn(("[PlotService] sanctum %d step failed: %s"):format(plot.Sanctum.Id, tostring(err)))
-			end
-		end
-	end
-end
-
 local function teardown(): ()
 	for _, connection in ipairs(connections) do connection:Disconnect() end
 	table.clear(connections)
@@ -227,7 +200,7 @@ function Service:Init(registry: any): ()
 	profiles = registry:Get("ProfileService")
 	economy = registry:Get("EconomyService")
 	remotes = registry:Get("RemoteService")
-	purchases = nil -- registered AFTER this service; resolved lazily in RebuildSanctum
+	purchases, evolution = nil, nil -- registered AFTER this service; resolved lazily in RebuildSanctum
 	links = PlotLinkController.new({
 		Remotes = remotes,
 		OnAccepted = function(sanctum: any, joiner: any)
@@ -237,7 +210,7 @@ function Service:Init(registry: any): ()
 	})
 	teardown() -- a re-Init must not leave the previous boot's models, runtimes or connections behind
 	PlotSession.bind(Service, plots, profiles, links)
-	accumulator, mirrorClock = 0, 0
+	ticker:Reset()
 	-- Rebuilt from scratch: a leftover folder would leave six abandoned Sanctums in the world, and
 	-- their pads would still answer a ProximityPrompt.
 	local previous = workspace:FindFirstChild(FOLDER_NAME)
@@ -284,7 +257,9 @@ function Service:Start(): ()
 			if plot ~= nil then Service:ResolveLink(player, plot.Sanctum, (payload :: any).Accept == true) end
 		end)
 	end
-	heartbeat = RunService.Heartbeat:Connect(tick)
+	heartbeat = RunService.Heartbeat:Connect(function(dt: number)
+		ticker:Step(dt)
+	end)
 	-- A Profile that loaded before Start (a boot-order edge, or a spec) still needs its Sanctum.
 	for _, player in ipairs(Players:GetPlayers()) do
 		if profiles:IsLoaded(player) then Service:ClaimEmpty(player) end

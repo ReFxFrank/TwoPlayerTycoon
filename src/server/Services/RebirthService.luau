@@ -20,6 +20,8 @@ local DropperData = require(Modules:WaitForChild("DropperData"))
 local Economy = require(Modules:WaitForChild("Economy"))
 local GameConfig = require(Modules:WaitForChild("GameConfig"))
 local RebirthData = require(Modules:WaitForChild("RebirthData"))
+
+local PrestigeAward = require(script.Parent.PrestigeAward)
 local StateSchema = require(Modules:WaitForChild("StateSchema"))
 
 type Connection = { Disconnect: (self: any) -> () }
@@ -122,25 +124,15 @@ function Service:Execute(sanctum: any): ()
 	local state = stateOf(sanctum)
 	if state == nil then return end
 	active[sanctum] = nil
+	-- The terminal ballot, sent FIRST so it survives any later error. Cancel was the only path
+	-- sending it, so a SUCCESSFUL vote used to leave both clients holding a scrim over a wiped
+	-- Sanctum, with the expiry timer finding active[sanctum] already cleared and cancelling nothing.
+	broadcast(sanctum, nil)
 	local occupants = occupantsOf(sanctum)
 	local banked = currency(state.LifetimeEssence) -- read BEFORE the reset zeroes it
 	for _, player in ipairs(occupants) do
 		local profile = if profiles ~= nil then profiles:Get(player) else nil
-		local prestige = if type(profile) == "table" then (profile :: any).Prestige else nil
-		if type(prestige) == "table" then
-			local rebirths = math.clamp(math.floor(currency(prestige.Rebirths)) + 1, 0, RebirthData.MaxTrackedRebirths)
-			prestige.Rebirths = rebirths
-			-- Recomputed, never incremented: the stored multiplier is a cache of the count, and one
-			-- bad write would otherwise become a permanent income bonus.
-			prestige.Multiplier = Economy.getPrestigeMultiplier(rebirths)
-			-- badgesFor returns the FULL earned set, so merging it in also self-heals an award lost
-			-- to a failed save. Merged into, never replaced: a hand-granted badge survives.
-			if type(prestige.Badges) ~= "table" then prestige.Badges = {} end
-			for id, earned in pairs(RebirthData.badgesFor(rebirths)) do
-				if earned then (prestige.Badges :: { [string]: boolean })[id] = true end
-			end
-			prestige.TotalTranscended = math.min(currency(prestige.TotalTranscended) + banked, MAX_CURRENCY)
-		end
+		PrestigeAward.pay(if type(profile) == "table" then (profile :: any).Prestige else nil, banked)
 	end
 
 	-- The Sanctum, not the players: Prestige lives in a different table precisely so a bug here

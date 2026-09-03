@@ -5309,6 +5309,7 @@ local Peers = script.Parent
 local PlotLinkController = require(Peers:WaitForChild("PlotLinkController"))
 local PlotRuntime = require(Peers:WaitForChild("PlotRuntime"))
 local PlotSession = require(Peers:WaitForChild("PlotSession"))
+local PlotTick = require(Peers:WaitForChild("PlotTick"))
 
 type Occupant = { UserId: number, Player: any, Slot: number, JoinedAt: number, Contribution: number, Vote: boolean? }
 type Sanctum = { Id: number, Model: Instance, State: any, Occupants: { [number]: Occupant },
@@ -5316,12 +5317,6 @@ type Sanctum = { Id: number, Model: Instance, State: any, Occupants: { [number]:
 type Plot = any -- PlotRuntime's object; typed there, and naming it here would be a require cycle
 type Connection = { Disconnect: (self: any) -> () }
 
--- Heartbeat is DECIMATED to GameConfig.Income.TickRate: DropperSystem's catch-up bound is sized off
--- a 0.1s step, and stepping six Sanctums at render rate buys nothing a Mote's flight can show.
-local STEP_INTERVAL = 1 / math.max(1, GameConfig.Income.TickRate)
-local MAX_STEP = 0.5 -- after a hitch the banked dt would teleport every Mote to the Font in one frame
-local MIRROR_SECONDS = 1 -- how often a dirty Sanctum is copied into its occupants' Profiles
-local WARN_SECONDS = 10 -- throttle on the per-Sanctum step-failure warning
 local FOLDER_NAME = "Sanctums"
 
 local Service = {}
@@ -5338,8 +5333,9 @@ local byId: { [number]: Plot } = {}
 local connections: { Connection } = {}
 local heartbeat: Connection? = nil
 local links: any, profiles: any, economy: any, remotes: any = nil, nil, nil, nil
-local purchases: any, registryRef: any = nil, nil
-local accumulator, mirrorClock = 0, 0
+local purchases: any, evolution: any, registryRef: any = nil, nil, nil
+-- The one loop. Built at module scope alongside `plots`, which it holds by reference.
+local ticker = PlotTick.new(plots, PlotSession)
 
 --[[ Resolves a caller's Sanctum back to the plot that owns it. The IDENTITY check matters: a spec
      fixture (or a stale reference to a rebuilt plot) can share an Id with a live Sanctum, and
@@ -5411,6 +5407,15 @@ function Service:RebuildSanctum(sanctum: any): ()
 	if purchases ~= nil and type(purchases.RefreshPads) == "function" then
 		purchases:RefreshPads(plot.Sanctum)
 	end
+	--[[ Stage-derived presentation, re-asserted here rather than at each caller: attune, affinity and
+	     rebirth applied it themselves but the CLAIM path never did, so a returning Stage 4 player got
+	     a Stage 1 Conflux and Stage 1 walk speed all session. Doing it here is also ordering-proof --
+	     claim fires OccupantAdded before the save is adopted, and this runs after both. ]]
+	if evolution == nil and registryRef ~= nil then evolution = registryRef:TryGet("EvolutionService") end
+	if evolution ~= nil then
+		evolution:ApplyStageVisuals(plot.Sanctum)
+		evolution:ApplyStageStats(plot.Sanctum)
+	end
 	Service:MarkDirty(plot.Sanctum)
 end
 
@@ -5460,38 +5465,6 @@ function Service:ClearMotes(sanctum: any): ()
 	if plot ~= nil then plot:ClearMotes() end
 end
 
---[[ The one loop -- one connection for the WHOLE service, never one per Sanctum. ]]
-
-local function stepPlot(plot: Plot, dt: number, mirroring: boolean): ()
-	plot:Step(dt)
-	-- Cheap and non-yielding, so it rides the income tick: any save (autosave, release, shutdown)
-	-- then finds a Profile at most MIRROR_SECONDS behind the live Sanctum, whoever triggered it.
-	if mirroring and plot.Sanctum.Dirty then PlotSession.mirrorOne(plot) end
-end
-
-local function tick(dt: any): ()
-	accumulator += if type(dt) == "number" and dt == dt then dt else 0
-	if accumulator < STEP_INTERVAL then return end
-	local step = math.min(accumulator, MAX_STEP)
-	accumulator = 0
-	mirrorClock += step
-	local mirroring = mirrorClock >= MIRROR_SECONDS
-	if mirroring then mirrorClock = 0 end
-	for _, plot in ipairs(plots) do
-		plot.Announced = false -- re-arm the coalesced SanctumChanged for this tick
-		if next(plot.Sanctum.Occupants) ~= nil then
-			--[[ Per-Sanctum pcall, not one around the whole loop: an error in plot 3 must not stop
-			     plots 4-6 earning, and an unguarded error would kill this connection for every
-			     player on the server for the rest of its life. ]]
-			local ok, err = pcall(stepPlot, plot, step, mirroring)
-			if not ok and os.clock() - plot.LastWarn >= WARN_SECONDS then
-				plot.LastWarn = os.clock()
-				warn(("[PlotService] sanctum %d step failed: %s"):format(plot.Sanctum.Id, tostring(err)))
-			end
-		end
-	end
-end
-
 local function teardown(): ()
 	for _, connection in ipairs(connections) do connection:Disconnect() end
 	table.clear(connections)
@@ -5513,7 +5486,7 @@ function Service:Init(registry: any): ()
 	profiles = registry:Get("ProfileService")
 	economy = registry:Get("EconomyService")
 	remotes = registry:Get("RemoteService")
-	purchases = nil -- registered AFTER this service; resolved lazily in RebuildSanctum
+	purchases, evolution = nil, nil -- registered AFTER this service; resolved lazily in RebuildSanctum
 	links = PlotLinkController.new({
 		Remotes = remotes,
 		OnAccepted = function(sanctum: any, joiner: any)
@@ -5523,7 +5496,7 @@ function Service:Init(registry: any): ()
 	})
 	teardown() -- a re-Init must not leave the previous boot's models, runtimes or connections behind
 	PlotSession.bind(Service, plots, profiles, links)
-	accumulator, mirrorClock = 0, 0
+	ticker:Reset()
 	-- Rebuilt from scratch: a leftover folder would leave six abandoned Sanctums in the world, and
 	-- their pads would still answer a ProximityPrompt.
 	local previous = workspace:FindFirstChild(FOLDER_NAME)
@@ -5570,7 +5543,9 @@ function Service:Start(): ()
 			if plot ~= nil then Service:ResolveLink(player, plot.Sanctum, (payload :: any).Accept == true) end
 		end)
 	end
-	heartbeat = RunService.Heartbeat:Connect(tick)
+	heartbeat = RunService.Heartbeat:Connect(function(dt: number)
+		ticker:Step(dt)
+	end)
 	-- A Profile that loaded before Start (a boot-order edge, or a spec) still needs its Sanctum.
 	for _, player in ipairs(Players:GetPlayers()) do
 		if profiles:IsLoaded(player) then Service:ClaimEmpty(player) end
@@ -5700,7 +5675,11 @@ local function beginGrace(plot: Plot): ()
 		-- reclaimed or taken by someone else simply finds a mismatch here and is left alone.
 		if plot.GraceToken ~= token or next(plot.Sanctum.Occupants) ~= nil then return end
 		plot:Reset()
-		owner:MarkDirty(plot.Sanctum)
+		-- RebuildSanctum, not MarkDirty: the wipe changes every price and lock state on the plot,
+		-- and MarkDirty only queues a snapshot. Without this the pads kept advertising the previous
+		-- pair's progress -- live, affordable-looking prompts on an emptied Sanctum -- until someone
+		-- claimed it, in full view of the whole server.
+		owner:RebuildSanctum(plot.Sanctum)
 	end)
 end
 
@@ -5797,7 +5776,10 @@ function PlotSession.release(player: any): ()
 		if links ~= nil then links:Cancel(plot.Sanctum.Id) end
 		beginGrace(plot)
 	end
-	owner:MarkDirty(plot.Sanctum)
+	-- A departure frees a slot, so the link pad's lock state is now wrong in both directions: it
+	-- stayed closed on a Sanctum that had room (the disconnect-and-rejoin case DECISIONS #6 protects)
+	-- and stayed open on one that had emptied. Only RebuildSanctum republishes pads.
+	owner:RebuildSanctum(plot.Sanctum)
 end
 
 --[[ ProfileService saves AND releases on PlayerRemoving, and its own handler is connected first
@@ -5882,6 +5864,127 @@ return PlotSession
         </Item>
         <Item class="ModuleScript" referent="35">
           <Properties>
+            <string name="Name">PlotTick</string>
+            <string name="Source"><![CDATA[--!strict
+--[[
+    PlotTick
+    The one income loop: a single decimated step that advances every occupied Sanctum and mirrors
+    dirty ones into their occupants' Profiles.
+
+    Split out of PlotService to keep that file inside the 300-line budget. It owns the two pieces of
+    clock state (the step accumulator and the mirror clock) so a restart cannot inherit a half-banked
+    tick from the previous boot.
+    Owner: server  |  Consumers: PlotService
+]]
+
+local Modules = game:GetService("ReplicatedStorage"):WaitForChild("Modules")
+local GameConfig = require(Modules:WaitForChild("GameConfig"))
+
+-- DECIMATED to GameConfig.Income.TickRate: DropperSystem's catch-up bound is sized off a 0.1s step,
+-- and stepping six Sanctums at render rate buys nothing a Mote's flight can show.
+local STEP_INTERVAL = 1 / math.max(1, GameConfig.Income.TickRate)
+local MAX_STEP = 0.5 -- after a hitch the banked dt would teleport every Mote to the Font in one frame
+local MIRROR_SECONDS = 1 -- how often a dirty Sanctum is copied into its occupants' Profiles
+local WARN_SECONDS = 10 -- throttle on the per-Sanctum step-failure warning
+
+local PlotTick = {}
+PlotTick.__index = PlotTick
+
+--- `plots` is the live list PlotService owns; `session` supplies mirrorOne.
+function PlotTick.new(plots: { any }, session: any)
+	return setmetatable({ _plots = plots, _session = session, _accumulator = 0, _mirrorClock = 0 }, PlotTick)
+end
+
+function PlotTick.Reset(self: any): ()
+	self._accumulator, self._mirrorClock = 0, 0
+end
+
+local function stepPlot(session: any, plot: any, dt: number, mirroring: boolean): ()
+	plot:Step(dt)
+	-- Cheap and non-yielding, so it rides the income tick: any save (autosave, release, shutdown)
+	-- then finds a Profile at most MIRROR_SECONDS behind the live Sanctum, whoever triggered it.
+	if mirroring and plot.Sanctum.Dirty then session.mirrorOne(plot) end
+end
+
+function PlotTick.Step(self: any, dt: any): ()
+	self._accumulator += if type(dt) == "number" and dt == dt then dt else 0
+	if self._accumulator < STEP_INTERVAL then return end
+	local step = math.min(self._accumulator, MAX_STEP)
+	self._accumulator = 0
+	self._mirrorClock += step
+	local mirroring = self._mirrorClock >= MIRROR_SECONDS
+	if mirroring then self._mirrorClock = 0 end
+	for _, plot in ipairs(self._plots) do
+		plot.Announced = false -- re-arm the coalesced SanctumChanged for this tick
+		if next(plot.Sanctum.Occupants) ~= nil then
+			--[[ Per-Sanctum pcall, not one around the whole loop: an error in plot 3 must not stop
+			     plots 4-6 earning, and an unguarded error would kill this connection for every
+			     player on the server for the rest of its life. ]]
+			local ok, err = pcall(stepPlot, self._session, plot, step, mirroring)
+			if not ok and os.clock() - plot.LastWarn >= WARN_SECONDS then
+				plot.LastWarn = os.clock()
+				warn(("[PlotService] sanctum %d step failed: %s"):format(plot.Sanctum.Id, tostring(err)))
+			end
+		end
+	end
+end
+
+return PlotTick
+]]></string>
+          </Properties>
+        </Item>
+        <Item class="ModuleScript" referent="36">
+          <Properties>
+            <string name="Name">PrestigeAward</string>
+            <string name="Source"><![CDATA[--!strict
+--[[
+    PrestigeAward
+    What a Transcendence pays one player: the rebirth count, the multiplier cached from it, the
+    milestone badges and the banked lifetime total.
+
+    Split out of RebirthService to keep that file inside the 300-line budget, and because this is the
+    only code in the game that writes the one thing a player cannot re-earn -- worth having behind a
+    single named function rather than inline in a 70-line Execute.
+    Owner: server  |  Consumers: RebirthService
+]]
+
+local Modules = game:GetService("ReplicatedStorage"):WaitForChild("Modules")
+local Economy = require(Modules:WaitForChild("Economy"))
+local RebirthData = require(Modules:WaitForChild("RebirthData"))
+
+local MAX_CURRENCY = 1e15
+
+local function currency(v: any): number
+	if type(v) ~= "number" or v ~= v or v == math.huge or v == -math.huge then return 0 end
+	return math.clamp(v, 0, MAX_CURRENCY)
+end
+
+local PrestigeAward = {}
+
+--- Credits one Transcendence to `prestige` (a Profile.Prestige table), banking `banked` essence.
+--- Total: a malformed or missing Prestige table is left alone rather than erroring mid-payout.
+function PrestigeAward.pay(prestige: any, banked: number): ()
+	if type(prestige) ~= "table" then return end
+	local rebirths = math.clamp(math.floor(currency(prestige.Rebirths)) + 1, 0, RebirthData.MaxTrackedRebirths)
+	prestige.Rebirths = rebirths
+	-- Recomputed, never incremented: the stored multiplier is a cache of the count, and one bad write
+	-- would otherwise become a permanent income bonus.
+	prestige.Multiplier = Economy.getPrestigeMultiplier(rebirths)
+	-- badgesFor returns the FULL earned set, so merging it in also self-heals an award lost to a
+	-- failed save. Merged into, never replaced: a hand-granted badge survives.
+	if type(prestige.Badges) ~= "table" then prestige.Badges = {} end
+	for id, earned in pairs(RebirthData.badgesFor(rebirths)) do
+		if earned then (prestige.Badges :: { [string]: boolean })[id] = true end
+	end
+	prestige.TotalTranscended = math.min(currency(prestige.TotalTranscended) + currency(banked), MAX_CURRENCY)
+end
+
+return PrestigeAward
+]]></string>
+          </Properties>
+        </Item>
+        <Item class="ModuleScript" referent="37">
+          <Properties>
             <string name="Name">ProfileLock</string>
             <string name="Source"><![CDATA[--!strict
 --[[
@@ -5942,7 +6045,7 @@ return ProfileLock
 ]]></string>
           </Properties>
         </Item>
-        <Item class="ModuleScript" referent="36">
+        <Item class="ModuleScript" referent="38">
           <Properties>
             <string name="Name">ProfileService</string>
             <string name="Source"><![CDATA[--!strict
@@ -6244,7 +6347,7 @@ return Service
 ]]></string>
           </Properties>
         </Item>
-        <Item class="ModuleScript" referent="37">
+        <Item class="ModuleScript" referent="39">
           <Properties>
             <string name="Name">PurchasePads</string>
             <string name="Source"><![CDATA[--!strict
@@ -6423,7 +6526,7 @@ return PurchasePads
 ]]></string>
           </Properties>
         </Item>
-        <Item class="ModuleScript" referent="38">
+        <Item class="ModuleScript" referent="40">
           <Properties>
             <string name="Name">PurchaseService</string>
             <string name="Source"><![CDATA[--!strict
@@ -6727,7 +6830,7 @@ return Service
 ]]></string>
           </Properties>
         </Item>
-        <Item class="ModuleScript" referent="39">
+        <Item class="ModuleScript" referent="41">
           <Properties>
             <string name="Name">RateLimiter</string>
             <string name="Source"><![CDATA[--!strict
@@ -6941,7 +7044,7 @@ return Service
 ]]></string>
           </Properties>
         </Item>
-        <Item class="ModuleScript" referent="40">
+        <Item class="ModuleScript" referent="42">
           <Properties>
             <string name="Name">RebirthService</string>
             <string name="Source"><![CDATA[--!strict
@@ -6966,6 +7069,8 @@ local DropperData = require(Modules:WaitForChild("DropperData"))
 local Economy = require(Modules:WaitForChild("Economy"))
 local GameConfig = require(Modules:WaitForChild("GameConfig"))
 local RebirthData = require(Modules:WaitForChild("RebirthData"))
+
+local PrestigeAward = require(script.Parent.PrestigeAward)
 local StateSchema = require(Modules:WaitForChild("StateSchema"))
 
 type Connection = { Disconnect: (self: any) -> () }
@@ -7068,25 +7173,15 @@ function Service:Execute(sanctum: any): ()
 	local state = stateOf(sanctum)
 	if state == nil then return end
 	active[sanctum] = nil
+	-- The terminal ballot, sent FIRST so it survives any later error. Cancel was the only path
+	-- sending it, so a SUCCESSFUL vote used to leave both clients holding a scrim over a wiped
+	-- Sanctum, with the expiry timer finding active[sanctum] already cleared and cancelling nothing.
+	broadcast(sanctum, nil)
 	local occupants = occupantsOf(sanctum)
 	local banked = currency(state.LifetimeEssence) -- read BEFORE the reset zeroes it
 	for _, player in ipairs(occupants) do
 		local profile = if profiles ~= nil then profiles:Get(player) else nil
-		local prestige = if type(profile) == "table" then (profile :: any).Prestige else nil
-		if type(prestige) == "table" then
-			local rebirths = math.clamp(math.floor(currency(prestige.Rebirths)) + 1, 0, RebirthData.MaxTrackedRebirths)
-			prestige.Rebirths = rebirths
-			-- Recomputed, never incremented: the stored multiplier is a cache of the count, and one
-			-- bad write would otherwise become a permanent income bonus.
-			prestige.Multiplier = Economy.getPrestigeMultiplier(rebirths)
-			-- badgesFor returns the FULL earned set, so merging it in also self-heals an award lost
-			-- to a failed save. Merged into, never replaced: a hand-granted badge survives.
-			if type(prestige.Badges) ~= "table" then prestige.Badges = {} end
-			for id, earned in pairs(RebirthData.badgesFor(rebirths)) do
-				if earned then (prestige.Badges :: { [string]: boolean })[id] = true end
-			end
-			prestige.TotalTranscended = math.min(currency(prestige.TotalTranscended) + banked, MAX_CURRENCY)
-		end
+		PrestigeAward.pay(if type(profile) == "table" then (profile :: any).Prestige else nil, banked)
 	end
 
 	-- The Sanctum, not the players: Prestige lives in a different table precisely so a bug here
@@ -7247,7 +7342,7 @@ return Service
 ]]></string>
           </Properties>
         </Item>
-        <Item class="ModuleScript" referent="41">
+        <Item class="ModuleScript" referent="43">
           <Properties>
             <string name="Name">RemoteService</string>
             <string name="Source"><![CDATA[--!strict
@@ -7551,7 +7646,7 @@ return Service
 ]]></string>
           </Properties>
         </Item>
-        <Item class="ModuleScript" referent="42">
+        <Item class="ModuleScript" referent="44">
           <Properties>
             <string name="Name">StateReplicator</string>
             <string name="Source"><![CDATA[--!strict
@@ -7809,11 +7904,11 @@ return Service
           </Properties>
         </Item>
       </Item>
-      <Item class="Folder" referent="43">
+      <Item class="Folder" referent="45">
         <Properties>
           <string name="Name">Systems</string>
         </Properties>
-        <Item class="ModuleScript" referent="44">
+        <Item class="ModuleScript" referent="46">
           <Properties>
             <string name="Name">BuildKit</string>
             <string name="Source"><![CDATA[--!strict
@@ -7909,7 +8004,7 @@ return BuildKit
 ]]></string>
           </Properties>
         </Item>
-        <Item class="ModuleScript" referent="45">
+        <Item class="ModuleScript" referent="47">
           <Properties>
             <string name="Name">DropperSystem</string>
             <string name="Source"><![CDATA[--!strict
@@ -8109,7 +8204,7 @@ return DropperSystem
 ]]></string>
           </Properties>
         </Item>
-        <Item class="ModuleScript" referent="46">
+        <Item class="ModuleScript" referent="48">
           <Properties>
             <string name="Name">MoteSystem</string>
             <string name="Source"><![CDATA[--!strict
@@ -8391,7 +8486,7 @@ return MoteSystem
 ]]></string>
           </Properties>
         </Item>
-        <Item class="ModuleScript" referent="47">
+        <Item class="ModuleScript" referent="49">
           <Properties>
             <string name="Name">PlotBuilder</string>
             <string name="Source"><![CDATA[--!strict
@@ -8675,7 +8770,7 @@ return PlotBuilder
       </Item>
     </Item>
   </Item>
-  <Item class="SoundService" referent="48">
+  <Item class="SoundService" referent="50">
     <Properties>
       <string name="Name">SoundService</string>
       <token name="AmbientReverb">11</token>
@@ -8685,19 +8780,19 @@ return PlotBuilder
       <float name="RolloffScale">1</float>
     </Properties>
   </Item>
-  <Item class="StarterPlayer" referent="49">
+  <Item class="StarterPlayer" referent="51">
     <Properties>
       <string name="Name">StarterPlayer</string>
     </Properties>
-    <Item class="StarterPlayerScripts" referent="50">
+    <Item class="StarterPlayerScripts" referent="52">
       <Properties>
         <string name="Name">StarterPlayerScripts</string>
       </Properties>
-      <Item class="Folder" referent="51">
+      <Item class="Folder" referent="53">
         <Properties>
           <string name="Name">Client</string>
         </Properties>
-        <Item class="LocalScript" referent="52">
+        <Item class="LocalScript" referent="54">
           <Properties>
             <string name="Name">ClientBootstrap</string>
             <string name="Source"><![CDATA[--!strict
@@ -8858,11 +8953,11 @@ player.CharacterAdded:Connect(requestSnapshot)
 ]]></string>
           </Properties>
         </Item>
-        <Item class="Folder" referent="53">
+        <Item class="Folder" referent="55">
           <Properties>
             <string name="Name">Controllers</string>
           </Properties>
-          <Item class="ModuleScript" referent="54">
+          <Item class="ModuleScript" referent="56">
             <Properties>
               <string name="Name">AffinityController</string>
               <string name="Source"><![CDATA[--!strict
@@ -9126,7 +9221,7 @@ return Controller
 ]]></string>
             </Properties>
           </Item>
-          <Item class="ModuleScript" referent="55">
+          <Item class="ModuleScript" referent="57">
             <Properties>
               <string name="Name">EvolutionFxController</string>
               <string name="Source"><![CDATA[--!strict
@@ -9422,7 +9517,7 @@ return Controller
 ]]></string>
             </Properties>
           </Item>
-          <Item class="ModuleScript" referent="56">
+          <Item class="ModuleScript" referent="58">
             <Properties>
               <string name="Name">HudController</string>
               <string name="Source"><![CDATA[--!strict
@@ -9646,7 +9741,7 @@ return Controller
 ]]></string>
             </Properties>
           </Item>
-          <Item class="ModuleScript" referent="57">
+          <Item class="ModuleScript" referent="59">
             <Properties>
               <string name="Name">NotifyController</string>
               <string name="Source"><![CDATA[--!strict
@@ -9874,7 +9969,7 @@ return Controller
 ]]></string>
             </Properties>
           </Item>
-          <Item class="ModuleScript" referent="58">
+          <Item class="ModuleScript" referent="60">
             <Properties>
               <string name="Name">PadVerdict</string>
               <string name="Source"><![CDATA[--!strict
@@ -10030,7 +10125,7 @@ return PadVerdict
 ]]></string>
             </Properties>
           </Item>
-          <Item class="ModuleScript" referent="59">
+          <Item class="ModuleScript" referent="61">
             <Properties>
               <string name="Name">PromptController</string>
               <string name="Source"><![CDATA[--!strict
@@ -10288,7 +10383,7 @@ return Controller
 ]]></string>
             </Properties>
           </Item>
-          <Item class="ModuleScript" referent="60">
+          <Item class="ModuleScript" referent="62">
             <Properties>
               <string name="Name">RebirthController</string>
               <string name="Source"><![CDATA[--!strict
@@ -10580,7 +10675,7 @@ return Controller
 ]]></string>
             </Properties>
           </Item>
-          <Item class="ModuleScript" referent="61">
+          <Item class="ModuleScript" referent="63">
             <Properties>
               <string name="Name">SettingsController</string>
               <string name="Source"><![CDATA[--!strict
@@ -10813,7 +10908,7 @@ return Controller
 ]]></string>
             </Properties>
           </Item>
-          <Item class="ModuleScript" referent="62">
+          <Item class="ModuleScript" referent="64">
             <Properties>
               <string name="Name">SoundController</string>
               <string name="Source"><![CDATA[--!strict
@@ -11014,7 +11109,7 @@ return Controller
 ]]></string>
             </Properties>
           </Item>
-          <Item class="ModuleScript" referent="63">
+          <Item class="ModuleScript" referent="65">
             <Properties>
               <string name="Name">UiBuilder</string>
               <string name="Source"><![CDATA[--!strict
@@ -11299,7 +11394,7 @@ return UiBuilder
 ]]></string>
             </Properties>
           </Item>
-          <Item class="ModuleScript" referent="64">
+          <Item class="ModuleScript" referent="66">
             <Properties>
               <string name="Name">UiModals</string>
               <string name="Source"><![CDATA[--!strict
@@ -11507,7 +11602,7 @@ return UiModals
       </Item>
     </Item>
   </Item>
-  <Item class="Workspace" referent="65">
+  <Item class="Workspace" referent="67">
     <Properties>
       <string name="Name">Workspace</string>
       <float name="FallenPartsDestroyHeight">-150</float>

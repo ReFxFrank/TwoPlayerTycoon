@@ -109,7 +109,11 @@ local function beginGrace(plot: Plot): ()
 		-- reclaimed or taken by someone else simply finds a mismatch here and is left alone.
 		if plot.GraceToken ~= token or next(plot.Sanctum.Occupants) ~= nil then return end
 		plot:Reset()
-		owner:MarkDirty(plot.Sanctum)
+		-- RebuildSanctum, not MarkDirty: the wipe changes every price and lock state on the plot,
+		-- and MarkDirty only queues a snapshot. Without this the pads kept advertising the previous
+		-- pair's progress -- live, affordable-looking prompts on an emptied Sanctum -- until someone
+		-- claimed it, in full view of the whole server.
+		owner:RebuildSanctum(plot.Sanctum)
 	end)
 end
 
@@ -206,7 +210,10 @@ function PlotSession.release(player: any): ()
 		if links ~= nil then links:Cancel(plot.Sanctum.Id) end
 		beginGrace(plot)
 	end
-	owner:MarkDirty(plot.Sanctum)
+	-- A departure frees a slot, so the link pad's lock state is now wrong in both directions: it
+	-- stayed closed on a Sanctum that had room (the disconnect-and-rejoin case DECISIONS #6 protects)
+	-- and stayed open on one that had emptied. Only RebuildSanctum republishes pads.
+	owner:RebuildSanctum(plot.Sanctum)
 end
 
 --[[ ProfileService saves AND releases on PlayerRemoving, and its own handler is connected first
