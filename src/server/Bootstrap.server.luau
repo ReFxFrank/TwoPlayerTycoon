@@ -116,6 +116,13 @@ else
 	warn("[Bootstrap] profile will be written -- which is deliberate: a half-booted server would")
 	warn("[Bootstrap] mirror broken state into real players' saves.")
 	warn("==================================================================")
+	--[[ ...and this is what MAKES the paragraph above true. Without it, every service whose Start
+	     already succeeded stays live: ProfileService keeps admitting players and autosaving,
+	     PlotService keeps its Heartbeat and claim hook, PurchaseService's prompts still fire. The
+	     server would go on taking sessions and writing profiles for its whole lifetime -- exactly
+	     the outcome the banner promises is prevented. StopAll pcalls every Stop and never re-raises,
+	     so it cannot mask the boot error, and it makes the BindToClose above a no-op. ]]
+	registry:StopAll()
 	--[[ Re-raised last, once the warnings are out and BindToClose is bound. Roblox's error telemetry
 	     reports errors, not warnings, so without this a broken deploy is invisible on the dashboard;
 	     and raising from the entry point is the closest thing available to refusing to start. ]]

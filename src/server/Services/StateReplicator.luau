@@ -91,7 +91,11 @@ end
 --[[ ONE payload per player, not one per Sanctum: a full snapshot carries `IsYou` on each occupant
      and a private `You` block (that player's badges, settings and lifetime earnings), so two
      occupants of the same Sanctum must never be sent the same table. ]]
-local function pushFull(sanctum: any, players: { Player }): ()
+--[[ `players` is the GATHER set (whose Profiles and Names go into the snapshot) and `recipients` is
+     the SEND set. They are the same for a broadcast, but NOT for PushTo: gathering only the
+     requester rendered every partner as 0 rebirths, because Snapshot falls back to an empty
+     Prestige for any occupant missing from opts.Profiles. ]]
+local function pushFull(sanctum: any, players: { Player }, recipients: { Player }?): ()
 	local profileById, nameById = gather(players)
 	local opts = {
 		Full = true,
@@ -103,7 +107,7 @@ local function pushFull(sanctum: any, players: { Player }): ()
 		-- the whole upgrade catalogue once per occupant per push.
 		Multipliers = economy:GetMultipliers(sanctum),
 	}
-	for _, player in ipairs(players) do
+	for _, player in ipairs(recipients or players) do
 		remotes:FireClient(player, "StateSync", Snapshot.forClient(sanctum, player, opts))
 	end
 end
@@ -125,7 +129,9 @@ function Service:PushTo(player: any): ()
 	tickCount += 1
 	local sanctum = if plots ~= nil then plots:GetSanctumForPlayer(player) else nil
 	if sanctum ~= nil then
-		pushFull(sanctum, { player :: Player })
+		-- Gather from the WHOLE Sanctum, send only to the requester: the partner's prestige has to
+		-- come from their profile, but this push is a reply to one client.
+		pushFull(sanctum, plots:GetOccupants(sanctum), { player :: Player })
 		return
 	end
 	--[[ No Sanctum yet -- the profile is still loading, every plot is full, or their plot's grace

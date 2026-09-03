@@ -22,15 +22,24 @@ local firstDropper = DropperData.List[1]
 --- Fresh service instances on a clean world. ProfileService only resolves DataStoreWrapper.
 local function boot()
     local wrapper = loadModule("ServerScriptService/Core/Services/DataStoreWrapper")
+    local limiter = loadModule("ServerScriptService/Core/Services/RateLimiter")
+    local remotes = loadModule("ServerScriptService/Core/Services/RemoteService")
     local profiles = loadModule("ServerScriptService/Core/Services/ProfileService")
+    -- RemoteService is a HARD dependency: ProfileService owns the SetSetting and ResetData remotes,
+    -- and resolving it leniently would let those go back to being silent no-ops.
+    limiter:Init({})
+    limiter:Start()
+    remotes:Init({ Get = function() return limiter end })
+    remotes:Start()
     profiles:Init({
         Get = function(_, name)
             if name == "DataStoreWrapper" then return wrapper end
+            if name == "RemoteService" then return remotes end
             error("unexpected dependency " .. tostring(name), 0)
         end,
     })
     profiles:Start()
-    return profiles, wrapper
+    return profiles, wrapper, remotes
 end
 
 local function rawStore()
@@ -382,13 +391,10 @@ end)
 
 t.test("a player already in game when Start runs is admitted too", function()
     -- A fresh server can fill before the first Heartbeat, so the connection alone is not enough.
-    local wrapper = loadModule("ServerScriptService/Core/Services/DataStoreWrapper")
-    local profiles = loadModule("ServerScriptService/Core/Services/ProfileService")
     local early = Mock.addPlayer("Early", 777)
-    profiles:Init({ Get = function() return wrapper end })
-    profiles:Start()
+    local ProfileService = boot() -- Init/Start run with the player already present
     Mock.advance(1)
-    t.truthy(profiles:IsLoaded(early), "the join beat the script and was still picked up")
+    t.truthy(ProfileService:IsLoaded(early), "the join beat the script and was still picked up")
 end)
 
 t.test("a player whose lock is held elsewhere is kicked, not given a blank profile", function()

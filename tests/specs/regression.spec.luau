@@ -157,3 +157,144 @@ t.test("a sanctum wiped by the grace timer stops advertising the old pair's prog
     t.neq(pad:GetAttribute("PadCost"), costWhileOwned,
         "the pad still quoted the price for a wellspring count that no longer exists")
 end)
+
+t.test("every client-to-server remote has a server handler", function()
+    -- The structural guard. SetSetting and ResetData were both declared, validated, rate-limited,
+    -- wired on the client -- and had no handler at all, so every click died as a counted rejection.
+    -- Nothing failed; the features were simply inert. A per-remote test would not have found it,
+    -- because there was no code to test.
+    local RemoteSchema = loadModule("ReplicatedStorage/Modules/RemoteSchema")
+    local services = bootServer()
+    local ash = joinPlayer("Ash", 1)
+
+    local payloads = {
+        RequestSnapshot = nil,
+        RebirthVote = { Accept = false },
+        ChooseAffinity = { Affinity = "ember" },
+        SetSetting = { Key = "Music", Value = true },
+        LinkResponse = { PlotId = 1, Accept = false },
+        ResetData = { Confirm = true },
+    }
+    for _, def in ipairs(RemoteSchema.List) do
+        if def.Direction == "ClientToServer" then
+            services.RemoteService:ResetRejectionStats()
+            Mock.fireServer(def.Name, ash, payloads[def.Name])
+            Mock.advance(0.2)
+            local stats = services.RemoteService:GetRejectionStats()[ash.UserId]
+            local rejected = stats ~= nil and (stats[def.Name] or 0) or 0
+            t.eq(rejected, 0, ("%s was rejected -- most likely it has no handler"):format(def.Name))
+            Mock.advance(def.RateLimit.Interval * 2)
+        end
+    end
+end)
+
+t.test("the Music and Sfx toggles actually change the saved setting", function()
+    local services = bootServer()
+    local ash = joinPlayer("Ash", 1)
+    t.truthy(services.ProfileService:Get(ash).Settings.Music, "settings default on")
+
+    Mock.fireServer("SetSetting", ash, { Key = "Music", Value = false })
+    Mock.advance(0.2)
+    t.falsy(services.ProfileService:Get(ash).Settings.Music, "the click reached the profile")
+
+    Mock.advance(2)
+    -- A setting is per-PLAYER, so it never dirties a Sanctum and no periodic full push would carry
+    -- it. The handler pushes explicitly, or the toggle's label would sit stale until the next
+    -- income tick happened to dirty the plot. Clear FIRST so we only see that push.
+    Mock.clearOutbox()
+    Mock.fireServer("SetSetting", ash, { Key = "Sfx", Value = false })
+    Mock.advance(0.2)
+    t.falsy(services.ProfileService:Get(ash).Settings.Sfx)
+    local pushes = Mock.outboxFor("StateSync", ash)
+    local full
+    for index = #pushes, 1, -1 do
+        local payload = pushes[index].Args[1]
+        if type(payload) == "table" and payload.Full then full = payload break end
+    end
+    t.truthy(full, "the change was pushed immediately, not left to the next dirty tick")
+    t.falsy(full.You.Settings.Music, "and the payload carries the new settings")
+    t.falsy(full.You.Settings.Sfx)
+end)
+
+t.test("the data reset is refused on a live server and works in Studio", function()
+    local GameConfigLive = loadModule("ReplicatedStorage/Modules/GameConfig")
+    t.truthy(GameConfigLive.Debug.DataResetStudioOnly, "the shipping config is Studio-only")
+
+    local services = bootServer()
+    local ash = joinPlayer("Ash", 1)
+    services.EconomyService:Credit(services.PlotService:GetSanctumForPlayer(ash), 5000)
+    services.PlotService:SaveAll(false)
+    Mock.advance(0.5)
+    t.gt(services.ProfileService:Get(ash).Plot.Essence, 0)
+
+    -- Live server: the client hiding the button is a courtesy; THIS is the control.
+    Mock.Services.context.Studio = false
+    Mock.fireServer("ResetData", ash, { Confirm = true })
+    Mock.advance(0.5)
+    t.gt(services.ProfileService:Get(ash).Plot.Essence, 0, "an irreversible action must not be live")
+
+    Mock.Services.context.Studio = true
+    Mock.advance(GameConfigLive.Save.AutosaveSeconds)
+    Mock.fireServer("ResetData", ash, { Confirm = true })
+    Mock.advance(0.5)
+    t.eq(services.ProfileService:Get(ash).Plot.Essence, 0, "but must still work while developing")
+end)
+
+t.test("a requested snapshot reports the partner's real prestige", function()
+    -- pushFull's single argument was doing two jobs: the gather set (whose profiles fill the
+    -- snapshot) and the send set. PushTo narrowed it to the requester, so a veteran partner
+    -- rendered as a fresh account -- on the exact path the client uses to recover its HUD.
+    local StateSchema = loadModule("ReplicatedStorage/Modules/StateSchema")
+    local profile = StateSchema.newProfile()
+    profile.Prestige.Rebirths = 7
+    game:GetService("DataStoreService"):GetDataStore(GameConfig.Save.DataStoreName)
+        :SetAsync(GameConfig.Save.KeyPrefix .. "2", { Data = profile })
+
+    local services = bootServer()
+    local ash = joinPlayer("Ash", 1)
+    local bree = joinPlayer("Bree", 2)
+    local host = services.PlotService:GetSanctumForPlayer(ash)
+    linkUp(services, host, bree, ash)
+    t.eq(services.ProfileService:Get(bree).Prestige.Rebirths, 7)
+
+    Mock.clearOutbox()
+    Mock.fireServer("RequestSnapshot", ash, nil)
+    Mock.advance(0.2)
+    local pushes = Mock.outboxFor("StateSync", ash)
+    local payload = pushes[#pushes].Args[1]
+    t.truthy(payload.Full, "RequestSnapshot returns a full snapshot")
+    local partner
+    for _, occupant in ipairs(payload.Occupants) do
+        if occupant.UserId == bree.UserId then partner = occupant end
+    end
+    t.truthy(partner, "the partner is in the roster")
+    t.eq(partner.Rebirths, 7, "a veteran partner must not read as a fresh account")
+    t.gt(partner.Multiplier, 1)
+end)
+
+t.test("a failed boot stops taking sessions instead of running half a game", function()
+    -- Bootstrap's own failure banner promises \"no profile will be written\". That was false: every
+    -- service whose Start had already succeeded stayed live, so the server kept admitting players
+    -- and autosaving for its whole lifetime.
+    local Registry = loadModule("ServerScriptService/Core/ServiceRegistry")
+    local registry = Registry.new()
+    local started = { Stopped = false }
+    registry:Register("Fine", {
+        Name = "Fine",
+        Init = function() end,
+        Start = function() started.Running = true end,
+        Stop = function() started.Stopped = true end,
+    })
+    registry:Register("Broken", {
+        Name = "Broken",
+        Init = function() end,
+        Start = function() error("boom", 0) end,
+    })
+    registry:InitAll()
+    t.throws(function() registry:StartAll() end, "a failed Start is fatal")
+    t.truthy(started.Running, "the earlier service really did start")
+
+    -- This is what Bootstrap now does in its failure branch.
+    t.noThrow(function() registry:StopAll() end, "teardown must never mask the boot error")
+    t.truthy(started.Stopped, "and it actually stopped what had started")
+end)

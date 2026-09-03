@@ -11,6 +11,7 @@
 ]]
 
 local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
 
 local Modules = game:GetService("ReplicatedStorage"):WaitForChild("Modules")
 local GameConfig = require(Modules:WaitForChild("GameConfig"))
@@ -18,6 +19,7 @@ local Signal = require(Modules:WaitForChild("Signal"))
 local StateSchema = require(Modules:WaitForChild("StateSchema"))
 
 local ProfileLock = require(script.Parent.ProfileLock)
+local ProfileRemotes = require(script.Parent.ProfileRemotes)
 
 type Profile = StateSchema.Profile
 type Lock = { JobId: string, Stamp: number }
@@ -61,7 +63,7 @@ Service.ProfileReleasing = Signal.new()
 
 local entries: { [Player]: Entry } = {}
 local connections: { Connection } = {}
-local wrapper: any = nil -- DataStoreWrapper, resolved in Init
+local wrapper: any, remotes: any, registryRef: any = nil, nil, nil -- DataStoreWrapper, resolved in Init
 local running = false
 -- Own RNG so autosave jitter never perturbs the global math.random sequence mote paths and other
 -- systems draw from, which would make their tests non-reproducible.
@@ -236,6 +238,9 @@ end
 
 function Service:Init(registry: any): ()
 	wrapper = registry:Get("DataStoreWrapper") -- resolved only: section 6 forbids calls during Init
+	-- Get, not TryGet: this service owns the SetSetting/ResetData remotes, and a lenient resolve
+	-- would let them silently become no-ops again. registryRef is for ProfileRemotes' lazy peer.
+	remotes, registryRef = registry:Get("RemoteService"), registry
 	running = false
 	-- Rebuilt: a re-Init inheriting entries would leave two autosave loops writing through one lock.
 	entries = {}
@@ -259,6 +264,7 @@ end
 
 function Service:Start(): ()
 	running = true
+	ProfileRemotes.register(remotes, Service, function(player: any) return entries[player] end, registryRef)
 	table.insert(connections, Players.PlayerAdded:Connect(function(player: Player)
 		task.spawn(admit, player) -- LoadAsync yields; PlayerAdded must not block on a DataStore
 	end))
