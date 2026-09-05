@@ -14,7 +14,8 @@ local function bootServer()
     runScript("ServerScriptService/Core/Bootstrap")
     Mock.advance(0.5)
     local services = {}
-    for _, name in ipairs({ "ProfileService", "PlotService", "EconomyService", "RemoteService" }) do
+    for _, name in ipairs({ "ProfileService", "PlotService", "EconomyService", "RemoteService",
+        "EvolutionService", "PurchaseService" }) do
         services[name] = loadModule("ServerScriptService/Core/Services/" .. name)
     end
     return services
@@ -227,4 +228,85 @@ t.test("pads on another player's sanctum are not rendered from your wallet", fun
         "the server publishes each pad from its own sanctum's state")
     t.falsy(prompt.ActionText:find("Can't") == nil and prompt.ActionText:find("afford") ~= nil,
         "and the client must not overwrite it with a verdict from our wallet")
+end)
+
+t.test("a live link offer is never buried under another modal", function()
+    -- Every modal is a full-screen Active backdrop over an opaque panel at the same position, so
+    -- two open at once means one is completely covered -- clicks included. They shared a ZIndex, so
+    -- sibling build order decided, and LinkOffer was built first. The Affinity modal opens itself
+    -- at Stage 3 and stays open until an element is bound, which made this reachable.
+    local services = bootServer()
+    local ash = Mock.addPlayer("Ash", 1)
+    local bree = Mock.addPlayer("Bree", 2)
+    Mock.advance(1)
+    local screenGui = bootClient(ash)
+
+    local link = findModal(screenGui, "LinkOffer")
+    local affinity = findModal(screenGui, "Affinity")
+    local transcend = findModal(screenGui, "Transcend")
+    local settings = findModal(screenGui, "Settings")
+    for _, modal in ipairs({ link, affinity, transcend, settings }) do
+        t.truthy(modal, "every modal exists")
+    end
+
+    -- No two modals may tie, or draw order silently falls back to build order.
+    local seen = {}
+    for _, modal in ipairs({ link, affinity, transcend, settings }) do
+        t.falsy(seen[modal.ZIndex], ("%s ties with %s on ZIndex %d")
+            :format(modal.Name, tostring(seen[modal.ZIndex]), modal.ZIndex))
+        seen[modal.ZIndex] = modal.Name
+    end
+
+    -- The two that expire on a clock must outrank the two that wait.
+    t.gt(link.ZIndex, affinity.ZIndex, "a link offer expires in 30s; the affinity choice does not")
+    t.gt(link.ZIndex, settings.ZIndex)
+    t.gt(transcend.ZIndex, affinity.ZIndex, "a running vote outranks a standing choice")
+
+    -- And it holds in practice, with both surfaces genuinely open at once.
+    local host = services.PlotService:GetSanctumForPlayer(ash)
+    host.State.Stage = 3
+    services.EconomyService:RefreshMultipliers(host)
+    services.PlotService:MarkDirty(host)
+    Mock.advance(2)
+    services.PlotService:RequestLink(bree, host)
+    Mock.advance(0.5)
+    t.truthy(link.Visible, "the offer is showing")
+    if affinity.Visible then
+        t.gt(link.ZIndex, affinity.ZIndex, "and is drawn over the affinity modal, not under it")
+    end
+end)
+
+t.test("the affinity selection does not survive a transcendence", function()
+    -- The gate closing with nothing chosen is exactly what a Transcendence produces. A nil-guard
+    -- left the previous run's element selected, so the next run's modal opened pre-highlighted on a
+    -- choice the pair never made, with a live "bind it forever" button.
+    local services = bootServer()
+    local ash = Mock.addPlayer("Ash", 1)
+    Mock.advance(1)
+    local screenGui = bootClient(ash)
+    local sanctum = services.PlotService:GetSanctumForPlayer(ash)
+
+    local AffinityData = loadModule("ReplicatedStorage/Modules/AffinityData")
+    local chosen = AffinityData.List[1].Id
+    sanctum.State.Stage = 3
+    services.EvolutionService:ChooseAffinity(ash, sanctum, chosen)
+    services.PlotService:MarkDirty(sanctum)
+    Mock.advance(2)
+
+    local modal = findModal(screenGui, "Affinity")
+    local confirm
+    for _, descendant in ipairs(modal:GetDescendants()) do
+        if descendant:IsA("TextButton") and descendant.Name == "Confirm" then confirm = descendant end
+    end
+    t.truthy(confirm)
+
+    -- Now transcend the run away: stage back to 1, affinity cleared.
+    sanctum.State.Stage = 1
+    sanctum.State.Affinity = nil
+    services.PlotService:MarkDirty(sanctum)
+    Mock.advance(2)
+
+    t.eq(confirm.Text, "Pick an element",
+        "the button must not offer to bind an element the new run never selected")
+    t.falsy(confirm.Active)
 end)

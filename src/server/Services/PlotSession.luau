@@ -114,6 +114,9 @@ local function beginGrace(plot: Plot): ()
 		-- pair's progress -- live, affordable-looking prompts on an emptied Sanctum -- until someone
 		-- claimed it, in full view of the whole server.
 		owner:RebuildSanctum(plot.Sanctum)
+		-- The one moment a plot genuinely becomes free, and so the one place it is safe to hand it
+		-- to someone the server turned away earlier.
+		owner:SweepUnclaimed()
 	end)
 end
 

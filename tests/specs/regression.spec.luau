@@ -364,3 +364,49 @@ t.test("a disconnect during a DataStore outage leaves no ghost either", function
     t.falsy(services.ProfileService:IsLoaded(ghost))
     t.eq(services.PlotService:GetSanctumForPlayer(ghost), nil)
 end)
+
+t.test("a player turned away from a full server is given a plot when one frees up", function()
+    -- ClaimEmpty was reached only from the one-shot ProfileLoaded handler and the boot sweep. There
+    -- is no client claim remote, and an empty Sanctum cannot be linked into, so a player who joined
+    -- one second too early sat in the lobby for the entire session while a plot stood free.
+    local services = bootServer()
+    local occupants = {}
+    for index = 1, GameConfig.Plot.SanctumCount do
+        occupants[index] = joinPlayer("P" .. index, 900 + index)
+    end
+    local late = joinPlayer("Late", 999)
+    t.eq(services.PlotService:GetSanctumForPlayer(late), nil, "the server really was full")
+
+    Mock.removePlayer(occupants[1])
+    Mock.advance(GameConfig.Plot.ReleaseGraceSeconds + 5)
+    t.truthy(services.PlotService:GetSanctumForPlayer(late),
+        "the freed plot must reach the player who was waiting for it")
+end)
+
+t.test("the developer data reset clears the live sanctum, not just the profile", function()
+    -- Re-announcing ProfileLoaded cannot blank the plot: PlotSession.claim is idempotent, so a
+    -- settled player is handed their existing Sanctum back without re-adopting. The reset appeared
+    -- to work and the next mirror wrote the old plot straight back over the fresh profile.
+    local services = bootServer()
+    local ash = joinPlayer("Ash", 1)
+    local sanctum = services.PlotService:GetSanctumForPlayer(ash)
+    services.EconomyService:Credit(sanctum, 250000)
+    sanctum.State.Stage = 4
+    services.PlotService:SaveAll(false)
+    Mock.advance(1)
+
+    Mock.Services.context.Studio = true
+    Mock.fireServer("ResetData", ash, { Confirm = true })
+    Mock.advance(1)
+
+    t.eq(services.ProfileService:Get(ash).Plot.Essence, 0, "the profile was reset")
+    local live = services.PlotService:GetSanctumForPlayer(ash)
+    t.eq(live.State.Stage, 1, "and so was the sanctum standing in the world")
+    t.lt(live.State.Essence, 250000)
+
+    -- The real test: let the mirror run. A reset that undoes itself is worse than none.
+    Mock.advance(GameConfig.Save.AutosaveSeconds + GameConfig.Save.AutosaveJitter + 5)
+    t.lt(services.ProfileService:Get(ash).Plot.Essence, 250000,
+        "the old plot must not be written back over the fresh profile")
+    t.eq(services.ProfileService:Get(ash).Plot.Stage, 1)
+end)

@@ -234,9 +234,11 @@ function Controller:Start(): ()
 		-- surface is done, and the confirmation of it came from the server, not from the click.
 		pendingToken += 1
 		modal.Root.Visible = false
-		if chosen ~= nil then
-			setSelected(chosen)
-		end
+		-- Unconditional, including nil. A Transcendence closes this gate with nothing chosen, and
+		-- the nil-guard that used to be here left the previous run's element selected: the next
+		-- run's modal opened pre-highlighted on a choice the pair never made, with a live
+		-- "Bind <element> forever" button. setSelected(nil) is the Init state, so this is safe.
+		setSelected(chosen)
 	end))
 end
 

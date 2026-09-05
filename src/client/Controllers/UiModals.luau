@@ -24,11 +24,23 @@ local UiModals = {}
 --[[ Backdrop + panel + title + body + a Content frame + a Confirm/Cancel row.
      The backdrop is Active so it swallows clicks aimed at the world behind it: a modal that can be
      clicked through is a modal a player can dismiss by accident. ]]
+--[[ LAYERS. Every modal is a full-screen Active backdrop with an opaque panel at the same position,
+     so two open at once means one is completely buried -- backdrop included, which swallows the
+     clicks. Sharing a ZIndex made sibling build order decide that, and LinkOffer was built first,
+     so a live link offer sat under any other modal. The Affinity surface opens itself at Stage 3
+     and stays open until an element is bound, so this was reachable rather than theoretical.
+
+     Ordered by URGENCY instead: the two that expire on a clock outrank the two that wait. Under
+     ZIndexBehavior.Sibling a descendant always draws in front of its own ancestors and ZIndex only
+     sorts against siblings, so ordering the four ROOTS is enough -- the 21..24 values inside each
+     shell keep working unchanged. ]]
+local LAYER = { LinkOffer = 44, Transcend = 42, Settings = 40, Affinity = 38 }
+
 local function makeShell(kit: Kit, parent: Instance, name: string, title: string, confirm: string, cancel: string): Region
 	local root = kit.new("Frame", {
 		Name = name, Active = true, BackgroundColor3 = Theme.Ui.Overlay, BackgroundTransparency = 0.4,
 		BorderSizePixel = 0, Position = UDim2.fromScale(0, 0), Size = UDim2.fromScale(1, 1),
-		Visible = false, ZIndex = 20,
+		Visible = false, ZIndex = LAYER[name] or 20,
 	}, parent)
 
 	local panel = kit.panel({

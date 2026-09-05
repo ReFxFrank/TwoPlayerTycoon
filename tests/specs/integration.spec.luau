@@ -301,6 +301,10 @@ t.test("no remote can move essence, stage or prestige", function()
     grant(services, sanctum, 1000)
     local essence, stage = sanctum.State.Essence, sanctum.State.Stage
     local rebirths = services.ProfileService:Get(ash).Prestige.Rebirths
+    -- A LIVE server, which is the scenario an exploiter is actually in. ResetData is a legitimate
+    -- action in Studio, so leaving the mock in its Studio default would test the wrong thing --
+    -- and asserting a real developer tool does nothing would be asserting it is broken.
+    Mock.Services.context.Studio = false
 
     local hostile = {
         { "RebirthVote", { Accept = true } },

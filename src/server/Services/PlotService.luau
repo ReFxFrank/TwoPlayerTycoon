@@ -133,6 +133,32 @@ function Service:RebuildSanctum(sanctum: any): ()
 	Service:MarkDirty(plot.Sanctum)
 end
 
+--[[ Blanks a Sanctum in place, for the developer data reset. Re-announcing ProfileLoaded cannot do
+     it: claim is idempotent, so a settled player gets their plot back without re-adopting, and the
+     next mirror would write the old plot back over the blanked Profile. ]]
+function Service:ResetSanctum(sanctum: any): ()
+	local plot = plotOf(sanctum)
+	if plot == nil then return end
+	plot:Reset()
+	Service:RebuildSanctum(plot.Sanctum)
+end
+
+--[[ A player turned away because every Sanctum was occupied has no second route: ClaimEmpty is
+     reached only from the one-shot ProfileLoaded handler and the boot sweep, there is no client
+     claim remote, and an empty Sanctum cannot be linked into. Without this they sit in the lobby
+     all session while a plot stands free. Called ONLY where a plot has genuinely been recycled: a
+     sweep on PlayerRemoving would hand the just-vacated plot to a stranger inside the grace window
+     DECISIONS #6 exists to protect. ]]
+function Service:SweepUnclaimed(): ()
+	for _, player in ipairs(Players:GetPlayers()) do
+		if profiles ~= nil and profiles:IsLoaded(player) and Service:GetSanctumForPlayer(player) == nil then
+			if Service:ClaimEmpty(player) ~= nil and remotes ~= nil then
+				remotes:FireClient(player, "Notify", { Kind = "success", Text = "A sanctum opened up. Welcome in." })
+			end
+		end
+	end
+end
+
 function Service:ClaimEmpty(player: any): Sanctum?
 	local plot = PlotSession.claim(player)
 	return if plot ~= nil then plot.Sanctum else nil
