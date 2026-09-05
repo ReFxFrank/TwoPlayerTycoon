@@ -39,10 +39,19 @@ local KINDS: { [string]: boolean } = { dropper = true, upgrade = true, section =
 	attune = true, transcend = true, link = true }
 PurchasePads.Kinds = KINDS
 
---[[ The only two refusals that leave a prompt LIVE. Both mean "come back with more Essence", and a
-     pad the pair are visibly saving for must stay a target. Every other refusal DISABLES the prompt
-     rather than merely relabelling it, so an unbuyable pad cannot even be pressed. ]]
-local SOFT: { [string]: boolean } = { [Reason.Insufficient] = true, [Reason.NeedEssence] = true }
+--[[ The three refusals that leave a prompt LIVE. All mean "come back with more Essence", and a pad
+     the pair are visibly saving for must stay a target. Every other refusal DISABLES the prompt
+     rather than merely relabelling it, so an unbuyable pad cannot even be pressed.
+
+     NeedLifetime belongs here for a reason worth stating: it is the ONE gate that income alone can
+     open, and RefreshPads is reached only from a purchase, an attunement or a RebuildSanctum. Held
+     hard, the Attune and Transcend prompts stayed DISABLED after their gate had opened and only
+     came back if the pair happened to buy something -- so a pair idling to the threshold, which is
+     the whole activity of a tycoon, walked to a dead pad. Nothing is weakened: the pad becomes
+     pressable-but-refused exactly like an unaffordable dropper, and Attune and BeginVote each
+     re-run the full gate against live state on the trigger. ]]
+local SOFT: { [string]: boolean } = { [Reason.Insufficient] = true, [Reason.NeedEssence] = true,
+	[Reason.NeedLifetime] = true }
 
 local function num(v: any, default: number): number
 	return if type(v) == "number" and v == v and v ~= math.huge and v ~= -math.huge then v :: number else default

@@ -7,7 +7,7 @@ deliberate and the reasoning is recorded there.
 ## Commands
 
 ```bash
-./tests/run.sh              # syntax + house rules + 312 tests   (~70s)
+./tests/run.sh              # syntax + house rules + 316 tests   (~70s)
 ./tests/run.sh economy      # only specs matching a substring    (~5s)
 rojo serve                  # then connect from Studio
 rojo build -o SanctumOfEmbers.rbxlx   # REQUIRED after any src/ change; CI fails on a stale file
@@ -32,7 +32,7 @@ is not on `PATH`). Neither is needed to play the game.
 
 ## The thing this codebase gets wrong most
 
-**Wiring gaps and stale state.** Nineteen defects were found across three review passes, and almost
+**Wiring gaps and stale state.** Twenty-three defects were found across four review passes, and almost
 none were bad logic. They were modules correct in isolation that nothing ever called, or a value
 left describing a world that had moved on:
 

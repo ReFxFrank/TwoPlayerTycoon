@@ -229,26 +229,19 @@ function Service:Init(registry: any): ()
 	purchases, evolution = nil, nil -- registered AFTER this service; resolved lazily in RebuildSanctum
 	links = PlotLinkController.new({
 		Remotes = remotes,
-		OnAccepted = function(sanctum: any, joiner: any)
+		-- Returns the resulting roster so PlotLinkController can announce a link that actually
+		-- landed; linkAccepted re-checks every gate and can decline silently.
+		OnAccepted = function(sanctum: any, joiner: any): { any }?
 			local plot = plotOf(sanctum)
-			if plot ~= nil then PlotSession.linkAccepted(plot, joiner) end
+			if plot == nil then return nil end
+			PlotSession.linkAccepted(plot, joiner)
+			return Service:GetOccupants(sanctum)
 		end,
 	})
 	teardown() -- a re-Init must not leave the previous boot's models, runtimes or connections behind
 	PlotSession.bind(Service, plots, profiles, links)
 	ticker:Reset()
-	-- Rebuilt from scratch: a leftover folder would leave six abandoned Sanctums in the world, and
-	-- their pads would still answer a ProximityPrompt.
-	local previous = workspace:FindFirstChild(FOLDER_NAME)
-	if previous ~= nil then previous:Destroy() end
-	local created = Instance.new("Folder")
-	created.Name = FOLDER_NAME
-	created.Parent = workspace
-	for id = 1, GameConfig.Plot.SanctumCount do
-		local plot = PlotRuntime.new(id, created, economy)
-		table.insert(plots, plot)
-		byId[id] = plot
-	end
+	PlotRuntime.buildAll(FOLDER_NAME, GameConfig.Plot.SanctumCount, plots, byId, economy)
 end
 
 function Service:Start(): ()

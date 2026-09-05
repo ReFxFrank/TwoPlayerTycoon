@@ -4806,7 +4806,7 @@ local GameConfig = require(Modules:WaitForChild("GameConfig"))
 type Offer = { PlotId: number, Joiner: any, JoinerId: number, ExpiresAt: number, Token: number }
 -- Remotes is RemoteService and OnAccepted is PlotService's merge step. Both are optional so a spec
 -- can drive the offer book with plain tables and no server standing behind it.
-type Deps = { Remotes: any?, OnAccepted: ((sanctum: any, joiner: any) -> ())? }
+type Deps = { Remotes: any?, OnAccepted: ((sanctum: any, joiner: any) -> { any }?)? }
 
 local PlotLinkController = {}
 
@@ -4829,7 +4829,7 @@ Controller.__index = Controller
 type ControllerSelf = {
 	_offers: { [number]: Offer }, -- keyed by PlotId: one open offer per Sanctum, never more
 	_remotes: any,
-	_onAccepted: (sanctum: any, joiner: any) -> (),
+	_onAccepted: (sanctum: any, joiner: any) -> { any }?,
 	_token: number, -- monotonic; identifies WHICH offer an expiry closure belongs to
 }
 type Controller = typeof(setmetatable({} :: ControllerSelf, Controller))
@@ -4943,7 +4943,15 @@ function Controller.Resolve(self: Controller, responder: any, sanctum: any, acce
 		self:_notify(offer.Joiner, "warn", "Your link request was declined.")
 		return true, Reason.Declined
 	end
-	self._onAccepted(sanctum, offer.Joiner)
+	--[[ OnAccepted reports the resulting roster, or nil if the merge declined -- every gate is
+	     re-checked against live state in there, so an accepted offer can still not land.
+	     EvolutionFxController has always had a "link" handler and nothing ever sent one, so until
+	     now the moment the whole game is built around arrived in silence. ]]
+	local occupants = self._onAccepted(sanctum, offer.Joiner)
+	if self._remotes ~= nil and type(occupants) == "table" and #occupants > 1 then
+		self._remotes:FireClients(occupants, "Fx",
+			{ Kind = "link", PlotId = sanctum.Id, Data = { Name = offer.Joiner.Name } })
+	end
 	return true, Reason.Ok
 end
 
@@ -5284,6 +5292,24 @@ function Plot.Destroy(self: Plot): ()
 	PlotBuilder.destroy(self.Sanctum.Model)
 end
 
+--[[ Builds every Sanctum in the world, filling the caller's tables IN PLACE -- PlotSession holds a
+     reference to the same list, so replacing it would leave that binding pointing at the previous
+     boot's plots. Rebuilt from scratch each time: a leftover folder would leave abandoned Sanctums
+     standing in Workspace whose pads still answer a ProximityPrompt, and a re-Init happens both in
+     tests and after a failed boot. ]]
+function PlotRuntime.buildAll(folderName: string, count: number, plots: { any }, byId: { [number]: any }, economy: any): ()
+	local previous = workspace:FindFirstChild(folderName)
+	if previous ~= nil then previous:Destroy() end
+	local created = Instance.new("Folder")
+	created.Name = folderName
+	created.Parent = workspace
+	for id = 1, count do
+		local plot = PlotRuntime.new(id, created, economy)
+		table.insert(plots, plot)
+		byId[id] = plot
+	end
+end
+
 return PlotRuntime
 ]]></string>
           </Properties>
@@ -5522,26 +5548,19 @@ function Service:Init(registry: any): ()
 	purchases, evolution = nil, nil -- registered AFTER this service; resolved lazily in RebuildSanctum
 	links = PlotLinkController.new({
 		Remotes = remotes,
-		OnAccepted = function(sanctum: any, joiner: any)
+		-- Returns the resulting roster so PlotLinkController can announce a link that actually
+		-- landed; linkAccepted re-checks every gate and can decline silently.
+		OnAccepted = function(sanctum: any, joiner: any): { any }?
 			local plot = plotOf(sanctum)
-			if plot ~= nil then PlotSession.linkAccepted(plot, joiner) end
+			if plot == nil then return nil end
+			PlotSession.linkAccepted(plot, joiner)
+			return Service:GetOccupants(sanctum)
 		end,
 	})
 	teardown() -- a re-Init must not leave the previous boot's models, runtimes or connections behind
 	PlotSession.bind(Service, plots, profiles, links)
 	ticker:Reset()
-	-- Rebuilt from scratch: a leftover folder would leave six abandoned Sanctums in the world, and
-	-- their pads would still answer a ProximityPrompt.
-	local previous = workspace:FindFirstChild(FOLDER_NAME)
-	if previous ~= nil then previous:Destroy() end
-	local created = Instance.new("Folder")
-	created.Name = FOLDER_NAME
-	created.Parent = workspace
-	for id = 1, GameConfig.Plot.SanctumCount do
-		local plot = PlotRuntime.new(id, created, economy)
-		table.insert(plots, plot)
-		byId[id] = plot
-	end
+	PlotRuntime.buildAll(FOLDER_NAME, GameConfig.Plot.SanctumCount, plots, byId, economy)
 end
 
 function Service:Start(): ()
@@ -6592,10 +6611,19 @@ local KINDS: { [string]: boolean } = { dropper = true, upgrade = true, section =
 	attune = true, transcend = true, link = true }
 PurchasePads.Kinds = KINDS
 
---[[ The only two refusals that leave a prompt LIVE. Both mean "come back with more Essence", and a
-     pad the pair are visibly saving for must stay a target. Every other refusal DISABLES the prompt
-     rather than merely relabelling it, so an unbuyable pad cannot even be pressed. ]]
-local SOFT: { [string]: boolean } = { [Reason.Insufficient] = true, [Reason.NeedEssence] = true }
+--[[ The three refusals that leave a prompt LIVE. All mean "come back with more Essence", and a pad
+     the pair are visibly saving for must stay a target. Every other refusal DISABLES the prompt
+     rather than merely relabelling it, so an unbuyable pad cannot even be pressed.
+
+     NeedLifetime belongs here for a reason worth stating: it is the ONE gate that income alone can
+     open, and RefreshPads is reached only from a purchase, an attunement or a RebuildSanctum. Held
+     hard, the Attune and Transcend prompts stayed DISABLED after their gate had opened and only
+     came back if the pair happened to buy something -- so a pair idling to the threshold, which is
+     the whole activity of a tycoon, walked to a dead pad. Nothing is weakened: the pad becomes
+     pressable-but-refused exactly like an unaffordable dropper, and Attune and BeginVote each
+     re-run the full gate against live state on the trigger. ]]
+local SOFT: { [string]: boolean } = { [Reason.Insufficient] = true, [Reason.NeedEssence] = true,
+	[Reason.NeedLifetime] = true }
 
 local function num(v: any, default: number): number
 	return if type(v) == "number" and v == v and v ~= math.huge and v ~= -math.huge then v :: number else default
@@ -7247,6 +7275,70 @@ return Service
         </Item>
         <Item class="ModuleScript" referent="44">
           <Properties>
+            <string name="Name">RebirthAnnounce</string>
+            <string name="Source"><![CDATA[--!strict
+--[[
+    RebirthAnnounce
+    Everything the clients are told about a Transcendence vote: the running ballot, the terminal push
+    that closes the modal, and the toast wording.
+
+    Split out of RebirthService for the 300-line ceiling, and it is a real seam -- this is the whole
+    client-facing surface of the vote, and the one place its wire shape is decided.
+    Owner: server  |  Consumers: RebirthService
+]]
+
+local RebirthAnnounce = {}
+
+--- `deps` supplies the remote service and the small readers RebirthService already owns, so this
+--- module needs no view of the Sanctum type.
+export type Deps = {
+	Remotes: any,
+	Occupants: (any) -> { any },
+	UserId: (any) -> number?,
+	Name: (any) -> string,
+	PlotId: (any) -> number,
+}
+
+local d: Deps? = nil
+
+function RebirthAnnounce.bind(deps: Deps): ()
+	d = deps
+end
+
+function RebirthAnnounce.notify(sanctum: any, kind: string, text: string): ()
+	local deps = d
+	if deps == nil or deps.Remotes == nil then return end
+	deps.Remotes:FireClients(deps.Occupants(sanctum), "Notify", { Kind = kind, Text = text })
+end
+
+-- The ballot as the client renders it. Keys are STRINGS (RebirthController indexes Names/Votes by
+-- tostring(UserId)), and an ExpiresAt that is not in the future is the terminal push every ending
+-- shares -- which is what closes the modal on a cancel, an expiry and a completed vote alike.
+function RebirthAnnounce.broadcast(sanctum: any, vote: Vote?): ()
+	local deps = d
+	if deps == nil or deps.Remotes == nil then return end
+	local names: { [string]: string }, ballots: { [string]: boolean } = {}, {}
+	local recipients = deps.Occupants(sanctum)
+	if vote ~= nil then
+		for _, player in ipairs(recipients) do
+			local userId = deps.UserId(player)
+			if userId ~= nil then
+				names[tostring(userId)] = deps.Name(player)
+				local cast = vote.Ballots[userId]
+				if cast ~= nil then ballots[tostring(userId)] = cast end
+			end
+		end
+	end
+	deps.Remotes:FireClients(recipients, "RebirthVoteState", { PlotId = deps.PlotId(sanctum),
+		Votes = ballots, Names = names, ExpiresAt = if vote ~= nil then vote.ExpiresAt else 0 })
+end
+
+return RebirthAnnounce
+]]></string>
+          </Properties>
+        </Item>
+        <Item class="ModuleScript" referent="45">
+          <Properties>
             <string name="Name">RebirthService</string>
             <string name="Source"><![CDATA[--!strict
 --[[
@@ -7272,6 +7364,7 @@ local GameConfig = require(Modules:WaitForChild("GameConfig"))
 local RebirthData = require(Modules:WaitForChild("RebirthData"))
 
 local PrestigeAward = require(script.Parent.PrestigeAward)
+local RebirthAnnounce = require(script.Parent.RebirthAnnounce)
 local StateSchema = require(Modules:WaitForChild("StateSchema"))
 
 type Connection = { Disconnect: (self: any) -> () }
@@ -7336,30 +7429,12 @@ local function isOccupant(sanctum: any, player: any): boolean
 	end
 	return false
 end
+-- Delegated to RebirthAnnounce, which owns the whole client-facing surface of a vote.
 local function notify(sanctum: any, kind: string, text: string): ()
-	if remotes == nil then return end
-	remotes:FireClients(occupantsOf(sanctum), "Notify", { Kind = kind, Text = text })
+	RebirthAnnounce.notify(sanctum, kind, text)
 end
-
--- The ballot as the client renders it. Keys are STRINGS (RebirthController indexes Names/Votes by
--- tostring(UserId)), and an ExpiresAt that is not in the future is the terminal push every ending
--- shares -- which is what closes the modal on a cancel, an expiry and a completed vote alike.
-local function broadcast(sanctum: any, vote: Vote?): ()
-	if remotes == nil then return end
-	local names: { [string]: string }, ballots: { [string]: boolean } = {}, {}
-	local recipients = occupantsOf(sanctum)
-	if vote ~= nil then
-		for _, player in ipairs(recipients) do
-			local userId = userIdOf(player)
-			if userId ~= nil then
-				names[tostring(userId)] = nameOf(player)
-				local cast = vote.Ballots[userId]
-				if cast ~= nil then ballots[tostring(userId)] = cast end
-			end
-		end
-	end
-	remotes:FireClients(recipients, "RebirthVoteState", { PlotId = plotIdOf(sanctum),
-		Votes = ballots, Names = names, ExpiresAt = if vote ~= nil then vote.ExpiresAt else 0 })
+local function broadcast(sanctum: any, vote: any): ()
+	RebirthAnnounce.broadcast(sanctum, vote)
 end
 
 function Service:CanTranscend(sanctum: any): (boolean, string)
@@ -7411,7 +7486,16 @@ function Service:Execute(sanctum: any): ()
 	if plots ~= nil then plots:MarkDirty(sanctum) end
 
 	if remotes ~= nil then
-		remotes:FireClients(occupants, "Fx", { Kind = "transcend", PlotId = plotIdOf(sanctum) })
+		--[[ Per player, not FireClients: the banner names THIS occupant's new rebirth count, and the
+		     count is per player. The client's snapshot is up to a full replication interval behind
+		     at this instant and the banner renders once, so the number has to ride the payload --
+		     otherwise every Transcendence announces the count from before it. ]]
+		for _, occupant in ipairs(occupants) do
+			local profile = if profiles ~= nil then profiles:Get(occupant) else nil
+			local prestige = if type(profile) == "table" then (profile :: any).Prestige else nil
+			remotes:FireClient(occupant, "Fx", { Kind = "transcend", PlotId = plotIdOf(sanctum),
+				Data = { Rebirths = if type(prestige) == "table" then prestige.Rebirths else nil } })
+		end
 	end
 	notify(sanctum, "success", "The Conflux transcends. The Sanctum is new; the power is yours to keep.")
 	-- Mirror the RESET plot, then save immediately rather than at the next autosave: PlotService's
@@ -7446,6 +7530,17 @@ local function tally(sanctum: any, vote: Vote): ()
 			broadcast(sanctum, vote)
 			return
 		end
+	end
+	--[[ Re-checked at EXECUTION, not only at BeginVote. Unanimity is measured against the live
+	     roster, but the SANCTUM can also move underneath an open ballot: PlotService:ResetSanctum
+	     (the developer data reset) replaces State on the same table the ballot book is keyed by, so
+	     a vote opened before it survives it. Without this the second yes mints permanent Prestige
+	     on a blank Stage 1 Sanctum -- and Prestige is the one thing players cannot re-earn. ]]
+	local state = stateOf(sanctum)
+	if state == nil then return end
+	if not (Economy.transcendStatus(state :: any)) then
+		Service:Cancel(sanctum, Reason.Expired)
+		return
 	end
 	Service:Execute(sanctum)
 end
@@ -7506,6 +7601,8 @@ function Service:Init(registry: any): () -- ServiceRegistry contract; resolve pe
 	economy = registry:Get("EconomyService")
 	profiles = registry:Get("ProfileService")
 	remotes = registry:Get("RemoteService")
+	RebirthAnnounce.bind({ Remotes = remotes, Occupants = occupantsOf, UserId = userIdOf,
+		Name = nameOf, PlotId = plotIdOf })
 	-- TryGet, not Get: EvolutionService is registered before this one so it is always there on a real
 	-- boot, but its role here is PRESENTATION (repaint the Conflux, re-apply walk speed). A reset is
 	-- correct without it, and refusing to boot a server over a cosmetic peer would be worse.
@@ -7543,7 +7640,7 @@ return Service
 ]]></string>
           </Properties>
         </Item>
-        <Item class="ModuleScript" referent="45">
+        <Item class="ModuleScript" referent="46">
           <Properties>
             <string name="Name">RemoteService</string>
             <string name="Source"><![CDATA[--!strict
@@ -7847,7 +7944,7 @@ return Service
 ]]></string>
           </Properties>
         </Item>
-        <Item class="ModuleScript" referent="46">
+        <Item class="ModuleScript" referent="47">
           <Properties>
             <string name="Name">StateReplicator</string>
             <string name="Source"><![CDATA[--!strict
@@ -8111,11 +8208,11 @@ return Service
           </Properties>
         </Item>
       </Item>
-      <Item class="Folder" referent="47">
+      <Item class="Folder" referent="48">
         <Properties>
           <string name="Name">Systems</string>
         </Properties>
-        <Item class="ModuleScript" referent="48">
+        <Item class="ModuleScript" referent="49">
           <Properties>
             <string name="Name">BuildKit</string>
             <string name="Source"><![CDATA[--!strict
@@ -8213,7 +8310,7 @@ return BuildKit
 ]]></string>
           </Properties>
         </Item>
-        <Item class="ModuleScript" referent="49">
+        <Item class="ModuleScript" referent="50">
           <Properties>
             <string name="Name">DropperSystem</string>
             <string name="Source"><![CDATA[--!strict
@@ -8413,7 +8510,7 @@ return DropperSystem
 ]]></string>
           </Properties>
         </Item>
-        <Item class="ModuleScript" referent="50">
+        <Item class="ModuleScript" referent="51">
           <Properties>
             <string name="Name">MoteSystem</string>
             <string name="Source"><![CDATA[--!strict
@@ -8695,7 +8792,7 @@ return MoteSystem
 ]]></string>
           </Properties>
         </Item>
-        <Item class="ModuleScript" referent="51">
+        <Item class="ModuleScript" referent="52">
           <Properties>
             <string name="Name">PlotBuilder</string>
             <string name="Source"><![CDATA[--!strict
@@ -8981,7 +9078,7 @@ return PlotBuilder
       </Item>
     </Item>
   </Item>
-  <Item class="SoundService" referent="52">
+  <Item class="SoundService" referent="53">
     <Properties>
       <string name="Name">SoundService</string>
       <token name="AmbientReverb">11</token>
@@ -8991,19 +9088,19 @@ return PlotBuilder
       <float name="RolloffScale">1</float>
     </Properties>
   </Item>
-  <Item class="StarterPlayer" referent="53">
+  <Item class="StarterPlayer" referent="54">
     <Properties>
       <string name="Name">StarterPlayer</string>
     </Properties>
-    <Item class="StarterPlayerScripts" referent="54">
+    <Item class="StarterPlayerScripts" referent="55">
       <Properties>
         <string name="Name">StarterPlayerScripts</string>
       </Properties>
-      <Item class="Folder" referent="55">
+      <Item class="Folder" referent="56">
         <Properties>
           <string name="Name">Client</string>
         </Properties>
-        <Item class="LocalScript" referent="56">
+        <Item class="LocalScript" referent="57">
           <Properties>
             <string name="Name">ClientBootstrap</string>
             <string name="Source"><![CDATA[--!strict
@@ -9165,11 +9262,11 @@ player.CharacterAdded:Connect(requestSnapshot)
 ]]></string>
           </Properties>
         </Item>
-        <Item class="Folder" referent="57">
+        <Item class="Folder" referent="58">
           <Properties>
             <string name="Name">Controllers</string>
           </Properties>
-          <Item class="ModuleScript" referent="58">
+          <Item class="ModuleScript" referent="59">
             <Properties>
               <string name="Name">AffinityController</string>
               <string name="Source"><![CDATA[--!strict
@@ -9435,7 +9532,7 @@ return Controller
 ]]></string>
             </Properties>
           </Item>
-          <Item class="ModuleScript" referent="59">
+          <Item class="ModuleScript" referent="60">
             <Properties>
               <string name="Name">EvolutionFxController</string>
               <string name="Source"><![CDATA[--!strict
@@ -9731,7 +9828,7 @@ return Controller
 ]]></string>
             </Properties>
           </Item>
-          <Item class="ModuleScript" referent="60">
+          <Item class="ModuleScript" referent="61">
             <Properties>
               <string name="Name">HudController</string>
               <string name="Source"><![CDATA[--!strict
@@ -9955,7 +10052,7 @@ return Controller
 ]]></string>
             </Properties>
           </Item>
-          <Item class="ModuleScript" referent="61">
+          <Item class="ModuleScript" referent="62">
             <Properties>
               <string name="Name">LinkController</string>
               <string name="Source"><![CDATA[--!strict
@@ -10079,7 +10176,7 @@ return Controller
 ]]></string>
             </Properties>
           </Item>
-          <Item class="ModuleScript" referent="62">
+          <Item class="ModuleScript" referent="63">
             <Properties>
               <string name="Name">NotifyController</string>
               <string name="Source"><![CDATA[--!strict
@@ -10307,7 +10404,7 @@ return Controller
 ]]></string>
             </Properties>
           </Item>
-          <Item class="ModuleScript" referent="63">
+          <Item class="ModuleScript" referent="64">
             <Properties>
               <string name="Name">PadVerdict</string>
               <string name="Source"><![CDATA[--!strict
@@ -10463,7 +10560,7 @@ return PadVerdict
 ]]></string>
             </Properties>
           </Item>
-          <Item class="ModuleScript" referent="64">
+          <Item class="ModuleScript" referent="65">
             <Properties>
               <string name="Name">PromptController</string>
               <string name="Source"><![CDATA[--!strict
@@ -10751,7 +10848,7 @@ return Controller
 ]]></string>
             </Properties>
           </Item>
-          <Item class="ModuleScript" referent="65">
+          <Item class="ModuleScript" referent="66">
             <Properties>
               <string name="Name">RebirthController</string>
               <string name="Source"><![CDATA[--!strict
@@ -11043,7 +11140,7 @@ return Controller
 ]]></string>
             </Properties>
           </Item>
-          <Item class="ModuleScript" referent="66">
+          <Item class="ModuleScript" referent="67">
             <Properties>
               <string name="Name">SettingsController</string>
               <string name="Source"><![CDATA[--!strict
@@ -11276,7 +11373,7 @@ return Controller
 ]]></string>
             </Properties>
           </Item>
-          <Item class="ModuleScript" referent="67">
+          <Item class="ModuleScript" referent="68">
             <Properties>
               <string name="Name">SoundController</string>
               <string name="Source"><![CDATA[--!strict
@@ -11477,7 +11574,7 @@ return Controller
 ]]></string>
             </Properties>
           </Item>
-          <Item class="ModuleScript" referent="68">
+          <Item class="ModuleScript" referent="69">
             <Properties>
               <string name="Name">UiBuilder</string>
               <string name="Source"><![CDATA[--!strict
@@ -11762,7 +11859,7 @@ return UiBuilder
 ]]></string>
             </Properties>
           </Item>
-          <Item class="ModuleScript" referent="69">
+          <Item class="ModuleScript" referent="70">
             <Properties>
               <string name="Name">UiModals</string>
               <string name="Source"><![CDATA[--!strict
@@ -11982,7 +12079,7 @@ return UiModals
       </Item>
     </Item>
   </Item>
-  <Item class="Workspace" referent="70">
+  <Item class="Workspace" referent="71">
     <Properties>
       <string name="Name">Workspace</string>
       <float name="FallenPartsDestroyHeight">-150</float>

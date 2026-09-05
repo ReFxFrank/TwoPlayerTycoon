@@ -203,4 +203,22 @@ function Plot.Destroy(self: Plot): ()
 	PlotBuilder.destroy(self.Sanctum.Model)
 end
 
+--[[ Builds every Sanctum in the world, filling the caller's tables IN PLACE -- PlotSession holds a
+     reference to the same list, so replacing it would leave that binding pointing at the previous
+     boot's plots. Rebuilt from scratch each time: a leftover folder would leave abandoned Sanctums
+     standing in Workspace whose pads still answer a ProximityPrompt, and a re-Init happens both in
+     tests and after a failed boot. ]]
+function PlotRuntime.buildAll(folderName: string, count: number, plots: { any }, byId: { [number]: any }, economy: any): ()
+	local previous = workspace:FindFirstChild(folderName)
+	if previous ~= nil then previous:Destroy() end
+	local created = Instance.new("Folder")
+	created.Name = folderName
+	created.Parent = workspace
+	for id = 1, count do
+		local plot = PlotRuntime.new(id, created, economy)
+		table.insert(plots, plot)
+		byId[id] = plot
+	end
+end
+
 return PlotRuntime

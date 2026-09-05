@@ -22,6 +22,7 @@ local GameConfig = require(Modules:WaitForChild("GameConfig"))
 local RebirthData = require(Modules:WaitForChild("RebirthData"))
 
 local PrestigeAward = require(script.Parent.PrestigeAward)
+local RebirthAnnounce = require(script.Parent.RebirthAnnounce)
 local StateSchema = require(Modules:WaitForChild("StateSchema"))
 
 type Connection = { Disconnect: (self: any) -> () }
@@ -86,30 +87,12 @@ local function isOccupant(sanctum: any, player: any): boolean
 	end
 	return false
 end
+-- Delegated to RebirthAnnounce, which owns the whole client-facing surface of a vote.
 local function notify(sanctum: any, kind: string, text: string): ()
-	if remotes == nil then return end
-	remotes:FireClients(occupantsOf(sanctum), "Notify", { Kind = kind, Text = text })
+	RebirthAnnounce.notify(sanctum, kind, text)
 end
-
--- The ballot as the client renders it. Keys are STRINGS (RebirthController indexes Names/Votes by
--- tostring(UserId)), and an ExpiresAt that is not in the future is the terminal push every ending
--- shares -- which is what closes the modal on a cancel, an expiry and a completed vote alike.
-local function broadcast(sanctum: any, vote: Vote?): ()
-	if remotes == nil then return end
-	local names: { [string]: string }, ballots: { [string]: boolean } = {}, {}
-	local recipients = occupantsOf(sanctum)
-	if vote ~= nil then
-		for _, player in ipairs(recipients) do
-			local userId = userIdOf(player)
-			if userId ~= nil then
-				names[tostring(userId)] = nameOf(player)
-				local cast = vote.Ballots[userId]
-				if cast ~= nil then ballots[tostring(userId)] = cast end
-			end
-		end
-	end
-	remotes:FireClients(recipients, "RebirthVoteState", { PlotId = plotIdOf(sanctum),
-		Votes = ballots, Names = names, ExpiresAt = if vote ~= nil then vote.ExpiresAt else 0 })
+local function broadcast(sanctum: any, vote: any): ()
+	RebirthAnnounce.broadcast(sanctum, vote)
 end
 
 function Service:CanTranscend(sanctum: any): (boolean, string)
@@ -161,7 +144,16 @@ function Service:Execute(sanctum: any): ()
 	if plots ~= nil then plots:MarkDirty(sanctum) end
 
 	if remotes ~= nil then
-		remotes:FireClients(occupants, "Fx", { Kind = "transcend", PlotId = plotIdOf(sanctum) })
+		--[[ Per player, not FireClients: the banner names THIS occupant's new rebirth count, and the
+		     count is per player. The client's snapshot is up to a full replication interval behind
+		     at this instant and the banner renders once, so the number has to ride the payload --
+		     otherwise every Transcendence announces the count from before it. ]]
+		for _, occupant in ipairs(occupants) do
+			local profile = if profiles ~= nil then profiles:Get(occupant) else nil
+			local prestige = if type(profile) == "table" then (profile :: any).Prestige else nil
+			remotes:FireClient(occupant, "Fx", { Kind = "transcend", PlotId = plotIdOf(sanctum),
+				Data = { Rebirths = if type(prestige) == "table" then prestige.Rebirths else nil } })
+		end
 	end
 	notify(sanctum, "success", "The Conflux transcends. The Sanctum is new; the power is yours to keep.")
 	-- Mirror the RESET plot, then save immediately rather than at the next autosave: PlotService's
@@ -196,6 +188,17 @@ local function tally(sanctum: any, vote: Vote): ()
 			broadcast(sanctum, vote)
 			return
 		end
+	end
+	--[[ Re-checked at EXECUTION, not only at BeginVote. Unanimity is measured against the live
+	     roster, but the SANCTUM can also move underneath an open ballot: PlotService:ResetSanctum
+	     (the developer data reset) replaces State on the same table the ballot book is keyed by, so
+	     a vote opened before it survives it. Without this the second yes mints permanent Prestige
+	     on a blank Stage 1 Sanctum -- and Prestige is the one thing players cannot re-earn. ]]
+	local state = stateOf(sanctum)
+	if state == nil then return end
+	if not (Economy.transcendStatus(state :: any)) then
+		Service:Cancel(sanctum, Reason.Expired)
+		return
 	end
 	Service:Execute(sanctum)
 end
@@ -256,6 +259,8 @@ function Service:Init(registry: any): () -- ServiceRegistry contract; resolve pe
 	economy = registry:Get("EconomyService")
 	profiles = registry:Get("ProfileService")
 	remotes = registry:Get("RemoteService")
+	RebirthAnnounce.bind({ Remotes = remotes, Occupants = occupantsOf, UserId = userIdOf,
+		Name = nameOf, PlotId = plotIdOf })
 	-- TryGet, not Get: EvolutionService is registered before this one so it is always there on a real
 	-- boot, but its role here is PRESENTATION (repaint the Conflux, re-apply walk speed). A reset is
 	-- correct without it, and refusing to boot a server over a cosmetic peer would be worse.

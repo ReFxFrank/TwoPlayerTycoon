@@ -410,3 +410,94 @@ t.test("the developer data reset clears the live sanctum, not just the profile",
         "the old plot must not be written back over the fresh profile")
     t.eq(services.ProfileService:Get(ash).Plot.Stage, 1)
 end)
+
+t.test("the attune pad is live once its gate opens, without needing a purchase to wake it", function()
+    --[[ RefreshPads is reached only from a purchase, an attunement or a RebuildSanctum. Lifetime
+         essence is the one gate INCOME alone opens, so holding it as a hard refusal left the prompt
+         disabled -- a pair idling to the threshold, which is the entire activity of a tycoon,
+         walked to a dead pad. pacing.spec never saw it because it calls Attune directly. ]]
+    local services = bootServer()
+    local ash = joinPlayer("Ash", 1)
+    local sanctum = services.PlotService:GetSanctumForPlayer(ash)
+    local pad = padOf(services, sanctum, "attune")
+    local prompt = promptOn(pad)
+    t.truthy(prompt, "the attune pad has a prompt")
+
+    -- Meet the stage-2 gate by INCOME only: no purchase, so nothing republishes the pads.
+    local stage = EvolutionData.Stages[2]
+    services.EconomyService:Credit(sanctum,
+        math.max(stage.RequiredEssence, stage.RequiredLifetimeEssence) * 1.2)
+    sanctum.State.Droppers[DropperData.List[1].Id] = math.max(stage.RequiredDroppers, 1)
+    Mock.advance(2)
+
+    t.truthy(prompt.Enabled, "the prompt must be pressable once the gate is open")
+    Mock.triggerPrompt(prompt, ash)
+    Mock.advance(1)
+    t.eq(sanctum.State.Stage, 2, "and pressing it must actually attune")
+end)
+
+t.test("a transcendence vote does not survive the sanctum being reset under it", function()
+    -- ResetSanctum replaces State on the same table the ballot book is keyed by, so a vote opened
+    -- beforehand outlived it -- and the second yes minted permanent Prestige on a blank Stage 1
+    -- sanctum. Prestige is the one thing a player cannot re-earn.
+    local services = bootServer()
+    local ash = joinPlayer("Ash", 1)
+    local bree = joinPlayer("Bree", 2)
+    local host = services.PlotService:GetSanctumForPlayer(ash)
+    linkUp(services, host, bree, ash)
+
+    host.State.Stage = RebirthData.RequiredStage
+    services.EconomyService:Credit(host, RebirthData.RequiredLifetimeEssence * 1.1)
+    host.State.LifetimeEssence = RebirthData.RequiredLifetimeEssence * 1.1
+    t.truthy(services.RebirthService:BeginVote(ash, host))
+    Mock.advance(0.5)
+
+    services.PlotService:ResetSanctum(host) -- the developer reset, mid-vote
+    Mock.advance(0.5)
+    services.RebirthService:CastVote(bree, true)
+    Mock.advance(1)
+
+    t.eq(services.ProfileService:Get(ash).Prestige.Rebirths, 0, "no rebirth was earned")
+    t.eq(services.ProfileService:Get(bree).Prestige.Rebirths, 0, "for either occupant")
+end)
+
+t.test("the transcendence banner names the count from AFTER the rebirth", function()
+    local services = bootServer()
+    local ash = joinPlayer("Ash", 1)
+    local host = services.PlotService:GetSanctumForPlayer(ash)
+    host.State.Stage = RebirthData.RequiredStage
+    services.EconomyService:Credit(host, RebirthData.RequiredLifetimeEssence * 1.1)
+    host.State.LifetimeEssence = RebirthData.RequiredLifetimeEssence * 1.1
+
+    Mock.clearOutbox()
+    services.RebirthService:BeginVote(ash, host) -- solo: one yes is unanimous
+    Mock.advance(1)
+
+    local fx
+    for _, entry in ipairs(Mock.outboxFor("Fx", ash)) do
+        local payload = entry.Args[1]
+        if type(payload) == "table" and payload.Kind == "transcend" then fx = payload end
+    end
+    t.truthy(fx, "a transcend Fx was sent")
+    t.truthy(fx.Data ~= nil and fx.Data.Rebirths == 1,
+        "the banner must announce the new count, not the one from before")
+end)
+
+t.test("a completed link announces itself to both players", function()
+    -- EvolutionFxController has always had a "link" handler and nothing ever sent one, so the
+    -- moment the whole game is built around landed in silence.
+    local services = bootServer()
+    local ash = joinPlayer("Ash", 1)
+    local bree = joinPlayer("Bree", 2)
+    local host = services.PlotService:GetSanctumForPlayer(ash)
+
+    Mock.clearOutbox()
+    linkUp(services, host, bree, ash)
+
+    local sawLink = false
+    for _, entry in ipairs(Mock.outboxFor("Fx")) do
+        local payload = entry.Args[1]
+        if type(payload) == "table" and payload.Kind == "link" then sawLink = true end
+    end
+    t.truthy(sawLink, "the link must be announced")
+end)

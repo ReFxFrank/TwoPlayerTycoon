@@ -16,7 +16,7 @@ local GameConfig = require(Modules:WaitForChild("GameConfig"))
 type Offer = { PlotId: number, Joiner: any, JoinerId: number, ExpiresAt: number, Token: number }
 -- Remotes is RemoteService and OnAccepted is PlotService's merge step. Both are optional so a spec
 -- can drive the offer book with plain tables and no server standing behind it.
-type Deps = { Remotes: any?, OnAccepted: ((sanctum: any, joiner: any) -> ())? }
+type Deps = { Remotes: any?, OnAccepted: ((sanctum: any, joiner: any) -> { any }?)? }
 
 local PlotLinkController = {}
 
@@ -39,7 +39,7 @@ Controller.__index = Controller
 type ControllerSelf = {
 	_offers: { [number]: Offer }, -- keyed by PlotId: one open offer per Sanctum, never more
 	_remotes: any,
-	_onAccepted: (sanctum: any, joiner: any) -> (),
+	_onAccepted: (sanctum: any, joiner: any) -> { any }?,
 	_token: number, -- monotonic; identifies WHICH offer an expiry closure belongs to
 }
 type Controller = typeof(setmetatable({} :: ControllerSelf, Controller))
@@ -153,7 +153,15 @@ function Controller.Resolve(self: Controller, responder: any, sanctum: any, acce
 		self:_notify(offer.Joiner, "warn", "Your link request was declined.")
 		return true, Reason.Declined
 	end
-	self._onAccepted(sanctum, offer.Joiner)
+	--[[ OnAccepted reports the resulting roster, or nil if the merge declined -- every gate is
+	     re-checked against live state in there, so an accepted offer can still not land.
+	     EvolutionFxController has always had a "link" handler and nothing ever sent one, so until
+	     now the moment the whole game is built around arrived in silence. ]]
+	local occupants = self._onAccepted(sanctum, offer.Joiner)
+	if self._remotes ~= nil and type(occupants) == "table" and #occupants > 1 then
+		self._remotes:FireClients(occupants, "Fx",
+			{ Kind = "link", PlotId = sanctum.Id, Data = { Name = offer.Joiner.Name } })
+	end
 	return true, Reason.Ok
 end
 
