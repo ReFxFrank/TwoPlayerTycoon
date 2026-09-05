@@ -1,0 +1,59 @@
+# Runs the headless suite on every push and pull request.
+#
+# The whole game server executes against a mock Roblox environment (see docs/TESTING.md), so this
+# needs nothing but Node and the Luau CLI -- no Roblox, no Studio, no place file.
+name: tests
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  suite:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      # Pin a tag here (e.g. "0.640") when a Luau release ever breaks the build. `latest` is the
+      # default because the language is stable and an unpinned CLI catches upstream breakage early,
+      # which is worth more here than perfectly reproducible builds.
+      LUAU_VERSION: latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install the Luau CLI
+        run: |
+          set -euo pipefail
+          if [ "$LUAU_VERSION" = "latest" ]; then
+            url="https://github.com/luau-lang/luau/releases/latest/download/luau-ubuntu.zip"
+          else
+            url="https://github.com/luau-lang/luau/releases/download/${LUAU_VERSION}/luau-ubuntu.zip"
+          fi
+          curl -fsSL -o luau.zip "$url"
+          unzip -q luau.zip -d "$HOME/luau"
+          chmod +x "$HOME/luau"/*
+          echo "$HOME/luau" >> "$GITHUB_PATH"
+
+      - name: Syntax, house rules and 300+ tests
+        run: ./tests/run.sh
+
+      # The place file is generated from src/, so a stale one is a real defect: someone opening it in
+      # Studio would play a build that does not match the branch.
+      - name: Check the committed place file is up to date
+        run: |
+          set -euo pipefail
+          curl -fsSL -o rojo.zip \
+            "https://github.com/rojo-rbx/rojo/releases/download/v7.5.1/rojo-7.5.1-linux-x86_64.zip"
+          unzip -q rojo.zip -d "$HOME/rojo"
+          chmod +x "$HOME/rojo/rojo"
+          "$HOME/rojo/rojo" build -o /tmp/rebuilt.rbxlx
+          if ! diff -q /tmp/rebuilt.rbxlx SanctumOfEmbers.rbxlx > /dev/null; then
+            echo "::error::SanctumOfEmbers.rbxlx is stale. Run: rojo build -o SanctumOfEmbers.rbxlx"
+            exit 1
+          fi

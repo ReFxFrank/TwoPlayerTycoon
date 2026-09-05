@@ -36,6 +36,7 @@ Run the tests (needs Node 18+ and the [Luau CLI](https://github.com/luau-lang/lu
 ./tests/run.sh
 ```
 
+CI runs exactly this on every push, and also fails if the committed place file is stale.
 That syntax-checks every file, enforces the house rules, and runs 304 tests — the whole game server
 executes headlessly against a mock Roblox environment. See [docs/TESTING.md](docs/TESTING.md).
 
