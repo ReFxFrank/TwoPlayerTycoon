@@ -7,7 +7,7 @@ deliberate and the reasoning is recorded there.
 ## Commands
 
 ```bash
-./tests/run.sh              # syntax + house rules + 304 tests   (~45s)
+./tests/run.sh              # syntax + house rules + 312 tests   (~70s)
 ./tests/run.sh economy      # only specs matching a substring    (~5s)
 rojo serve                  # then connect from Studio
 rojo build -o SanctumOfEmbers.rbxlx   # REQUIRED after any src/ change; CI fails on a stale file
@@ -32,13 +32,15 @@ is not on `PATH`). Neither is needed to play the game.
 
 ## The thing this codebase gets wrong most
 
-**Wiring gaps.** Eleven defects were found here, and almost none were bad logic. They were modules
-that were correct in isolation and that nothing ever called:
+**Wiring gaps and stale state.** Nineteen defects were found across three review passes, and almost
+none were bad logic. They were modules correct in isolation that nothing ever called, or a value
+left describing a world that had moved on:
 
 - the link gate refused every player, because everyone auto-claims a plot on join;
 - nothing called `ProfileService:LoadAsync`, so no join ever loaded a profile;
 - no client listened for `LinkOffer`, so nobody could accept a link;
-- `SetSetting` and `ResetData` had no server handler at all.
+- `SetSetting` and `ResetData` had no server handler at all;
+- a player turned away from a full server was never given a plot when one freed up.
 
 Every module's own tests passed through all of it. Two structural guards now exist because
 per-feature tests structurally cannot catch this — there is no code to write a test against:
@@ -49,6 +51,17 @@ per-feature tests structurally cannot catch this — there is no code to write a
 **If you add a remote, a controller or a service, add it to those lists.** And when you finish a
 feature, trace it once from its real trigger — a prompt press, a `PlayerAdded`, a remote — rather
 than from its entry point.
+
+## The mock is not Roblox, and the gap has already bitten
+
+A refactor once left `PlotBuilder` assigning `BasePart.Material` from a nil global. Roblox throws on
+that and the server would not have booted — but the mock stored whatever it was handed, so all 304
+tests were green and the committed place file was dead.
+
+The mock now type-checks a shortlist of properties whose wrong-typing is fatal in Roblox, and its
+Heartbeat runs at Roblox's real 60Hz. Both were added *after* the fact. Treat a green suite as
+strong evidence about logic and weak evidence about Roblox itself: **open the place file and press
+Play before believing anything is finished.** Nothing in this repo has ever run in Roblox.
 
 ## Testing
 
