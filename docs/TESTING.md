@@ -51,7 +51,8 @@ Mock.advance(1.0)   -- "later"
 
 `task.wait` inside a scheduler-owned coroutine parks and resumes when the virtual clock reaches its
 deadline. On the test thread it *fast-forwards* instead, so a spec can call a yielding API
-(`ProfileService:LoadAsync`) directly and still return. Heartbeat fires ~30× per simulated second.
+(`ProfileService:LoadAsync`) directly and still return. Heartbeat fires at 60Hz, matching Roblox — a coarser step lets a value that is about to be
+overwritten read as a stable pass.
 
 ## Control surface
 

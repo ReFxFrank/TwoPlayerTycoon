@@ -27,7 +27,7 @@ local scheduler = {
     timers = {},
     deferred = {},
     advancing = false,
-    stepSize = 1 / 30,
+    stepSize = 1 / 60, -- Roblox Heartbeat runs ~60Hz; a coarser step lets a transient read as stable
 }
 Services.scheduler = scheduler
 

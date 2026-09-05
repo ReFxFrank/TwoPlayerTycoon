@@ -93,7 +93,7 @@ t.test("clock: task.delay, task.spawn and Heartbeat only run when time advances"
     t.deepEq(order, { "spawned", "delayed-1" })
     Mock.advance(1)
     t.deepEq(order, { "spawned", "delayed-1", "delayed-2" })
-    t.gt(heartbeats, 60, "Heartbeat fires ~30x per simulated second")
+    t.gt(heartbeats, 60, "Heartbeat fires ~60x per simulated second, matching Roblox")
 end)
 
 t.test("clock: task.wait yields inside a coroutine and fast-forwards on the main thread", function()
