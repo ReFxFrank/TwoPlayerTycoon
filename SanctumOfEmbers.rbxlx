@@ -5992,6 +5992,57 @@ return PrestigeAward
         </Item>
         <Item class="ModuleScript" referent="37">
           <Properties>
+            <string name="Name">ProfileAutosave</string>
+            <string name="Source"><![CDATA[--!strict
+--[[
+    ProfileAutosave
+    The per-player autosave loop, and the jitter that keeps a full server from writing on one frame.
+
+    Split out of ProfileService for the 300-line ceiling. It is a real seam: this is the only
+    background writer in the game, and the two conditions that must stop it -- the server shutting
+    down, and the player having left -- are the ones the ghost-profile bug turned out to hinge on.
+    Owner: server  |  Consumers: ProfileService
+]]
+
+local Modules = game:GetService("ReplicatedStorage"):WaitForChild("Modules")
+local GameConfig = require(Modules:WaitForChild("GameConfig"))
+
+local SAVE = GameConfig.Save
+local MIN_AUTOSAVE_SECONDS = 5 -- a floor, so a misconfigured interval cannot hammer the DataStore
+
+-- Its own RNG, so autosave jitter never perturbs the global math.random sequence that mote paths and
+-- other systems draw from -- which would make their tests non-reproducible.
+local rng = Random.new(os.time())
+
+local ProfileAutosave = {}
+
+--- Starts the loop for `entry`. `stillOurs` is re-asked after every park: it must return false once
+--- the server has stopped or this entry is no longer the live one for its player.
+function ProfileAutosave.start(entry: any, save: (any) -> (), stillOurs: (any) -> boolean): ()
+	if entry.Autosave then return end -- a second thread would double this player's write rate
+	entry.Autosave = true
+	task.spawn(function()
+		while entry.Autosave and stillOurs(entry) do
+			-- The +/- jitter IS the stagger: players who joined on the same frame land up to 2 x
+			-- AutosaveJitter (40s) apart, and re-rolling each cycle stops them re-converging. A fixed
+			-- period would have all twelve occupants of a full server writing on one frame.
+			local jitter = rng:NextNumber(-SAVE.AutosaveJitter, SAVE.AutosaveJitter)
+			task.wait(math.max(SAVE.AutosaveSeconds + jitter, MIN_AUTOSAVE_SECONDS))
+			-- Re-checked after the park: the player may have left, or the server stopped, while this
+			-- thread slept, and saving a released profile would retake a lock nobody holds.
+			if not entry.Autosave or not stillOurs(entry) then break end
+			save(entry.Player)
+		end
+		entry.Autosave = false
+	end)
+end
+
+return ProfileAutosave
+]]></string>
+          </Properties>
+        </Item>
+        <Item class="ModuleScript" referent="38">
+          <Properties>
             <string name="Name">ProfileLock</string>
             <string name="Source"><![CDATA[--!strict
 --[[
@@ -6072,7 +6123,7 @@ return ProfileLock
 ]]></string>
           </Properties>
         </Item>
-        <Item class="ModuleScript" referent="38">
+        <Item class="ModuleScript" referent="39">
           <Properties>
             <string name="Name">ProfileRemotes</string>
             <string name="Source"><![CDATA[--!strict
@@ -6147,7 +6198,7 @@ return ProfileRemotes
 ]]></string>
           </Properties>
         </Item>
-        <Item class="ModuleScript" referent="39">
+        <Item class="ModuleScript" referent="40">
           <Properties>
             <string name="Name">ProfileService</string>
             <string name="Source"><![CDATA[--!strict
@@ -6171,6 +6222,7 @@ local Signal = require(Modules:WaitForChild("Signal"))
 local StateSchema = require(Modules:WaitForChild("StateSchema"))
 
 local ProfileLock = require(script.Parent.ProfileLock)
+local ProfileAutosave = require(script.Parent.ProfileAutosave)
 local ProfileRemotes = require(script.Parent.ProfileRemotes)
 
 type Profile = StateSchema.Profile
@@ -6204,7 +6256,6 @@ local JOB_ID: string = ProfileLock.JobId
 local SAVE_POLL_SECONDS, SAVE_WAIT_TIMEOUT = 0.1, 20
 -- Floor on the autosave period: a hand-edited config (Jitter >= AutosaveSeconds) must not be able to
 -- turn the loop into a DataStore flood.
-local MIN_AUTOSAVE_SECONDS = 5
 
 local Service = {}
 Service.Name = "ProfileService"
@@ -6217,28 +6268,17 @@ local entries: { [Player]: Entry } = {}
 local connections: { Connection } = {}
 local wrapper: any, remotes: any, registryRef: any = nil, nil, nil -- DataStoreWrapper, resolved in Init
 local running = false
--- Own RNG so autosave jitter never perturbs the global math.random sequence mote paths and other
 -- systems draw from, which would make their tests non-reproducible.
-local rng = Random.new(os.time())
 
 -- The lock protocol lives in ProfileLock; aliased so call sites below read unchanged.
 local keyFor, unwrap, blocks = ProfileLock.keyFor, ProfileLock.unwrap, ProfileLock.blocks
+--- Delegated to ProfileAutosave; the liveness predicate stays here because `running` and `entries`
+--- are this module's state.
 local function startAutosave(entry: Entry): ()
-	if entry.Autosave then return end -- a second thread would double this player's write rate
-	entry.Autosave = true
-	task.spawn(function()
-		while entry.Autosave and running do
-			-- The +/- jitter IS the stagger: players who joined on the same frame land up to 2 x
-			-- AutosaveJitter (40s) apart, and re-rolling each cycle stops them re-converging. A
-			-- fixed period would have all twelve occupants of a full server writing on one frame.
-			local jitter = rng:NextNumber(-SAVE.AutosaveJitter, SAVE.AutosaveJitter)
-			task.wait(math.max(SAVE.AutosaveSeconds + jitter, MIN_AUTOSAVE_SECONDS))
-			-- Re-checked after the park: the player may have left (or the server stopped) while this
-			-- thread slept, and saving a released profile would retake a lock nobody holds.
-			if not entry.Autosave or not running or entries[entry.Player] ~= entry then break end
-			Service:Save(entry.Player)
-		end
-		entry.Autosave = false
+	ProfileAutosave.start(entry, function(player: any)
+		Service:Save(player)
+	end, function(candidate: any): boolean
+		return running and entries[candidate.Player] == candidate
 	end)
 end
 
@@ -6300,10 +6340,25 @@ function Service:LoadAsync(player: Player): Profile?
 		if not ok then
 			-- The wrapper already exhausted its own retry schedule, so this is not contention: the
 			-- DataStore is unreachable. Five more lock attempts would only delay the join.
+			if player.Parent ~= Players then return nil end -- gone across the retries; see below
 			return unsavable(player)
 		end
 		local profile = loaded
-		if claimed and profile ~= nil then return register(player, profile) end
+		if claimed and profile ~= nil then
+			--[[ THE GHOST CHECK. PlayerRemoving may have fired while this thread was parked on the
+			     DataStore -- and Release, finding no entry yet, bailed and will never run again. So
+			     registering now strands an entry nothing can ever release: its autosave loop would
+			     re-stamp the session lock every couple of minutes for the life of the server (the
+			     lock never goes stale, so this player is refused on EVERY other server), and
+			     PlotService would hold a Sanctum for someone who is not here. Hand the lock back
+			     instead. The window is the whole load, and widens to ~30s on the contention path --
+			     exactly the server-hop case where a player is most likely to give up and leave. ]]
+			if player.Parent ~= Players then
+				ProfileLock.write(wrapper, player, profile, true) -- release-write clears the lock
+				return nil
+			end
+			return register(player, profile)
+		end
 		if attempt < attempts then task.wait(SESSION.LockRetryDelay) end
 	end
 	--[[ Give up with nil, NOT a blank profile. The caller kicks the player with a clear message and
@@ -6442,7 +6497,7 @@ return Service
 ]]></string>
           </Properties>
         </Item>
-        <Item class="ModuleScript" referent="40">
+        <Item class="ModuleScript" referent="41">
           <Properties>
             <string name="Name">PurchasePads</string>
             <string name="Source"><![CDATA[--!strict
@@ -6621,7 +6676,7 @@ return PurchasePads
 ]]></string>
           </Properties>
         </Item>
-        <Item class="ModuleScript" referent="41">
+        <Item class="ModuleScript" referent="42">
           <Properties>
             <string name="Name">PurchaseService</string>
             <string name="Source"><![CDATA[--!strict
@@ -6925,7 +6980,7 @@ return Service
 ]]></string>
           </Properties>
         </Item>
-        <Item class="ModuleScript" referent="42">
+        <Item class="ModuleScript" referent="43">
           <Properties>
             <string name="Name">RateLimiter</string>
             <string name="Source"><![CDATA[--!strict
@@ -7139,7 +7194,7 @@ return Service
 ]]></string>
           </Properties>
         </Item>
-        <Item class="ModuleScript" referent="43">
+        <Item class="ModuleScript" referent="44">
           <Properties>
             <string name="Name">RebirthService</string>
             <string name="Source"><![CDATA[--!strict
@@ -7437,7 +7492,7 @@ return Service
 ]]></string>
           </Properties>
         </Item>
-        <Item class="ModuleScript" referent="44">
+        <Item class="ModuleScript" referent="45">
           <Properties>
             <string name="Name">RemoteService</string>
             <string name="Source"><![CDATA[--!strict
@@ -7741,7 +7796,7 @@ return Service
 ]]></string>
           </Properties>
         </Item>
-        <Item class="ModuleScript" referent="45">
+        <Item class="ModuleScript" referent="46">
           <Properties>
             <string name="Name">StateReplicator</string>
             <string name="Source"><![CDATA[--!strict
@@ -8005,11 +8060,11 @@ return Service
           </Properties>
         </Item>
       </Item>
-      <Item class="Folder" referent="46">
+      <Item class="Folder" referent="47">
         <Properties>
           <string name="Name">Systems</string>
         </Properties>
-        <Item class="ModuleScript" referent="47">
+        <Item class="ModuleScript" referent="48">
           <Properties>
             <string name="Name">BuildKit</string>
             <string name="Source"><![CDATA[--!strict
@@ -8097,6 +8152,8 @@ BuildKit.MAX_LIGHT_RANGE = MAX_LIGHT_RANGE
 BuildKit.RAIL_WIDTH = RAIL_WIDTH
 BuildKit.RAIL_THICKNESS = RAIL_THICKNESS
 BuildKit.MIN_RAIL_LENGTH = MIN_RAIL_LENGTH
+BuildKit.FLOOR_MATERIAL, BuildKit.PAD_MATERIAL = FLOOR_MATERIAL, PAD_MATERIAL
+BuildKit.NEON, BuildKit.MARKER_MATERIAL = NEON, MARKER_MATERIAL
 BuildKit.newFolder = newFolder
 BuildKit.makePart = makePart
 BuildKit.makeSign = makeSign
@@ -8105,7 +8162,7 @@ return BuildKit
 ]]></string>
           </Properties>
         </Item>
-        <Item class="ModuleScript" referent="48">
+        <Item class="ModuleScript" referent="49">
           <Properties>
             <string name="Name">DropperSystem</string>
             <string name="Source"><![CDATA[--!strict
@@ -8305,7 +8362,7 @@ return DropperSystem
 ]]></string>
           </Properties>
         </Item>
-        <Item class="ModuleScript" referent="49">
+        <Item class="ModuleScript" referent="50">
           <Properties>
             <string name="Name">MoteSystem</string>
             <string name="Source"><![CDATA[--!strict
@@ -8587,7 +8644,7 @@ return MoteSystem
 ]]></string>
           </Properties>
         </Item>
-        <Item class="ModuleScript" referent="50">
+        <Item class="ModuleScript" referent="51">
           <Properties>
             <string name="Name">PlotBuilder</string>
             <string name="Source"><![CDATA[--!strict
@@ -8632,6 +8689,8 @@ local MARKER_DROP, MAX_CONFLUX_SIZE = BuildKit.MARKER_DROP, BuildKit.MAX_CONFLUX
 local MAX_LIGHT_RANGE = BuildKit.MAX_LIGHT_RANGE
 local RAIL_WIDTH, RAIL_THICKNESS = BuildKit.RAIL_WIDTH, BuildKit.RAIL_THICKNESS
 local MIN_RAIL_LENGTH = BuildKit.MIN_RAIL_LENGTH
+local FLOOR_MATERIAL, PAD_MATERIAL = BuildKit.FLOOR_MATERIAL, BuildKit.PAD_MATERIAL
+local NEON, MARKER_MATERIAL = BuildKit.NEON, BuildKit.MARKER_MATERIAL
 local HIDDEN_ROOT_NAME = "SanctumHiddenWings" -- where locked Wings wait; see setSectionVisible
 
 local PlotBuilder = {}
@@ -8871,7 +8930,7 @@ return PlotBuilder
       </Item>
     </Item>
   </Item>
-  <Item class="SoundService" referent="51">
+  <Item class="SoundService" referent="52">
     <Properties>
       <string name="Name">SoundService</string>
       <token name="AmbientReverb">11</token>
@@ -8881,19 +8940,19 @@ return PlotBuilder
       <float name="RolloffScale">1</float>
     </Properties>
   </Item>
-  <Item class="StarterPlayer" referent="52">
+  <Item class="StarterPlayer" referent="53">
     <Properties>
       <string name="Name">StarterPlayer</string>
     </Properties>
-    <Item class="StarterPlayerScripts" referent="53">
+    <Item class="StarterPlayerScripts" referent="54">
       <Properties>
         <string name="Name">StarterPlayerScripts</string>
       </Properties>
-      <Item class="Folder" referent="54">
+      <Item class="Folder" referent="55">
         <Properties>
           <string name="Name">Client</string>
         </Properties>
-        <Item class="LocalScript" referent="55">
+        <Item class="LocalScript" referent="56">
           <Properties>
             <string name="Name">ClientBootstrap</string>
             <string name="Source"><![CDATA[--!strict
@@ -9055,11 +9114,11 @@ player.CharacterAdded:Connect(requestSnapshot)
 ]]></string>
           </Properties>
         </Item>
-        <Item class="Folder" referent="56">
+        <Item class="Folder" referent="57">
           <Properties>
             <string name="Name">Controllers</string>
           </Properties>
-          <Item class="ModuleScript" referent="57">
+          <Item class="ModuleScript" referent="58">
             <Properties>
               <string name="Name">AffinityController</string>
               <string name="Source"><![CDATA[--!strict
@@ -9323,7 +9382,7 @@ return Controller
 ]]></string>
             </Properties>
           </Item>
-          <Item class="ModuleScript" referent="58">
+          <Item class="ModuleScript" referent="59">
             <Properties>
               <string name="Name">EvolutionFxController</string>
               <string name="Source"><![CDATA[--!strict
@@ -9619,7 +9678,7 @@ return Controller
 ]]></string>
             </Properties>
           </Item>
-          <Item class="ModuleScript" referent="59">
+          <Item class="ModuleScript" referent="60">
             <Properties>
               <string name="Name">HudController</string>
               <string name="Source"><![CDATA[--!strict
@@ -9843,7 +9902,7 @@ return Controller
 ]]></string>
             </Properties>
           </Item>
-          <Item class="ModuleScript" referent="60">
+          <Item class="ModuleScript" referent="61">
             <Properties>
               <string name="Name">LinkController</string>
               <string name="Source"><![CDATA[--!strict
@@ -9967,7 +10026,7 @@ return Controller
 ]]></string>
             </Properties>
           </Item>
-          <Item class="ModuleScript" referent="61">
+          <Item class="ModuleScript" referent="62">
             <Properties>
               <string name="Name">NotifyController</string>
               <string name="Source"><![CDATA[--!strict
@@ -10195,7 +10254,7 @@ return Controller
 ]]></string>
             </Properties>
           </Item>
-          <Item class="ModuleScript" referent="62">
+          <Item class="ModuleScript" referent="63">
             <Properties>
               <string name="Name">PadVerdict</string>
               <string name="Source"><![CDATA[--!strict
@@ -10351,7 +10410,7 @@ return PadVerdict
 ]]></string>
             </Properties>
           </Item>
-          <Item class="ModuleScript" referent="63">
+          <Item class="ModuleScript" referent="64">
             <Properties>
               <string name="Name">PromptController</string>
               <string name="Source"><![CDATA[--!strict
@@ -10639,7 +10698,7 @@ return Controller
 ]]></string>
             </Properties>
           </Item>
-          <Item class="ModuleScript" referent="64">
+          <Item class="ModuleScript" referent="65">
             <Properties>
               <string name="Name">RebirthController</string>
               <string name="Source"><![CDATA[--!strict
@@ -10931,7 +10990,7 @@ return Controller
 ]]></string>
             </Properties>
           </Item>
-          <Item class="ModuleScript" referent="65">
+          <Item class="ModuleScript" referent="66">
             <Properties>
               <string name="Name">SettingsController</string>
               <string name="Source"><![CDATA[--!strict
@@ -11164,7 +11223,7 @@ return Controller
 ]]></string>
             </Properties>
           </Item>
-          <Item class="ModuleScript" referent="66">
+          <Item class="ModuleScript" referent="67">
             <Properties>
               <string name="Name">SoundController</string>
               <string name="Source"><![CDATA[--!strict
@@ -11365,7 +11424,7 @@ return Controller
 ]]></string>
             </Properties>
           </Item>
-          <Item class="ModuleScript" referent="67">
+          <Item class="ModuleScript" referent="68">
             <Properties>
               <string name="Name">UiBuilder</string>
               <string name="Source"><![CDATA[--!strict
@@ -11650,7 +11709,7 @@ return UiBuilder
 ]]></string>
             </Properties>
           </Item>
-          <Item class="ModuleScript" referent="68">
+          <Item class="ModuleScript" referent="69">
             <Properties>
               <string name="Name">UiModals</string>
               <string name="Source"><![CDATA[--!strict
@@ -11858,7 +11917,7 @@ return UiModals
       </Item>
     </Item>
   </Item>
-  <Item class="Workspace" referent="69">
+  <Item class="Workspace" referent="70">
     <Properties>
       <string name="Name">Workspace</string>
       <float name="FallenPartsDestroyHeight">-150</float>

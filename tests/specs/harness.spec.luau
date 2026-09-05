@@ -232,3 +232,30 @@ t.test("modules: shared modules load through require(script.Parent.X)", function
     -- Requiring twice returns the cached table, exactly as Roblox does.
     t.eq(loadModule("ReplicatedStorage/Modules/TableUtil"), TableUtil)
 end)
+
+t.test("the mock refuses a wrong-typed property write, as Roblox does", function()
+    -- A permissive mock is not a neutral simplification: it hides the exact class of bug that stops
+    -- a real server booting. This project shipped a place file whose PlotBuilder assigned
+    -- Material from a nil global, with all 304 tests green, because the mock accepted it.
+    local part = Instance.new("Part", workspace)
+    t.throws(function() part.Material = nil end, "a nil Material must throw, as Roblox does")
+    t.throws(function() part.Anchored = "yes" end)
+    t.throws(function() part.Transparency = true end)
+    t.throws(function() part.Color = Vector3.new(1, 1, 1) end)
+    t.noThrow(function() part.Material = Enum.Material.Neon end)
+    t.noThrow(function() part.Anchored = true end)
+
+    -- Size and Position are polymorphic, so the check has to come from the instance's class.
+    t.throws(function() part.Size = UDim2.fromScale(1, 1) end, "a BasePart takes a Vector3")
+    t.noThrow(function() part.Size = Vector3.new(2, 2, 2) end)
+
+    local label = Instance.new("TextLabel", workspace)
+    t.throws(function() label.Size = Vector3.new(1, 1, 1) end, "a GuiObject takes a UDim2")
+    t.noThrow(function() label.Size = UDim2.fromScale(0.5, 0.5) end)
+    t.throws(function() label.Text = 42 end)
+    t.noThrow(function() label.Text = "42" end)
+
+    -- Unknown properties stay permissive on purpose: the mock must not need teaching before a test
+    -- can use a property.
+    t.noThrow(function() part.SomeFutureProperty = {} end)
+end)

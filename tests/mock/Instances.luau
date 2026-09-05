@@ -266,10 +266,53 @@ local function setParent(self, parent)
     getSignal(self, "AncestryChanged"):Fire(self, parent)
 end
 
+--[[ Roblox VALIDATES every property assignment and throws on a type mismatch; a permissive mock does
+     not, and that difference turns a green suite into a dead server. A real example from this
+     project: a refactor left BasePart.Material assigned from a nil global. All 304 tests stayed
+     green and the shipped place file would not have booted -- PlotService:Init would have thrown
+     "Unable to assign property Material. EnumItem expected, got nil".
+
+     Deliberately a SHORTLIST, not a property database. Every entry is one whose wrong-typing is
+     easy to introduce and fatal in Roblox. Unknown properties stay permissive, because the
+     alternative is a mock that must be taught every property before a test can use one. ]]
+local PROPERTY_TYPES: { [string]: string } = {
+    Material = "EnumItem", Color = "Color3",
+    CFrame = "CFrame",
+    Anchored = "boolean", CanCollide = "boolean", CanTouch = "boolean", CanQuery = "boolean",
+    Transparency = "number", Reflectance = "number", CastShadow = "boolean",
+    Name = "string", Text = "string", Visible = "boolean", Enabled = "boolean",
+    TextColor3 = "Color3", BackgroundColor3 = "Color3", TextScaled = "boolean",
+    BackgroundTransparency = "number", ZIndex = "number", TextSize = "number",
+    AnchorPoint = "Vector2",
+    WalkSpeed = "number", Volume = "number", Looped = "boolean",
+    ActionText = "string", ObjectText = "string", HoldDuration = "number",
+    MaxActivationDistance = "number", RequiresLineOfSight = "boolean",
+    Range = "number", Brightness = "number",
+}
+
+--- Size and Position are Vector3 on a BasePart and UDim2 on a GuiObject, so the expected type is
+--- resolved from the instance rather than from the property name alone.
+local function expectedTypeFor(instance, key)
+    if key == "Size" or key == "Position" then
+        if instance:IsA("BasePart") then
+            return "Vector3"
+        elseif instance:IsA("GuiObject") then
+            return "UDim2"
+        end
+        return nil
+    end
+    return PROPERTY_TYPES[key]
+end
+
 InstanceMeta.__newindex = function(self, key, value)
     if key == "Parent" then
         setParent(self, value)
         return
+    end
+    local expected = expectedTypeFor(self, key)
+    if expected ~= nil and typeof(value) ~= expected then
+        error(("Unable to assign property %s. %s expected, got %s"):format(
+            key, expected, typeof(value)), 2)
     end
     local props = rawget(self, "_props")
     local previous = props[key]

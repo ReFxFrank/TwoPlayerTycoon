@@ -40,6 +40,8 @@ local MARKER_DROP, MAX_CONFLUX_SIZE = BuildKit.MARKER_DROP, BuildKit.MAX_CONFLUX
 local MAX_LIGHT_RANGE = BuildKit.MAX_LIGHT_RANGE
 local RAIL_WIDTH, RAIL_THICKNESS = BuildKit.RAIL_WIDTH, BuildKit.RAIL_THICKNESS
 local MIN_RAIL_LENGTH = BuildKit.MIN_RAIL_LENGTH
+local FLOOR_MATERIAL, PAD_MATERIAL = BuildKit.FLOOR_MATERIAL, BuildKit.PAD_MATERIAL
+local NEON, MARKER_MATERIAL = BuildKit.NEON, BuildKit.MARKER_MATERIAL
 local HIDDEN_ROOT_NAME = "SanctumHiddenWings" -- where locked Wings wait; see setSectionVisible
 
 local PlotBuilder = {}

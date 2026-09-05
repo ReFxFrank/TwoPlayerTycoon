@@ -19,6 +19,7 @@ local Signal = require(Modules:WaitForChild("Signal"))
 local StateSchema = require(Modules:WaitForChild("StateSchema"))
 
 local ProfileLock = require(script.Parent.ProfileLock)
+local ProfileAutosave = require(script.Parent.ProfileAutosave)
 local ProfileRemotes = require(script.Parent.ProfileRemotes)
 
 type Profile = StateSchema.Profile
@@ -52,7 +53,6 @@ local JOB_ID: string = ProfileLock.JobId
 local SAVE_POLL_SECONDS, SAVE_WAIT_TIMEOUT = 0.1, 20
 -- Floor on the autosave period: a hand-edited config (Jitter >= AutosaveSeconds) must not be able to
 -- turn the loop into a DataStore flood.
-local MIN_AUTOSAVE_SECONDS = 5
 
 local Service = {}
 Service.Name = "ProfileService"
@@ -65,28 +65,17 @@ local entries: { [Player]: Entry } = {}
 local connections: { Connection } = {}
 local wrapper: any, remotes: any, registryRef: any = nil, nil, nil -- DataStoreWrapper, resolved in Init
 local running = false
--- Own RNG so autosave jitter never perturbs the global math.random sequence mote paths and other
 -- systems draw from, which would make their tests non-reproducible.
-local rng = Random.new(os.time())
 
 -- The lock protocol lives in ProfileLock; aliased so call sites below read unchanged.
 local keyFor, unwrap, blocks = ProfileLock.keyFor, ProfileLock.unwrap, ProfileLock.blocks
+--- Delegated to ProfileAutosave; the liveness predicate stays here because `running` and `entries`
+--- are this module's state.
 local function startAutosave(entry: Entry): ()
-	if entry.Autosave then return end -- a second thread would double this player's write rate
-	entry.Autosave = true
-	task.spawn(function()
-		while entry.Autosave and running do
-			-- The +/- jitter IS the stagger: players who joined on the same frame land up to 2 x
-			-- AutosaveJitter (40s) apart, and re-rolling each cycle stops them re-converging. A
-			-- fixed period would have all twelve occupants of a full server writing on one frame.
-			local jitter = rng:NextNumber(-SAVE.AutosaveJitter, SAVE.AutosaveJitter)
-			task.wait(math.max(SAVE.AutosaveSeconds + jitter, MIN_AUTOSAVE_SECONDS))
-			-- Re-checked after the park: the player may have left (or the server stopped) while this
-			-- thread slept, and saving a released profile would retake a lock nobody holds.
-			if not entry.Autosave or not running or entries[entry.Player] ~= entry then break end
-			Service:Save(entry.Player)
-		end
-		entry.Autosave = false
+	ProfileAutosave.start(entry, function(player: any)
+		Service:Save(player)
+	end, function(candidate: any): boolean
+		return running and entries[candidate.Player] == candidate
 	end)
 end
 
@@ -148,10 +137,25 @@ function Service:LoadAsync(player: Player): Profile?
 		if not ok then
 			-- The wrapper already exhausted its own retry schedule, so this is not contention: the
 			-- DataStore is unreachable. Five more lock attempts would only delay the join.
+			if player.Parent ~= Players then return nil end -- gone across the retries; see below
 			return unsavable(player)
 		end
 		local profile = loaded
-		if claimed and profile ~= nil then return register(player, profile) end
+		if claimed and profile ~= nil then
+			--[[ THE GHOST CHECK. PlayerRemoving may have fired while this thread was parked on the
+			     DataStore -- and Release, finding no entry yet, bailed and will never run again. So
+			     registering now strands an entry nothing can ever release: its autosave loop would
+			     re-stamp the session lock every couple of minutes for the life of the server (the
+			     lock never goes stale, so this player is refused on EVERY other server), and
+			     PlotService would hold a Sanctum for someone who is not here. Hand the lock back
+			     instead. The window is the whole load, and widens to ~30s on the contention path --
+			     exactly the server-hop case where a player is most likely to give up and leave. ]]
+			if player.Parent ~= Players then
+				ProfileLock.write(wrapper, player, profile, true) -- release-write clears the lock
+				return nil
+			end
+			return register(player, profile)
+		end
 		if attempt < attempts then task.wait(SESSION.LockRetryDelay) end
 	end
 	--[[ Give up with nil, NOT a blank profile. The caller kicks the player with a clear message and

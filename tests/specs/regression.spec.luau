@@ -298,3 +298,69 @@ t.test("a failed boot stops taking sessions instead of running half a game", fun
     t.noThrow(function() registry:StopAll() end, "teardown must never mask the boot error")
     t.truthy(started.Stopped, "and it actually stopped what had started")
 end)
+
+t.test("a player who disconnects mid-load leaves no ghost holding a sanctum or the lock", function()
+    --[[ The worst bug found in this project. PlayerRemoving fires while LoadAsync is parked on the
+         DataStore, so Release finds no entry and bails -- and will never run again. LoadAsync then
+         resumes and registers unconditionally: the departed player gets an entry, an autosave loop
+         and a claimed Sanctum that nothing can ever free. Worse, every autosave re-stamps their
+         session lock, so the lock never goes stale and that player is refused on EVERY other server
+         with "your sanctum is still saving" for as long as this one lives. ]]
+    local services = bootServer()
+    Mock.DataStore.setLatency(0.2) -- a real join always yields; this makes the window deterministic
+
+    local ghost = Mock.addPlayer("Ghost", 8001)
+    Mock.removePlayer(ghost) -- leaves DURING the load
+    Mock.advance(2)
+
+    t.falsy(services.ProfileService:IsLoaded(ghost), "no profile is registered for a departed player")
+    t.eq(services.PlotService:GetSanctumForPlayer(ghost), nil, "and no sanctum is held")
+
+    local occupied = 0
+    services.PlotService:ForEachSanctum(function(sanctum)
+        if next(sanctum.Occupants) ~= nil then occupied += 1 end
+    end)
+    t.eq(occupied, 0, "every sanctum is still claimable")
+
+    -- The lock half: it must be released, or this player cannot play anywhere else.
+    local stored = game:GetService("DataStoreService")
+        :GetDataStore(GameConfig.Save.DataStoreName):GetAsync(GameConfig.Save.KeyPrefix .. "8001")
+    if stored ~= nil and stored.Lock ~= nil then
+        t.eq(stored.Lock.JobId, nil, "a ghost must not hold the session lock")
+    end
+
+    local before = Mock.DataStore.calls()
+    Mock.advance(GameConfig.Save.AutosaveSeconds * 3)
+    t.eq(Mock.DataStore.calls(), before, "and must not keep autosaving forever")
+end)
+
+t.test("repeated mid-load disconnects cannot exhaust the server's sanctums", function()
+    local services = bootServer()
+    Mock.DataStore.setLatency(0.2)
+    for index = 1, GameConfig.Plot.SanctumCount + 2 do
+        local ghost = Mock.addPlayer("Ghost" .. index, 8100 + index)
+        Mock.removePlayer(ghost)
+        Mock.advance(1)
+    end
+    Mock.DataStore.setLatency(0)
+
+    -- A real player joining afterwards must still get a plot.
+    local ash = Mock.addPlayer("Ash", 1)
+    Mock.advance(2)
+    t.truthy(services.PlotService:GetSanctumForPlayer(ash),
+        "eight ghosts must not leave a full server with nobody on it")
+end)
+
+t.test("a disconnect during a DataStore outage leaves no ghost either", function()
+    -- The unsavable path registers unconditionally too. That profile never touches the lock, but it
+    -- still holds a Sanctum for the life of the server.
+    local services = bootServer()
+    Mock.DataStore.failAlways(true)
+    local ghost = Mock.addPlayer("Ghost", 8002)
+    Mock.removePlayer(ghost)
+    Mock.advance(3)
+    Mock.DataStore.failAlways(false)
+
+    t.falsy(services.ProfileService:IsLoaded(ghost))
+    t.eq(services.PlotService:GetSanctumForPlayer(ghost), nil)
+end)
